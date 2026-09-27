@@ -119,6 +119,11 @@ pub fn router(state: AppState) -> Router {
             delete(delete_ceph_object_store),
         )
         .route("/ceph/devices", post(add_ceph_device))
+        .route(
+            "/ceph/nodes/{node_name}/devices",
+            get(list_ceph_node_devices),
+        )
+        .route("/zfs/devices", get(list_zfs_devices))
         .route("/zfs/pools/from-device", post(create_zfs_pool_from_device))
         .route("/storage-classes", get(list_storage_classes))
         .route("/kubernetes/pvcs", get(list_pvcs))

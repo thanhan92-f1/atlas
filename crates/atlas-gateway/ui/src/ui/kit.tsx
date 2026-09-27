@@ -387,6 +387,7 @@ export function FormModal({
   fields: fieldsProp,
   submitLabel = "Create",
   danger = false,
+  onValuesChange,
   onSubmit,
 }: {
   open: boolean;
@@ -398,10 +399,17 @@ export function FormModal({
   submitLabel?: string;
   /** Use danger styling on the primary submit (e.g. irreversible creates). */
   danger?: boolean;
+  /** Notified with the live values on every change — e.g. so a parent can fetch data that depends
+      on the current selection (a device list scoped to the currently-picked node). */
+  onValuesChange?: (v: Record<string, string>) => void;
   onSubmit: (v: Record<string, string>) => Promise<void> | void;
 }) {
   const [vals, setVals] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState(false);
+  useEffect(() => {
+    onValuesChange?.(vals);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [vals]);
   // Resolved with an empty {} on the very first pass (before `vals` is populated below) — fine in
   // practice since a conditional field's branch condition is a specific non-default value (e.g.
   // kind === "backup"), so an empty/undefined value naturally falls through to the default branch.

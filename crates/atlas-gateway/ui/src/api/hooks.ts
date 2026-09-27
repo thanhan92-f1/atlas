@@ -5,9 +5,9 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { http } from "./client";
 import { useUi } from "../store/ui";
 import type {
-  ActivityEvent, AlertRecord, AuditRow, BackupRecord, ClusterHealthState, JobRecord, MetricForecast, MetricHistoryPoint, MetricSample, MetricsSummary, Osd,
+  ActivityEvent, AlertRecord, AuditRow, BackupRecord, CephNodeDevice, ClusterHealthState, JobRecord, MetricForecast, MetricHistoryPoint, MetricSample, MetricsSummary, Osd,
   SnapshotSchedule, StorageBucket, StorageCluster, StoragePool, StorageSnapshot, StorageVolume,
-  TenantPolicy, TenantQuota, VolumeProtectionStatus,
+  TenantPolicy, TenantQuota, VolumeProtectionStatus, ZfsBlockDevice,
   MigrationSource, MigrationPlan, EdgeDbCluster, CdcStream, ValidationRun,
 } from "./types";
 
@@ -32,6 +32,15 @@ export const useClusters = () => useApiQuery<StorageCluster[]>(["clusters"], "/c
 export const usePools = () => useApiQuery<StoragePool[]>(["pools"], "/pools", 10000);
 export const useOsds = () => useApiQuery<Osd[]>(["osds"], "/osds", 10000);
 export const useNodes = () => useApiQuery<{ host: string }[]>(["nodes"], "/nodes", 15000);
+export const useZfsDevices = () =>
+  useApiQuery<ZfsBlockDevice[]>(["zfs-devices"], "/zfs/devices", 15000);
+export const useCephNodeDevices = (nodeName?: string) =>
+  useApiQuery<CephNodeDevice[]>(
+    ["ceph-node-devices", nodeName],
+    `/ceph/nodes/${nodeName}/devices`,
+    15000,
+    !!nodeName,
+  );
 export const useVolumes = (state?: string, tenant?: string, backend?: string, kind?: string) => {
   const qs = new URLSearchParams();
   if (state) qs.set("state", state);

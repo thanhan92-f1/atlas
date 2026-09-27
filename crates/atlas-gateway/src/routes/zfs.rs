@@ -93,3 +93,45 @@ pub(crate) async fn create_zfs_pool_from_device(
         json!({ "pool_name": body.pool_name, "device": body.device_path }),
     ))
 }
+
+/// The only device fake mode ever reports — mirrors `atlas_jobs::dispatch::zfs::FAKE_FIXTURE_DEVICE`
+/// (kept as a separate literal: that constant is private to the job-dispatch crate, and this is
+/// display-only data, not a safety-relevant check).
+const FAKE_FIXTURE_DEVICE: &str = "/dev/vdz";
+
+/// `GET /zfs/devices` — every whole disk the gateway's own host currently sees, with its current
+/// signature state (empty / has data / mounted / root-boot disk), so an operator can pick a device
+/// instead of guessing a path blind. Advisory only: `POST /zfs/pools/from-device` re-runs the
+/// authoritative safety check itself against whatever's chosen. Local-host-only, same limitation
+/// as the rest of this driver — this can never see a disk on a different node.
+pub(crate) async fn list_zfs_devices(State(s): State<AppState>) -> AppResult<Json<Value>> {
+    if s.config.zfs_driver_mode == atlas_common::config::DriverMode::Fake {
+        return Ok(Json(json!([{
+            "path": FAKE_FIXTURE_DEVICE,
+            "size_bytes": 10_737_418_240u64,
+            "read_only": false,
+            "has_children": false,
+            "fstype": null,
+            "pttype": null,
+            "mounted_at": null,
+            "wipefs_signatures": [],
+            "member_of_zpool": null,
+            "is_root_or_boot_disk": false,
+            "status": "empty",
+        }])));
+    }
+    let devices = atlas_driver_zfs::list_whole_disks()
+        .await
+        .map_err(|e| AppError::Driver(e.to_string()))?;
+    let rows: Vec<Value> = devices
+        .iter()
+        .map(|d| {
+            let mut v = serde_json::to_value(d).unwrap_or_default();
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("status".into(), json!(d.status()));
+            }
+            v
+        })
+        .collect();
+    Ok(Json(json!(rows)))
+}

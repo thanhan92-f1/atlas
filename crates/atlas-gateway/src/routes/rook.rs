@@ -283,6 +283,36 @@ pub(crate) async fn create_ceph_object_store(
 // ---- raw disk -> OSD provisioning ----
 
 #[derive(Debug, Deserialize)]
+pub(crate) struct ListNodeDevicesParams {
+    namespace: Option<String>,
+}
+
+/// `GET /ceph/nodes/{node_name}/devices` — Rook's own device-discovery data for one node (the same
+/// oracle `add_ceph_device` checks against, see below), surfaced read-only so an operator can see
+/// what's actually there before picking a `device_path` instead of guessing. Returns an empty list
+/// (not an error) when Rook's discovery ConfigMap doesn't exist yet — the mutating path below still
+/// fails closed on its own if that data is genuinely required for a claim.
+pub(crate) async fn list_ceph_node_devices(
+    State(s): State<AppState>,
+    Path(node_name): Path<String>,
+    Query(q): Query<ListNodeDevicesParams>,
+) -> AppResult<Json<Value>> {
+    require_k8s(&s)?;
+    let namespace = q
+        .namespace
+        .unwrap_or_else(|| s.config.rook_namespace.clone());
+    let devices = s
+        .k8s
+        .as_ref()
+        .unwrap()
+        .get_local_devices(&namespace, &node_name)
+        .await
+        .map_err(|e| AppError::Driver(e.to_string()))?
+        .unwrap_or_default();
+    Ok(Json(json!(devices)))
+}
+
+#[derive(Debug, Deserialize)]
 pub(crate) struct AddCephDeviceBody {
     node_name: String,
     device_path: String,

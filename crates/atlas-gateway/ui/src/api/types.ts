@@ -278,6 +278,31 @@ export interface Osd {
   capacity_bytes?: number | null;
 }
 
+export interface ZfsBlockDevice {
+  path: string;
+  size_bytes: number;
+  read_only: boolean;
+  has_children: boolean;
+  fstype?: string | null;
+  pttype?: string | null;
+  mounted_at?: string | null;
+  wipefs_signatures: string[];
+  member_of_zpool?: string | null;
+  is_root_or_boot_disk: boolean;
+  status: "empty" | "has_data" | "mounted" | "read_only" | "root_or_boot";
+}
+
+// Passed through verbatim from Rook's own `local-device-<node>` discovery ConfigMap schema.
+export interface CephNodeDevice {
+  name: string;
+  size?: number;
+  filesystem?: string;
+  empty?: boolean;
+  type?: string;
+  rotational?: boolean;
+  [key: string]: unknown;
+}
+
 export interface MetricsSummary {
   raw_capacity_bytes: number;
   used_capacity_bytes: number;

@@ -235,3 +235,18 @@ async fn ceph_add_device_requires_kubernetes() {
         .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
 }
+
+// ---- GET /zfs/devices: the Disks UI's device picker, not just a blind text field ----
+
+#[tokio::test]
+async fn zfs_devices_fake_mode_reports_only_the_fixture_device() {
+    let base = format!("http://{}/api/atlas/v1", spawn(true).await);
+    let c = reqwest::Client::new();
+    let resp = c.get(format!("{base}/zfs/devices")).send().await.unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let devices: Value = resp.json().await.unwrap();
+    let devices = devices.as_array().unwrap();
+    assert_eq!(devices.len(), 1);
+    assert_eq!(devices[0]["path"], "/dev/vdz");
+    assert_eq!(devices[0]["status"], "empty");
+}

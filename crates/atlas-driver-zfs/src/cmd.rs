@@ -240,6 +240,152 @@ pub async fn inspect_device(device_path: &str) -> Result<DeviceCheck, DriverErro
     Ok(check)
 }
 
+/// One row of `list_whole_disks`'s result — the read-only "what's out there" listing the Disks UI
+/// renders as a picker instead of a blind device-path text field. Deliberately not `DeviceCheck`:
+/// this describes N devices found by one bulk scan, not the single-device pass/fail decision
+/// `inspect_device`/`refusal_reason` make right before a mutating command runs — that check is
+/// re-run, authoritatively, against the chosen device at that point; this listing is advisory.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct BlockDevice {
+    pub path: String,
+    pub size_bytes: u64,
+    pub read_only: bool,
+    pub has_children: bool,
+    pub fstype: Option<String>,
+    pub pttype: Option<String>,
+    pub mounted_at: Option<String>,
+    pub wipefs_signatures: Vec<String>,
+    pub member_of_zpool: Option<String>,
+    pub is_root_or_boot_disk: bool,
+}
+
+impl BlockDevice {
+    /// A single coarse status label for the UI to badge/sort by — the fields above carry the
+    /// actual detail. Ordered the same way `DeviceCheck::refusal_reason` is (root/boot first).
+    pub fn status(&self) -> &'static str {
+        if self.is_root_or_boot_disk {
+            "root_or_boot"
+        } else if self.read_only {
+            "read_only"
+        } else if self.mounted_at.is_some() {
+            "mounted"
+        } else if self.has_children
+            || self.fstype.is_some()
+            || self.pttype.is_some()
+            || !self.wipefs_signatures.is_empty()
+            || self.member_of_zpool.is_some()
+        {
+            "has_data"
+        } else {
+            "empty"
+        }
+    }
+}
+
+/// Bulk-scans every whole disk on the local host (partitions/loop/optical devices excluded) — the
+/// same signals `inspect_device` gathers for one device, run once for all of them, so the Disks UI
+/// can show a picker instead of a blind device-path text field.
+pub async fn list_whole_disks() -> Result<Vec<BlockDevice>, DriverError> {
+    let (ok, stdout, stderr) = run(
+        "lsblk",
+        &["-J", "-b", "-o", "NAME,SIZE,TYPE,MOUNTPOINT,FSTYPE,PTTYPE,RO"],
+    )
+    .await?;
+    if !ok {
+        return Err(DriverError::Unreachable(format!("lsblk: {stderr}")));
+    }
+    let parsed: serde_json::Value = serde_json::from_str(&stdout)
+        .map_err(|e| DriverError::Parse(format!("lsblk: {e} (stderr: {stderr})")))?;
+    let devices = parsed
+        .get("blockdevices")
+        .and_then(|d| d.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    // Root/boot-disk resolution done once, matched by basename against every listed disk — see
+    // `inspect_device`'s step 4 for why this is dynamic rather than a static first-letter guess.
+    let mut root_boot_basenames = std::collections::HashSet::new();
+    for mountpoint in ["/", "/boot", "/boot/efi"] {
+        if let Some(disk) = resolve_mounted_disk_basename(mountpoint).await {
+            root_boot_basenames.insert(disk);
+        }
+    }
+    // zpool membership done once too (see `inspect_device`'s step 5); by-id aliases are re-filtered
+    // per device below.
+    let (_, status_stdout, _) = run("zpool", &["status", "-P"]).await?;
+    let (_, by_id_listing, _) = run("ls", &["-la", "/dev/disk/by-id/"]).await.unwrap_or_default();
+
+    let mut out = Vec::new();
+    for dev in &devices {
+        if dev.get("type").and_then(|v| v.as_str()) != Some("disk") {
+            continue;
+        }
+        let Some(name) = dev.get("name").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        let path = format!("/dev/{name}");
+        let size_bytes = dev.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
+        let read_only = match dev.get("ro") {
+            Some(serde_json::Value::Bool(b)) => *b,
+            Some(serde_json::Value::String(s)) => s == "1",
+            _ => false,
+        };
+        let has_children = dev
+            .get("children")
+            .and_then(|c| c.as_array())
+            .is_some_and(|a| !a.is_empty());
+        let fstype = dev
+            .get("fstype")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let pttype = dev
+            .get("pttype")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let mounted_at = dev
+            .get("mountpoint")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let (_, wipefs_stdout, _) = run("wipefs", &["-n", &path]).await.unwrap_or_default();
+        let wipefs_signatures: Vec<String> = wipefs_stdout
+            .lines()
+            .skip(1)
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| l.trim().to_string())
+            .collect();
+        let member_of_zpool = if status_stdout.is_empty() {
+            None
+        } else {
+            let by_id_aliases: Vec<String> = by_id_listing
+                .lines()
+                .filter(|l| l.ends_with(&format!("/{name}")))
+                .filter_map(|l| l.split(" -> ").next())
+                .filter_map(|before_arrow| before_arrow.split_whitespace().last())
+                .map(|alias| format!("/dev/disk/by-id/{alias}"))
+                .collect();
+            let by_id_aliases: Vec<&str> = by_id_aliases.iter().map(String::as_str).collect();
+            find_zpool_member(&status_stdout, &path, name, &by_id_aliases)
+        };
+
+        out.push(BlockDevice {
+            path,
+            size_bytes,
+            read_only,
+            has_children,
+            fstype,
+            pttype,
+            mounted_at,
+            wipefs_signatures,
+            member_of_zpool,
+            is_root_or_boot_disk: root_boot_basenames.contains(name),
+        });
+    }
+    Ok(out)
+}
+
 /// Scan `zpool status -P` output for a pool that lists this device (or a by-id alias resolving to
 /// it) as a vdev. Returns the owning pool's name if found.
 fn find_zpool_member(

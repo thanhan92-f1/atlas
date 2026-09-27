@@ -5,14 +5,24 @@
 // button on Backends/Cluster, and deliberately kept thin: one form, one recent-jobs table.
 import { useState } from "react";
 import { submitJob } from "../api/client";
-import { useInvalidate, useJobs, useNodes } from "../api/hooks";
+import { useCephNodeDevices, useInvalidate, useJobs, useNodes, useZfsDevices } from "../api/hooks";
 import { Badge, FormModal, type FormField } from "../ui/kit";
 import { Table } from "../ui/Table";
 import { ListPage } from "../ui/templates/ListPage";
 import { navCrumbs } from "../nav/routes";
-import { stateKind, timeAgo } from "../lib/format";
+import { fmtBytes, stateKind, timeAgo } from "../lib/format";
 
 const JOB_TYPES = new Set(["zfs.pool.create_from_device", "ceph.osd.add_device"]);
+
+// Devices in these states are never a valid target (mirrors the server's own unconditional
+// refusals) — left out of the picker entirely rather than shown disabled, since the plain
+// options-based FormField has no per-option disabled state.
+const ZFS_UNSELECTABLE = new Set(["root_or_boot", "mounted", "read_only"]);
+
+const ZFS_STATUS_LABEL: Record<string, string> = {
+  empty: "empty",
+  has_data: "has data — wipeable",
+};
 
 function escapeRegExp(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -20,12 +30,28 @@ function escapeRegExp(s: string): string {
 
 export default function Disks() {
   const [open, setOpen] = useState(false);
+  const [selectedNode, setSelectedNode] = useState("");
   const { data: nodes } = useNodes();
   const { data: jobs } = useJobs();
+  const { data: zfsDevices } = useZfsDevices();
+  const { data: cephDevices } = useCephNodeDevices(selectedNode);
   const inv = useInvalidate();
 
   const nodeOptions = (nodes || []).map((n) => ({ value: n.host, label: n.host }));
   const recentJobs = (jobs || []).filter((j) => JOB_TYPES.has(j.job_type));
+
+  const zfsDeviceOptions = (zfsDevices || [])
+    .filter((d) => !ZFS_UNSELECTABLE.has(d.status))
+    .map((d) => ({
+      value: d.path,
+      label: `${d.path} · ${fmtBytes(d.size_bytes)} · ${ZFS_STATUS_LABEL[d.status] ?? d.status}`,
+    }));
+  const cephDeviceOptions = (cephDevices || [])
+    .filter((d) => d.empty && !d.filesystem)
+    .map((d) => ({
+      value: `/dev/${d.name}`,
+      label: `/dev/${d.name}${d.size ? ` · ${fmtBytes(d.size)}` : ""} · empty`,
+    }));
 
   const fields = (vals: Record<string, string>): FormField[] => {
     const backend = vals.backend || "zfs";
@@ -55,16 +81,27 @@ export default function Disks() {
         hint: "zpool name — lowercase, no spaces.",
       });
     }
-    out.push({
-      name: "device_path",
-      label: "Device path",
-      placeholder: "/dev/sdb",
-      pattern: /^\/dev\/[a-zA-Z0-9/_-]+$/,
-      hint:
-        backend === "zfs"
-          ? "Exact path on the host the gateway runs on. This will be wiped."
-          : "Exact path as seen on the selected node. This will be wiped.",
-    });
+    if (backend === "zfs") {
+      out.push({
+        name: "device_path",
+        label: "Device (detected on this host)",
+        options: zfsDeviceOptions,
+        hint: zfsDeviceOptions.length
+          ? "Root/boot, mounted, and read-only devices are never shown — see docs/DISKS.md."
+          : "No usable whole disks detected on this host.",
+      });
+    } else {
+      out.push({
+        name: "device_path",
+        label: "Device (detected on the selected node)",
+        options: cephDeviceOptions,
+        hint: !vals.node_name
+          ? "Pick a node first."
+          : cephDeviceOptions.length
+            ? "Only devices Rook's own discovery reports empty are shown."
+            : "No empty devices discovered on this node yet (needs ROOK_ENABLE_DISCOVERY_DAEMON).",
+      });
+    }
     if (backend === "zfs") {
       out.push({
         name: "wipe_existing",
@@ -128,6 +165,7 @@ export default function Disks() {
         title="Provision a raw device"
         fields={fields}
         submitLabel="Provision (destructive)"
+        onValuesChange={(v) => setSelectedNode(v.node_name || "")}
         danger
         onSubmit={async (vals) => {
           if (vals.backend === "ceph") {
