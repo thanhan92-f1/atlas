@@ -35,13 +35,25 @@ FROM docker.io/library/debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a
 # manifest); these packages only provide the userspace CLI the driver shells out to.
 # zfsutils-linux ships in Debian's `contrib` component (CDDL, not in `main`) — enable it before
 # installing; nothing else in this image needs it.
+# File capabilities (setcap), not `privileged`/`runAsUser: 0`: the gateway runs as a non-root uid
+# (10001, see below) and — confirmed live against the deploy target — Kubernetes does NOT populate
+# a non-root container's effective/ambient capability set from `privileged: true` or from
+# `securityContext.capabilities.add` (only the *bounding* set changes; CapEff/CapPrm/CapAmb stayed
+# all-zero either way, so `wipefs`/`zpool` still got `Permission denied` opening a root:disk 0660
+# device). File capabilities on the binaries themselves ARE honored regardless of the calling
+# process's uid, independent of that ambient-capability gap — the standard mechanism for "grant
+# capabilities to one binary, not root". Requires `allowPrivilegeEscalation: true` in the manifest
+# (the default no-new-privs behavior otherwise suppresses file capabilities on exec) and the target
+# capabilities still present in the container's bounding set (`capabilities.add` in the manifest).
 # Oracle Instant Client (Basic Lite) + libaio provide libclntsh.so, which ODPI-C dlopens at runtime
 # for the DataBridge `oracle` connector; freely redistributable. The URL is a build ARG so air-gapped
 # builds can point at an internal mirror, e.g. --build-arg ORACLE_IC_URL=https://mirror.corp/…zip
 ARG ORACLE_IC_URL=https://download.oracle.com/otn_software/linux/instantclient/2113000/instantclient-basiclite-linux.x64-21.13.0.0.0dbru.zip
 RUN echo "deb http://deb.debian.org/debian bookworm contrib" >> /etc/apt/sources.list \
     && apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl unzip libaio1 zfsutils-linux util-linux \
+    && apt-get install -y --no-install-recommends ca-certificates curl unzip libaio1 zfsutils-linux util-linux libcap2-bin \
+    && setcap cap_dac_override,cap_sys_admin=ep /usr/sbin/wipefs /usr/sbin/zpool /usr/sbin/zfs /usr/bin/lsblk /usr/bin/findmnt /usr/sbin/blockdev \
+    && apt-get purge -y --auto-remove libcap2-bin \
     && curl -fsSL -o /tmp/ic.zip "$ORACLE_IC_URL" \
     && mkdir -p /opt/oracle && unzip -q /tmp/ic.zip -d /opt/oracle && rm /tmp/ic.zip \
     && apt-get purge -y --auto-remove curl unzip \
