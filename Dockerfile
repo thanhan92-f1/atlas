@@ -33,11 +33,14 @@ FROM docker.io/library/debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a
 # ATLAS_ZFS_DRIVER_MODE=real against a raw host disk (see docs/DISKS.md) — the container still
 # needs the host's /dev and its `zfs` kernel module (privileged + hostPath /dev in the k8s
 # manifest); these packages only provide the userspace CLI the driver shells out to.
+# zfsutils-linux ships in Debian's `contrib` component (CDDL, not in `main`) — enable it before
+# installing; nothing else in this image needs it.
 # Oracle Instant Client (Basic Lite) + libaio provide libclntsh.so, which ODPI-C dlopens at runtime
 # for the DataBridge `oracle` connector; freely redistributable. The URL is a build ARG so air-gapped
 # builds can point at an internal mirror, e.g. --build-arg ORACLE_IC_URL=https://mirror.corp/…zip
 ARG ORACLE_IC_URL=https://download.oracle.com/otn_software/linux/instantclient/2113000/instantclient-basiclite-linux.x64-21.13.0.0.0dbru.zip
-RUN apt-get update \
+RUN echo "deb http://deb.debian.org/debian bookworm contrib" >> /etc/apt/sources.list \
+    && apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl unzip libaio1 zfsutils-linux util-linux \
     && curl -fsSL -o /tmp/ic.zip "$ORACLE_IC_URL" \
     && mkdir -p /opt/oracle && unzip -q /tmp/ic.zip -d /opt/oracle && rm /tmp/ic.zip \
