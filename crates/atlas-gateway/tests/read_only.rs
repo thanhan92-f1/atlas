@@ -55,6 +55,7 @@ async fn spawn() -> (SocketAddr, sqlx::AnyPool) {
         rustfs_endpoint: None,
         rustfs_buckets: Vec::new(),
         rustfs_driver_mode: atlas_common::config::DriverMode::Fake,
+        rustfs_credentials_namespace: "zyvor-system".into(),
         oidc: None,
         rook_namespace: "rook-ceph".into(),
         rook_cluster_name: "rook-ceph".into(),
@@ -230,6 +231,7 @@ async fn spawn_auth(secret: &str) -> String {
         rustfs_endpoint: None,
         rustfs_buckets: Vec::new(),
         rustfs_driver_mode: atlas_common::config::DriverMode::Fake,
+        rustfs_credentials_namespace: "zyvor-system".into(),
         oidc: None,
         rook_namespace: "rook-ceph".into(),
         rook_cluster_name: "rook-ceph".into(),
@@ -902,11 +904,13 @@ async fn bucket_create_enqueues_and_lists() {
     // The inventory row is now only written once k8s has accepted the OBC create (dispatch-side,
     // not the HTTP handler) — a failed job must leave no row at all, matching `volume.create`'s
     // behavior, instead of a permanent orphan with `bucket_name: null`.
+    // Explicit backend_id: RustFS is now the default backend when omitted, and isn't enabled in
+    // this test's Config — this test specifically exercises the Ceph/Rook OBC path.
     let (addr, _pool) = spawn().await;
     let base = format!("http://{addr}");
     let resp = client()
         .post(format!("{base}/api/atlas/v1/buckets"))
-        .json(&serde_json::json!({ "name": "backups-acme" }))
+        .json(&serde_json::json!({ "name": "backups-acme", "backend_id": "bkd_ceph_lab" }))
         .send()
         .await
         .unwrap();
@@ -968,6 +972,7 @@ async fn backup_requires_known_volume_and_bound_bucket() {
         "bkt_1",
         "t1",
         "b1",
+        "bkd_ceph_lab",
         "rook-ceph",
         "b1",
         "zyvor-rgw-bucket",
@@ -1040,6 +1045,7 @@ async fn restore_from_backup_enqueues() {
         "bkt_r",
         "t1",
         "b",
+        "bkd_ceph_lab",
         "rook-ceph",
         "b",
         "zyvor-rgw-bucket",
@@ -1095,6 +1101,7 @@ async fn backup_delete_enqueues() {
         "bkt_bd",
         "t1",
         "b",
+        "bkd_ceph_lab",
         "rook-ceph",
         "b",
         "zyvor-rgw-bucket",
@@ -1147,6 +1154,7 @@ async fn bucket_delete_guarded_by_backups() {
         "bkt_empty",
         "t1",
         "e",
+        "bkd_ceph_lab",
         "rook-ceph",
         "e",
         "zyvor-rgw-bucket",
@@ -1167,6 +1175,7 @@ async fn bucket_delete_guarded_by_backups() {
         "bkt_used",
         "t1",
         "u",
+        "bkd_ceph_lab",
         "rook-ceph",
         "u",
         "zyvor-rgw-bucket",
@@ -1210,6 +1219,7 @@ async fn backup_retention_prunes_old() {
         "bkt_ret",
         "t1",
         "b",
+        "bkd_ceph_lab",
         "rook-ceph",
         "b",
         "zyvor-rgw-bucket",

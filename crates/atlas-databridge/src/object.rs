@@ -460,10 +460,11 @@ async fn run_migration_inner(
     let source_provider = ObjectProvider::parse(&rec.source_provider);
     let dest_provider = ObjectProvider::parse(&rec.dest_provider);
 
-    // The destination is always Ceph RGW (S3 protocol).
+    // The destination must be an S3-protocol endpoint — RustFS by default, Ceph RGW or another
+    // S3-compatible target also supported (any `dest_provider` that resolves to `S3Compatible`).
     if !dest_provider.is_s3_protocol() {
         anyhow::bail!(
-            "destination provider '{}' must be S3-protocol (Ceph RGW is the migration target)",
+            "destination provider '{}' must be S3-protocol (e.g. RustFS or Ceph RGW)",
             rec.dest_provider
         );
     }

@@ -98,7 +98,8 @@ Full write-up: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## 🧰 Capabilities
 
-- **Intent → storage** — volumes, snapshots, clones, CephFS RWX, RGW buckets via REST + gRPC
+- **Intent → storage** — volumes, snapshots, clones, CephFS RWX, S3 buckets via REST + gRPC
+  (RustFS is the default object backend; Ceph RGW is explicitly selectable via `backend_id`)
 - **Pluggable drivers** — real Ceph first; NFS + ZFS + Longhorn + RustFS; fake driver for local demo
 - **DataBridge** — cloud-to-edge DB migration (six engines, CDC, cutover) on Ceph
 - **Day-2** — alerts, maintenance, governance, quotas, upgrade preflight, DR scaffolding

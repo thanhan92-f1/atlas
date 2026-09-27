@@ -16,18 +16,20 @@ pub async fn insert_bucket(
     id: &str,
     tenant_id: &str,
     name: &str,
+    backend_id: &str,
     namespace: &str,
     obc_name: &str,
     storage_class: &str,
 ) -> Result<()> {
     sqlx::query(
-        "INSERT INTO storage_buckets (id, tenant_id, name, namespace, obc_name, storage_class, state)
-         VALUES ($1, $2, $3, $4, $5, $6, 'pending')
+        "INSERT INTO storage_buckets (id, tenant_id, name, backend_id, namespace, obc_name, storage_class, state)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending')
          ON CONFLICT DO NOTHING",
     )
     .bind(id)
     .bind(tenant_id)
     .bind(name)
+    .bind(backend_id)
     .bind(namespace)
     .bind(obc_name)
     .bind(storage_class)
@@ -96,7 +98,7 @@ pub async fn list_buckets(pool: &AnyPool) -> Result<Vec<StorageBucket>> {
 
 fn select(tail: &str) -> String {
     format!(
-        "SELECT id, tenant_id, name, bucket_name, endpoint, region, secret_ref, namespace, state, created_at
+        "SELECT id, tenant_id, name, backend_id, bucket_name, endpoint, region, secret_ref, namespace, state, created_at
          FROM storage_buckets {tail}"
     )
 }
@@ -106,6 +108,7 @@ fn row_to_bucket(r: sqlx::any::AnyRow) -> StorageBucket {
         id: r.get("id"),
         tenant_id: r.get("tenant_id"),
         name: r.get("name"),
+        backend_id: r.get("backend_id"),
         bucket_name: r.get("bucket_name"),
         endpoint: r.get("endpoint"),
         region: r.get("region"),

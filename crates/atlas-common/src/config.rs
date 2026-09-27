@@ -183,6 +183,12 @@ pub struct Config {
     /// `Fake` (default) serves canned fixtures; `Real` calls `rustfs_endpoint`'s health/S3
     /// `ListBuckets` endpoints. See `DriverMode`.
     pub rustfs_driver_mode: DriverMode,
+    /// Kubernetes namespace holding the Secret named by a RustFS backend's `connection_ref`
+    /// (`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`) — defaults to the namespace the gateway
+    /// itself runs in, since RustFS has no per-bucket credential-provisioning operator the way
+    /// Rook's ObjectBucketClaim does; one backend-level service credential is shared across
+    /// every bucket Atlas creates on it.
+    pub rustfs_credentials_namespace: String,
     /// OIDC/SSO login (`None` = feature disabled — no unauthenticated OIDC routes are mounted).
     pub oidc: Option<OidcConfig>,
     /// Kubernetes namespace the Rook operator/CephCluster runs in — used when reading Rook's own
@@ -409,6 +415,8 @@ impl Config {
             rustfs_driver_mode: DriverMode::from_env_str(
                 &std::env::var("ATLAS_RUSTFS_DRIVER_MODE").unwrap_or_else(|_| "fake".into()),
             ),
+            rustfs_credentials_namespace: std::env::var("ATLAS_RUSTFS_CREDENTIALS_NAMESPACE")
+                .unwrap_or_else(|_| "zyvor-system".into()),
             oidc: oidc_from_env(),
             rook_namespace: std::env::var("ATLAS_ROOK_NAMESPACE")
                 .ok()
@@ -510,6 +518,7 @@ impl Default for Config {
             rustfs_endpoint: None,
             rustfs_buckets: Vec::new(),
             rustfs_driver_mode: DriverMode::Fake,
+            rustfs_credentials_namespace: "zyvor-system".into(),
             oidc: None,
             rook_namespace: "rook-ceph".into(),
             rook_cluster_name: "rook-ceph".into(),

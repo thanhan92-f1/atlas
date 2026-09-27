@@ -54,7 +54,13 @@ This is the customer-facing onboarding guide — how to access the product, your
      same deterministic capacity fixture (8 TB / 30% used) regardless of what server/exports you
      give it — it never actually runs `showmount`/`df` or `zpool list`/`zfs list` against it. Real
      capacity/volume discovery for these two backends is not implemented; only Ceph is backed by
-     the real driver.
+     the real driver. **RustFS** (the default backend for new buckets) is a mixed case: bucket
+     create/delete and object PUT/GET/DELETE/list/presigned-URLs are real, signed S3 calls — but
+     its `discover`/capacity reporting is still anonymous and fixture-shaped like NFS/ZFS, and
+     bucket `stats` isn't implemented for it yet. **Longhorn** has a real, signed read path (node
+     disk capacity, volume health via its Kubernetes CRDs) but no native write path of its own —
+     PVC provisioning for it goes through the existing Kubernetes StorageClass path, not this
+     driver.
 - **Provision a volume by intent**
   1. `POST /api/atlas/v1/volumes` with `{ "tenant_id": "...", "name": "billing-db-root", "size_bytes": 3221225472, "kind": "block", "policy": "database", "owner": {...} }` → `202 + job_id`.
   1. Poll `GET /api/atlas/v1/jobs/{id}` (or watch SSE at `/api/atlas/v1/jobs/{id}/watch`) until `succeeded`.
@@ -94,7 +100,7 @@ _Provision and manage RBD block, CephFS file, and RGW/S3 object storage from one
   - **How:** REST `POST /api/atlas/v1/volumes` (`kind: "block"`) → `202 + job_id`; `GET /volumes/{id}`, `DELETE /volumes/{id}`. CLI: `atlasctl create-volume NAME --size-gib 5 --policy database`. Console: Storage Center → Volumes → Create.
 - **CephFS File Shares (RWX)** — Provision shared read-write-many file storage on CephFS for workloads that need concurrent access. — _Multi-writer file storage without standing up a separate NAS._
   - **How:** REST `POST /api/atlas/v1/volumes` with `"policy": "shared"` (recommended — always resolves to CephFS/RWX correctly) or an explicit placement (`kubernetes.storage_class: "zyvor-cephfs-shared"`, `access_mode: ReadWriteMany`, `kind: "filesystem"` — set `kind` explicitly on this path, since it isn't inferred from the storage class). Console: Storage Center → Volumes → Create (File).
-- **Object Buckets** — Create S3 buckets via ObjectBucketClaim with per-bucket quotas, stats, and presigned upload/download URLs. — _Self-service object storage with quota control and short-lived access links._
+- **Object Buckets** — Create S3 buckets on RustFS (the default backend — a direct signed `CreateBucket` call, no Kubernetes operator involved) or Ceph RGW via `ObjectBucketClaim` (pass `"backend_id": "bkd_ceph_lab"`), with presigned upload/download URLs; per-bucket quotas and stats remain Ceph-only for now. — _Self-service object storage, portable across backends._
   - **How:** REST `POST /api/atlas/v1/buckets` with `{ "name": "...", "max_objects": ..., "max_size": "2G" }`; list `GET /buckets`; usage/quota via `GET /buckets/{id}/stats`. CLI: `atlasctl create-bucket NAME`. Console: Storage Center → Buckets. `name` must be a valid Kubernetes/S3-style name, 3-63 characters (lowercase, `-`/`.`, no uppercase or underscores) — an invalid name is rejected immediately rather than failing after the fact.
 - **Direct RBD Image Ops** — Provision, clone, resize, flatten, snapshot, and roll back RBD images directly, with per-image usage tracking. — _Full low-level control when you need to bypass the PVC abstraction — the only bypass-CSI path in Atlas, for non-Kubernetes consumers like machina/libvirt._
   - **How:** REST `POST /api/atlas/v1/rbd-images {name, size_bytes, pool?}` to create, `.../clone {name, snap?}` for a golden-image copy, `.../resize`, `.../flatten`, `.../snapshots`, `.../rollback`, `DELETE /rbd-images/{pool}/{image}`. Same cordon + quota admission as `POST /volumes`. CLI: `atlasctl create-rbd-image`. Console: Storage Center → Ceph → RBD Images.

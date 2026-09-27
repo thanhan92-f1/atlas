@@ -410,6 +410,10 @@ pub struct StorageBucket {
     pub id: String,
     pub tenant_id: String,
     pub name: String,
+    /// Which backend provisioned this bucket (e.g. `bkd_ceph_lab`, `bkd_rustfs_lab`). `None` for
+    /// rows created before this field existed — routes must treat that the same as Ceph, the
+    /// historical default before any other backend could create buckets.
+    pub backend_id: Option<String>,
     /// The actual bucket name RGW assigned (OBC may generate one).
     pub bucket_name: Option<String>,
     /// S3 endpoint (e.g. http://rook-ceph-rgw-...:80).

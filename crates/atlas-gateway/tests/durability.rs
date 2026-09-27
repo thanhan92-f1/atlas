@@ -52,6 +52,7 @@ fn config_for(database_url: &str) -> Config {
         rustfs_endpoint: None,
         rustfs_buckets: Vec::new(),
         rustfs_driver_mode: atlas_common::config::DriverMode::Fake,
+        rustfs_credentials_namespace: "zyvor-system".into(),
         oidc: None,
         rook_namespace: "rook-ceph".into(),
         rook_cluster_name: "rook-ceph".into(),

@@ -45,10 +45,14 @@ pub(crate) async fn dispatch(
             volumes::dispatch_volumes(pool, k8s, tenant_id, spec).await
         }
         JobSpec::BucketCreate { .. }
+        | JobSpec::BucketCreateRustfs { .. }
         | JobSpec::BackupCreate { .. }
         | JobSpec::RestoreBackup { .. }
         | JobSpec::BackupDelete { .. }
-        | JobSpec::BucketDelete { .. } => object::dispatch_object(pool, k8s, tenant_id, spec).await,
+        | JobSpec::BucketDelete { .. }
+        | JobSpec::BucketDeleteRustfs { .. } => {
+            object::dispatch_object(pool, k8s, tenant_id, spec).await
+        }
         JobSpec::CephPoolCreate { .. }
         | JobSpec::CephPoolDelete { .. }
         | JobSpec::CephFilesystemCreate { .. }

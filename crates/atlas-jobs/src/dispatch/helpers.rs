@@ -49,6 +49,40 @@ pub(crate) async fn build_s3_target(
     )
 }
 
+/// Resolve a backend row's `connection_ref` (a Kubernetes Secret name holding
+/// `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`) into an `S3Target` — the RustFS analogue of
+/// `build_s3_target` above, for backends with one shared backend-level service credential rather
+/// than a per-bucket auto-provisioned Secret (RustFS has no ObjectBucketClaim-style operator).
+/// Also returns the resolved `connection_ref` itself, since callers need it verbatim to record as
+/// the bucket row's `secret_ref` (so a later object-level request can re-resolve credentials the
+/// same way `bucket_s3_target` already does for RGW buckets).
+pub(crate) async fn build_s3_target_for_backend(
+    k8s: &K8sDriver,
+    pool: &AnyPool,
+    backend_id: &str,
+    credentials_namespace: &str,
+    endpoint: &str,
+    region: &str,
+    bucket_name: &str,
+) -> Result<(atlas_driver_rgw::S3Target, String)> {
+    let backend = atlas_inventory::get_backend(pool, backend_id)
+        .await?
+        .ok_or_else(|| anyhow!("backend {backend_id} not registered"))?;
+    let connection_ref = backend.connection_ref.ok_or_else(|| {
+        anyhow!("backend {backend_id} has no connection_ref (credentials secret) configured")
+    })?;
+    let target = build_s3_target(
+        k8s,
+        credentials_namespace,
+        &connection_ref,
+        endpoint,
+        region,
+        bucket_name,
+    )
+    .await?;
+    Ok((target, connection_ref))
+}
+
 /// Read a backup manifest object back from RGW (used by restore to verify integrity).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn read_backup_manifest(

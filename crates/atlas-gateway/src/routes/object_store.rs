@@ -71,6 +71,13 @@ pub(crate) async fn bucket_stats(
         .bucket_name
         .ok_or_else(|| AppError::Validation("bucket has no bucket_name".into()))?;
 
+    if b.backend_id.as_deref() == Some(crate::startup::RUSTFS_BACKEND_ID) {
+        return Ok(Json(json!({
+            "bucket_id": id, "bucket": name, "available": false,
+            "reason": "bucket stats are not implemented for the RustFS backend (no radosgw-admin equivalent wired up yet)",
+        })));
+    }
+
     if s.config.ceph_driver_mode == CephDriverMode::Fake {
         return Ok(Json(json!({
             "bucket_id": id, "bucket": name, "available": true,
@@ -164,12 +171,18 @@ pub(crate) async fn bucket_s3_target(
     let secret_key = secret
         .get("AWS_SECRET_ACCESS_KEY")
         .ok_or_else(|| AppError::Internal("bucket secret missing AWS_SECRET_ACCESS_KEY".into()))?;
-    let endpoint = s
-        .config
-        .rgw_public_endpoint
-        .clone()
-        .or(b.endpoint)
-        .unwrap_or_default();
+    // `rgw_public_endpoint` is a browser-reachable override for Ceph RGW specifically (so
+    // presigned URLs work from outside the cluster) — it must never apply to a RustFS (or any
+    // other non-Ceph) bucket's own stored endpoint, which is already the real, correct one.
+    let endpoint = if b.backend_id.as_deref() == Some(crate::startup::RUSTFS_BACKEND_ID) {
+        b.endpoint.unwrap_or_default()
+    } else {
+        s.config
+            .rgw_public_endpoint
+            .clone()
+            .or(b.endpoint)
+            .unwrap_or_default()
+    };
     atlas_driver_rgw::S3Target::new(
         &endpoint,
         &b.region.unwrap_or_else(|| "us-east-1".into()),
@@ -395,11 +408,23 @@ pub(crate) async fn delete_bucket(
         )));
     }
 
-    let spec = JobSpec::BucketDelete {
-        bucket_id: id.clone(),
-        namespace: bucket.namespace.unwrap_or_else(|| "rook-ceph".into()),
-        // The OBC name equals the bucket's registered name (set at creation).
-        obc_name: bucket.name,
+    // `NULL`/missing backend_id means the row predates this field — the historical default was
+    // always Ceph, so that's the safe backward-compatible assumption here.
+    let spec = if bucket.backend_id.as_deref() == Some(crate::startup::RUSTFS_BACKEND_ID) {
+        JobSpec::BucketDeleteRustfs {
+            bucket_id: id.clone(),
+            backend_id: crate::startup::RUSTFS_BACKEND_ID.into(),
+            bucket_name: bucket.bucket_name.clone().unwrap_or(bucket.name),
+            region: bucket.region.clone().unwrap_or_else(|| "us-east-1".into()),
+            credentials_namespace: bucket.namespace.unwrap_or_else(|| "zyvor-system".into()),
+        }
+    } else {
+        JobSpec::BucketDelete {
+            bucket_id: id.clone(),
+            namespace: bucket.namespace.unwrap_or_else(|| "rook-ceph".into()),
+            // The OBC name equals the bucket's registered name (set at creation).
+            obc_name: bucket.name,
+        }
     };
     let job_id = ids::job_id();
     let job = s
@@ -425,15 +450,21 @@ pub(crate) async fn delete_bucket(
 #[derive(Debug, Deserialize)]
 pub(crate) struct CreateBucketBody {
     name: String,
+    /// Which backend provisions this bucket. Defaults to RustFS (the primary object backend as
+    /// of this change) — pass `"bkd_ceph_lab"` explicitly for the original Rook/RGW path.
+    #[serde(default)]
+    backend_id: Option<String>,
     namespace: Option<String>,
     storage_class: Option<String>,
-    /// Optional RGW quota: max object count.
+    /// Optional RGW quota: max object count. Ignored for RustFS (no quota mechanism wired up yet).
     max_objects: Option<i64>,
-    /// Optional RGW quota: max size (e.g. "2G").
+    /// Optional RGW quota: max size (e.g. "2G"). Ignored for RustFS.
     max_size: Option<String>,
 }
 
-/// `POST /buckets` — provision an RGW bucket via an ObjectBucketClaim (async job).
+/// `POST /buckets` — provision a bucket on the requested backend (async job). Defaults to RustFS
+/// (direct signed S3 `CreateBucket`, no Kubernetes operator involved); `backend_id: "bkd_ceph_lab"`
+/// keeps the original Rook `ObjectBucketClaim` path, unchanged.
 pub(crate) async fn create_bucket(
     State(s): State<AppState>,
     Extension(actor): Extension<Actor>,
@@ -451,35 +482,60 @@ pub(crate) async fn create_bucket(
     }
     super::util::validate_k8s_name(&body.name)?;
 
+    let backend_id = atlas_policy::resolve_object_backend(body.backend_id.as_deref());
+
     // Maintenance: a cordoned backend rejects new provisioning (existing buckets are untouched).
-    if atlas_inventory::is_backend_cordoned(&s.pool, CEPH_BACKEND_ID).await? {
+    if atlas_inventory::is_backend_cordoned(&s.pool, &backend_id).await? {
         return Err(AppError::Unavailable(format!(
-            "backend {CEPH_BACKEND_ID} is cordoned for maintenance"
+            "backend {backend_id} is cordoned for maintenance"
         )));
     }
 
-    // The OBC (and its Secret/ConfigMap) live where this gateway can read them.
-    let namespace = body.namespace.unwrap_or_else(|| "rook-ceph".into());
-    let storage_class = body
-        .storage_class
-        .unwrap_or_else(|| "zyvor-rgw-bucket".into());
     let bucket_id = ids::bucket_id();
-    let obc_name = body.name.clone();
-
-    // The inventory row is inserted from the job dispatcher (`dispatch::object::BucketCreate`)
-    // only after k8s has accepted the OBC create call — inserting it here, eagerly, before the
-    // job even runs, left a permanent orphan row (`bucket_name: null`) whenever the OBC creation
-    // later failed (e.g. an invalid name), unlike `volume.create`'s equivalent path which only
-    // ever writes its inventory row after the PVC create call succeeds.
     let job_id = ids::job_id();
-    let spec = JobSpec::BucketCreate {
-        bucket_id: bucket_id.clone(),
-        namespace: namespace.clone(),
-        obc_name,
-        storage_class,
-        max_objects: body.max_objects,
-        max_size: body.max_size.clone(),
+
+    let spec = if backend_id == crate::startup::RUSTFS_BACKEND_ID {
+        if !s.config.rustfs_enable {
+            return Err(AppError::Unavailable(
+                "the RustFS backend is not enabled (set ATLAS_RUSTFS_ENABLE=1 and restart the gateway)"
+                    .into(),
+            ));
+        }
+        JobSpec::BucketCreateRustfs {
+            bucket_id: bucket_id.clone(),
+            backend_id: backend_id.clone(),
+            bucket_name: body.name.clone(),
+            region: "us-east-1".into(),
+            credentials_namespace: s.config.rustfs_credentials_namespace.clone(),
+        }
+    } else if backend_id == CEPH_BACKEND_ID {
+        // The OBC (and its Secret/ConfigMap) live where this gateway can read them.
+        let namespace = body.namespace.unwrap_or_else(|| "rook-ceph".into());
+        let storage_class = body
+            .storage_class
+            .unwrap_or_else(|| "zyvor-rgw-bucket".into());
+        let obc_name = body.name.clone();
+        // The inventory row is inserted from the job dispatcher
+        // (`dispatch::object::BucketCreate`) only after k8s has accepted the OBC create call —
+        // inserting it here, eagerly, before the job even runs, left a permanent orphan row
+        // (`bucket_name: null`) whenever the OBC creation later failed (e.g. an invalid name),
+        // unlike `volume.create`'s equivalent path which only ever writes its inventory row
+        // after the PVC create call succeeds.
+        JobSpec::BucketCreate {
+            bucket_id: bucket_id.clone(),
+            backend_id: backend_id.clone(),
+            namespace,
+            obc_name,
+            storage_class,
+            max_objects: body.max_objects,
+            max_size: body.max_size.clone(),
+        }
+    } else {
+        return Err(AppError::Validation(format!(
+            "unknown or unsupported bucket backend {backend_id:?}"
+        )));
     };
+
     let job = s
         .jobs
         .enqueue(&job_id, "global", &actor.id, spec, None)
@@ -493,13 +549,13 @@ pub(crate) async fn create_bucket(
         "bucket",
         &bucket_id,
         "accepted",
-        Some(json!({ "name": body.name })),
+        Some(json!({ "name": body.name, "backend_id": backend_id })),
         None,
     )
     .await;
     Ok(accepted(
         &job,
-        json!({ "bucket_id": bucket_id, "namespace": namespace }),
+        json!({ "bucket_id": bucket_id, "backend_id": backend_id }),
     ))
 }
 

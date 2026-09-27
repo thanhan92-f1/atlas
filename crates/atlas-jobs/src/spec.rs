@@ -61,6 +61,11 @@ pub enum JobSpec {
     #[serde(rename = "bucket.create")]
     BucketCreate {
         bucket_id: String,
+        /// Added after this variant already existed — defaults to Ceph (the only backend that
+        /// could ever create a bucket via this variant before RustFS existed), so a persisted job
+        /// row from before this field existed still deserializes correctly.
+        #[serde(default = "default_ceph_backend_id")]
+        backend_id: String,
         namespace: String,
         obc_name: String,
         storage_class: String,
@@ -70,6 +75,25 @@ pub enum JobSpec {
         /// Optional RGW quota (OBC additionalConfig): max size (e.g. "2G").
         #[serde(default)]
         max_size: Option<String>,
+    },
+    /// Provision a bucket directly via a signed S3 `CreateBucket` call — no Kubernetes operator
+    /// involved (unlike `BucketCreate`'s Rook ObjectBucketClaim): synchronous, no bind-poll.
+    #[serde(rename = "bucket.create.rustfs")]
+    BucketCreateRustfs {
+        bucket_id: String,
+        backend_id: String,
+        bucket_name: String,
+        region: String,
+        credentials_namespace: String,
+    },
+    /// Delete a bucket created via `BucketCreateRustfs` (direct signed S3 `DeleteBucket`).
+    #[serde(rename = "bucket.delete.rustfs")]
+    BucketDeleteRustfs {
+        bucket_id: String,
+        backend_id: String,
+        bucket_name: String,
+        region: String,
+        credentials_namespace: String,
     },
     /// Back up a volume: snapshot it and write a manifest to an RGW bucket over S3 (PDF §16).
     #[serde(rename = "backup.create")]
@@ -384,10 +408,12 @@ impl JobSpec {
             JobSpec::SnapshotClone { mode, .. } if mode == "restore" => "snapshot.restore",
             JobSpec::SnapshotClone { .. } => "snapshot.clone",
             JobSpec::BucketCreate { .. } => "bucket.create",
+            JobSpec::BucketCreateRustfs { .. } => "bucket.create.rustfs",
             JobSpec::BackupCreate { .. } => "backup.create",
             JobSpec::RestoreBackup { .. } => "backup.restore",
             JobSpec::BackupDelete { .. } => "backup.delete",
             JobSpec::BucketDelete { .. } => "bucket.delete",
+            JobSpec::BucketDeleteRustfs { .. } => "bucket.delete.rustfs",
             JobSpec::RbdCreate { .. } => "rbd.create",
             JobSpec::RbdDelete { .. } => "rbd.delete",
             JobSpec::RbdClone { .. } => "rbd.clone",
@@ -421,4 +447,10 @@ impl JobSpec {
             JobSpec::CephOsdAddDevice { .. } => "ceph.osd.add_device",
         }
     }
+}
+
+/// `serde(default)` fallback for `BucketCreate::backend_id` — the only backend that variant could
+/// ever target before RustFS existed.
+fn default_ceph_backend_id() -> String {
+    "bkd_ceph_lab".to_string()
 }

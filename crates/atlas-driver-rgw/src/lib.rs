@@ -1,10 +1,13 @@
 // Copyright (c) 2026 ZyvorAI Labs Private Limited.
 // SPDX-License-Identifier: LicenseRef-Zyvor-Production-1.0
-//! Minimal S3 client for Ceph RGW (PDF §10.3 "Atlas → RGW: S3 API").
+//! Minimal, generic S3 client (PDF §10.3 "Atlas → RGW: S3 API") — shared by Ceph RGW and any other
+//! S3-compatible backend (e.g. RustFS). Nothing here is Ceph-specific: it's plain SigV4 signing
+//! against whatever endpoint/bucket/credentials the caller supplies.
 //!
 //! Uses `rusty-s3` to build SigV4-signed request URLs and `reqwest` to execute them — no heavy
-//! AWS SDK. Path-style addressing (required by RGW). Credentials are passed in by the caller
-//! (read from the Rook OBC Secret in-cluster); this crate never persists or logs them.
+//! AWS SDK. Path-style addressing (required by RGW, and the conventional choice for other
+//! S3-compatible servers too). Credentials are passed in by the caller (read from a Kubernetes
+//! Secret in-cluster); this crate never persists or logs them.
 
 use std::time::Duration;
 
@@ -358,5 +361,111 @@ impl S3Target {
             anyhow::bail!("DELETE {key} failed: HTTP {status}: {detail}");
         }
         Ok(())
+    }
+
+    /// Whether the bucket itself already exists and is reachable with these credentials
+    /// (S3 `HeadBucket`).
+    pub async fn bucket_exists(&self) -> bool {
+        let action = self.bucket.head_bucket(Some(&self.creds));
+        matches!(
+            self.http.get(action.sign(SIGN_TTL)).send().await,
+            Ok(r) if r.status().is_success()
+        )
+    }
+
+    /// Create the bucket itself (S3 `CreateBucket`). Sends no request body (no
+    /// `LocationConstraint`) — real AWS S3 requires that body for any region other than
+    /// `us-east-1`; MinIO-family servers are generally lenient, but this has not been verified
+    /// against a real RustFS server. Not idempotent by itself — callers that want
+    /// create-if-missing semantics should check `bucket_exists` first.
+    pub async fn create_bucket(&self) -> Result<()> {
+        let action = self.bucket.create_bucket(&self.creds);
+        let resp = self
+            .http
+            .put(action.sign(SIGN_TTL))
+            .send()
+            .await
+            .with_context(|| format!("CreateBucket {}", self.bucket.name()))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let detail = resp.text().await.unwrap_or_default();
+            anyhow::bail!(
+                "CreateBucket {} failed: HTTP {status}: {detail}",
+                self.bucket.name()
+            );
+        }
+        Ok(())
+    }
+
+    /// Delete the bucket itself (S3 `DeleteBucket`). The bucket must be empty; a non-empty bucket
+    /// returns an error (S3's own `409 BucketNotEmpty`), same as every other S3-compatible server.
+    /// 404 is treated as success, matching `delete_object`'s idempotency convention.
+    pub async fn delete_bucket(&self) -> Result<()> {
+        let action = self.bucket.delete_bucket(&self.creds);
+        let resp = self
+            .http
+            .delete(action.sign(SIGN_TTL))
+            .send()
+            .await
+            .with_context(|| format!("DeleteBucket {}", self.bucket.name()))?;
+        let status = resp.status();
+        if !status.is_success() && status.as_u16() != 404 {
+            let detail = resp.text().await.unwrap_or_default();
+            anyhow::bail!(
+                "DeleteBucket {} failed: HTTP {status}: {detail}",
+                self.bucket.name()
+            );
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A port nothing is listening on — connection refused immediately, no real network I/O.
+    /// Same "never fabricates success" convention used elsewhere in this codebase (e.g.
+    /// `RealZfsDriver`'s "missing binary errors instead of fabricating data" tests): these prove
+    /// the new bucket-lifecycle methods are wired to the right HTTP verb and don't panic, without
+    /// needing a live S3-compatible server.
+    fn unreachable_target() -> S3Target {
+        S3Target::new("http://127.0.0.1:1", "us-east-1", "test-bucket", "ak", "sk").unwrap()
+    }
+
+    #[tokio::test]
+    async fn create_bucket_against_unreachable_endpoint_errors_not_panics() {
+        let t = unreachable_target();
+        assert!(t.create_bucket().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn delete_bucket_against_unreachable_endpoint_errors_not_panics() {
+        let t = unreachable_target();
+        assert!(t.delete_bucket().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn bucket_exists_against_unreachable_endpoint_is_false_not_a_panic() {
+        let t = unreachable_target();
+        assert!(!t.bucket_exists().await);
+    }
+
+    #[test]
+    fn create_bucket_signs_a_path_style_put_to_the_bucket_root() {
+        let t = unreachable_target();
+        let url = t.bucket.create_bucket(&t.creds).sign(SIGN_TTL);
+        // Path-style addressing: bucket name is a path segment, not a subdomain.
+        assert_eq!(url.host_str(), Some("127.0.0.1"));
+        assert_eq!(url.path(), "/test-bucket/");
+        assert!(url.query().unwrap_or_default().contains("X-Amz-Signature="));
+    }
+
+    #[test]
+    fn delete_bucket_signs_a_path_style_delete_to_the_bucket_root() {
+        let t = unreachable_target();
+        let url = t.bucket.delete_bucket(&t.creds).sign(SIGN_TTL);
+        assert_eq!(url.path(), "/test-bucket/");
+        assert!(url.query().unwrap_or_default().contains("X-Amz-Signature="));
     }
 }

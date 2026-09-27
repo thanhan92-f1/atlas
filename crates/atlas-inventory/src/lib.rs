@@ -809,30 +809,41 @@ pub async fn delete_volumes_by_backend(pool: &AnyPool, backend_id: &str) -> Resu
     Ok(r.rows_affected())
 }
 
+fn row_to_backend(r: sqlx::any::AnyRow) -> StorageBackend {
+    let caps: Capabilities = serde_json::from_str(r.get::<String, _>("capabilities").as_str())
+        .unwrap_or_default();
+    StorageBackend {
+        id: r.get("id"),
+        name: r.get("name"),
+        backend_type: backend_type_from(r.get::<String, _>("backend_type").as_str()),
+        mode: mode_from(r.get::<String, _>("mode").as_str()),
+        status: r.get("status"),
+        capabilities: caps,
+        connection_ref: r.get("connection_ref"),
+        cordoned: r.get::<i64, _>("cordoned") != 0,
+    }
+}
+
 pub async fn list_backends(pool: &AnyPool) -> Result<Vec<StorageBackend>> {
     let rows = sqlx::query(
         "SELECT id, name, backend_type, mode, status, capabilities, connection_ref, cordoned FROM storage_backends ORDER BY name",
     )
     .fetch_all(pool)
     .await?;
-    Ok(rows
-        .into_iter()
-        .map(|r| {
-            let caps: Capabilities =
-                serde_json::from_str(r.get::<String, _>("capabilities").as_str())
-                    .unwrap_or_default();
-            StorageBackend {
-                id: r.get("id"),
-                name: r.get("name"),
-                backend_type: backend_type_from(r.get::<String, _>("backend_type").as_str()),
-                mode: mode_from(r.get::<String, _>("mode").as_str()),
-                status: r.get("status"),
-                capabilities: caps,
-                connection_ref: r.get("connection_ref"),
-                cordoned: r.get::<i64, _>("cordoned") != 0,
-            }
-        })
-        .collect())
+    Ok(rows.into_iter().map(row_to_backend).collect())
+}
+
+/// A single backend row by id (`None` if not registered) — used to resolve a backend's
+/// `connection_ref` (credentials secret name) at request/dispatch time, e.g. for the RustFS
+/// object-storage write path.
+pub async fn get_backend(pool: &AnyPool, id: &str) -> Result<Option<StorageBackend>> {
+    let row = sqlx::query(
+        "SELECT id, name, backend_type, mode, status, capabilities, connection_ref, cordoned FROM storage_backends WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(row_to_backend))
 }
 
 pub async fn list_clusters(pool: &AnyPool) -> Result<Vec<StorageCluster>> {

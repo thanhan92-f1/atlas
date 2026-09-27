@@ -104,9 +104,12 @@ for stage in assess provision full-load cdc/start validate cutover; do curl -sX 
 
 Alongside the database pipeline, DataBridge moves **object storage** — AI datasets, model
 weights, checkpoints, RAG source documents, embeddings exports — from a cloud object store
-into a **Ceph RGW** bucket, so Forge/Zeus consume data from a local S3 endpoint instead of
-the cloud. Implemented in `atlas-databridge::object` on top of `atlas-driver-rgw::S3Target`
-(SigV4, path-style, streaming sha256), driven by the same job engine + `/jobs/{id}/watch` SSE.
+into a **local S3-compatible bucket** (RustFS by default; Ceph RGW or another S3-compatible
+destination also supported — `dest_endpoint`/`dest_bucket` are always caller-specified, there is
+no implicit destination), so Forge/Zeus consume data locally instead of the cloud. Implemented in
+`atlas-databridge::object` on top of `atlas-driver-rgw::S3Target` (SigV4, path-style, streaming
+sha256 — a generic S3 client, not Ceph-specific despite the crate name), driven by the same job
+engine + `/jobs/{id}/watch` SSE.
 
 The copy is: **list source → diff vs destination (full, or incremental by key+size) →
 stream each changed object recording its sha256 → verify every planned key landed at the
@@ -129,14 +132,21 @@ connector (same philosophy as the DB side gating oracle/mongodb behind features)
 |---|---|---|
 | `aws` (AWS S3) | ✅ works | S3 protocol, SigV4 |
 | `gcs` (Google Cloud Storage) | ✅ works | GCS **S3-interoperability** endpoint + HMAC keys |
-| `s3-compatible` (MinIO, Wasabi, DO Spaces, Ceph RGW, …) | ✅ works | S3 protocol |
+| `s3-compatible` (RustFS, MinIO, Wasabi, DO Spaces, Ceph RGW, …) | ✅ works | S3 protocol |
 | `azure-blob` (Azure Blob Storage) | ✅ native connector (feature `azure-blob`) | pure-Rust Azure SDK; not S3-native, so it implements `ObjectSource` directly |
 | `vmware` (vSphere/vSAN datastores) | ❌ not an object store | VMs/VMDKs live on block storage — migrate via the block (RBD import) leg, not object copy |
 
-The source is pluggable via the `ObjectSource` trait (list + get→sha256); the destination is
-always Ceph RGW (S3). `azure-blob` is a native, feature-gated connector (below); `vmware` is
-rejected with guidance to use the volume path; any other non-S3 source errors clearly rather
-than failing silently.
+The source is pluggable via the `ObjectSource` trait (list + get→sha256); the destination is any
+S3-protocol endpoint (RustFS by default for new local buckets; Ceph RGW or another S3-compatible
+target also accepted — the only check is `dest_provider.is_s3_protocol()`). `azure-blob` is a
+native, feature-gated connector (below); `vmware` is rejected with guidance to use the volume
+path; any other non-S3 source errors clearly rather than failing silently.
+
+**Not yet live-verified against a RustFS destination** — the "Verified live" run above was an
+RGW-to-RGW self-migration on the same cluster. Do not treat a RustFS destination as production-
+verified until an equivalent live run has actually been done against one (see `docs/RUSTFS.md`'s
+known-unverified-risks list — presigned URLs and multipart upload wire compatibility with RustFS
+specifically haven't been exercised yet either).
 
 ### Object REST endpoints (`/api/atlas/v1`, `require_role(operator)`, tenant-scoped)
 | Method | Path | Purpose |

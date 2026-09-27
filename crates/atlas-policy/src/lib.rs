@@ -76,6 +76,21 @@ pub fn find(intent: &str) -> Option<&'static Policy> {
     POLICIES.iter().find(|p| p.intent == intent)
 }
 
+/// Default backend for new object (bucket) provisioning — RustFS, not Ceph RGW. Deliberately not
+/// part of the [`Policy`]/[`resolve`] machinery above: those describe StorageClass/access-mode/
+/// volume-mode placement for PVC-shaped provisioning, none of which apply to an S3 bucket. This is
+/// the one thing bucket creation actually needs resolved with an explicit-override-wins default,
+/// so the choice lives in one named, testable place instead of a route-handler literal.
+pub const DEFAULT_OBJECT_BACKEND: &str = "bkd_rustfs_lab";
+
+/// Resolve which backend provisions a new bucket: an explicit `backend_id` always wins; otherwise
+/// [`DEFAULT_OBJECT_BACKEND`].
+pub fn resolve_object_backend(explicit: Option<&str>) -> String {
+    explicit
+        .map(str::to_string)
+        .unwrap_or_else(|| DEFAULT_OBJECT_BACKEND.to_string())
+}
+
 /// Resolve a placement decision from an optional intent and the requested volume kind.
 ///
 /// Precedence: explicit `storage_class_override` › named policy › kind default.
@@ -187,5 +202,16 @@ mod tests {
         // error since it's purely a cosmetic label at that point (PDF §12.3 override precedence).
         let p = resolve(Some("nonsense"), VolumeKind::Block, Some("custom-sc")).unwrap();
         assert_eq!(p.storage_class, "custom-sc");
+    }
+
+    #[test]
+    fn resolve_object_backend_explicit_override_wins() {
+        assert_eq!(resolve_object_backend(Some("bkd_ceph_lab")), "bkd_ceph_lab");
+    }
+
+    #[test]
+    fn resolve_object_backend_defaults_to_rustfs() {
+        assert_eq!(resolve_object_backend(None), DEFAULT_OBJECT_BACKEND);
+        assert_eq!(DEFAULT_OBJECT_BACKEND, "bkd_rustfs_lab");
     }
 }
