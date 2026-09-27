@@ -128,19 +128,25 @@ spec:
           imagePullPolicy: Never   # image is imported into k3s containerd, not pulled
           securityContext:
             # Raw-disk provisioning (ATLAS_ZFS_DRIVER_MODE=real below) needs `zpool create`/`wipefs`
-            # to open a real host block device and the host's /dev/zfs, whose node is owned
-            # root:disk 0660 on the host — this container runs as uid 10001 (see the pod-level
-            # securityContext below), so it needs DAC_OVERRIDE to bypass that permission check and
-            # SYS_ADMIN for the block-device ioctls zpool/wipefs issue. Deliberately NOT
-            # `privileged: true` + root: unlike `privileged`, explicitly `add`-ed capabilities are
-            # also granted to this non-root process's ambient set (confirmed live: a plain
-            # `privileged: true` container's CapEff stayed all-zero for a non-root runAsUser,
-            # because Kubernetes only auto-populates the *bounding* set for privileged, not the
-            # effective/ambient sets a non-root process actually uses) — this is the narrower fix.
+            # to open and write a real host block device and the host's /dev/zfs. Tried, and ruled
+            # out live, two narrower alternatives before landing here:
+            #   1. `capabilities.add: [DAC_OVERRIDE, SYS_ADMIN]` without `privileged` fixed the
+            #      file-permission-bits check (root:disk 0660 — DAC_OVERRIDE bypasses that), but
+            #      wipefs then failed differently ("Operation not permitted", not "Permission
+            #      denied"): Kubernetes' device cgroup still blocked raw I/O against /dev/sdb's
+            #      major:minor — that's a separate, mandatory control that capabilities alone don't
+            #      bypass; only `privileged: true` opens the device cgroup to everything.
+            #   2. `privileged: true` alone opens the device cgroup, but this container runs as a
+            #      non-root uid (10001, see the pod-level securityContext below) — confirmed live
+            #      that Kubernetes only populates the *bounding* capability set for a privileged,
+            #      non-root container, not its effective/ambient set, so wipefs/zpool still couldn't
+            #      use those capabilities.
+            # Combining both closes each gap: `privileged: true` for full device-cgroup access, and
+            # file capabilities (`setcap` on the specific binaries in the Dockerfile) for the actual
+            # effective capabilities a non-root exec needs — file capabilities are granted from the
+            # binary's own xattr on exec regardless of the calling shell's empty effective set.
             # See docs/DISKS.md.
-            allowPrivilegeEscalation: true
-            capabilities:
-              add: ["DAC_OVERRIDE", "SYS_ADMIN"]
+            privileged: true
           resources:
             requests:
               cpu: 100m
