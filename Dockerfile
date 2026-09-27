@@ -52,7 +52,9 @@ ARG ORACLE_IC_URL=https://download.oracle.com/otn_software/linux/instantclient/2
 RUN echo "deb http://deb.debian.org/debian bookworm contrib" >> /etc/apt/sources.list \
     && apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl unzip libaio1 zfsutils-linux util-linux libcap2-bin \
-    && setcap cap_dac_override,cap_sys_admin=ep /usr/sbin/wipefs /usr/sbin/zpool /usr/sbin/zfs /usr/bin/lsblk /usr/bin/findmnt /usr/sbin/blockdev \
+    && for bin in /usr/sbin/wipefs /usr/sbin/zpool /usr/sbin/zfs /usr/bin/lsblk /usr/bin/findmnt /usr/sbin/blockdev; do \
+         setcap cap_dac_override,cap_sys_admin=ep "$bin"; \
+       done \
     && apt-get purge -y --auto-remove libcap2-bin \
     && curl -fsSL -o /tmp/ic.zip "$ORACLE_IC_URL" \
     && mkdir -p /opt/oracle && unzip -q /tmp/ic.zip -d /opt/oracle && rm /tmp/ic.zip \
