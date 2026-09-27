@@ -113,6 +113,15 @@ fn basename(device_path: &str) -> &str {
     device_path.rsplit('/').next().unwrap_or(device_path)
 }
 
+/// The conventional first-disk names `atlas_common::device::validate_raw_device_path` always
+/// refuses regardless of live host state — duplicated here as a minimal, dependency-free check
+/// (rather than pulling in atlas-common) so this crate's own root/boot detection has a fallback
+/// that still works when the dynamic, mount-namespace-dependent check above is blind (see its
+/// comment). Keep in sync with that function's static rule if it ever changes.
+fn is_conventional_first_disk(basename: &str) -> bool {
+    matches!(basename, "sda" | "vda" | "nvme0n1")
+}
+
 /// Resolve a mounted mountpoint's source device (`findmnt -n -o SOURCE <mountpoint>`) down to its
 /// parent whole-disk basename (`lsblk -no pkname <source>`, falling back to the source's own
 /// basename when it has no parent, i.e. it's already a whole disk).
@@ -204,9 +213,15 @@ pub async fn inspect_device(device_path: &str) -> Result<DeviceCheck, DriverErro
         .collect();
 
     // 4. Dynamic root/boot-disk refusal: resolve the host's actual mounted root/boot devices to
-    // their parent whole-disk basenames and compare against this device's own basename. Stronger
-    // than any static allow-list heuristic, since the real boot disk isn't always the first
-    // letter/index (cloud images, unusual partitioning).
+    // their parent whole-disk basenames and compare against this device's own basename. In
+    // principle stronger than any static allow-list heuristic, since the real boot disk isn't
+    // always the first letter/index (cloud images, unusual partitioning) — BUT this is blind when
+    // the gateway runs in a container without visibility into the *host's* mount namespace (e.g.
+    // the k8s lab deploy: `findmnt -n -o SOURCE /` inside the container resolves the container's
+    // own rootfs, not the host's — confirmed live: `/dev/sda`, this host's actual root/boot disk,
+    // was not flagged by this check alone). `is_conventional_first_disk` below is the fallback for
+    // exactly that blind spot; `validate_raw_device_path` (atlas-common) enforces the same rule
+    // independently at the route/dispatch layer regardless of what `DeviceCheck` reports.
     let target_basename = basename(device_path);
     for mountpoint in ["/", "/boot", "/boot/efi"] {
         if let Some(disk) = resolve_mounted_disk_basename(mountpoint).await {
@@ -215,6 +230,9 @@ pub async fn inspect_device(device_path: &str) -> Result<DeviceCheck, DriverErro
                 break;
             }
         }
+    }
+    if is_conventional_first_disk(target_basename) {
+        check.is_root_or_boot_disk = true;
     }
 
     // 5. Already a zpool member? Cross-check both the plain device path and its `/dev/disk/by-id`
@@ -380,7 +398,8 @@ pub async fn list_whole_disks() -> Result<Vec<BlockDevice>, DriverError> {
             mounted_at,
             wipefs_signatures,
             member_of_zpool,
-            is_root_or_boot_disk: root_boot_basenames.contains(name),
+            is_root_or_boot_disk: root_boot_basenames.contains(name)
+                || is_conventional_first_disk(name),
         });
     }
     Ok(out)
@@ -580,5 +599,19 @@ mod tests {
     fn pool_and_cluster_ids_match_the_driver_scheme() {
         assert_eq!(pool_id("tank"), "pool_zfs_tank");
         assert_eq!(cluster_id("zfs01.zyvor.lab"), "cls_zfs_zfs01_zyvor_lab");
+    }
+
+    #[test]
+    fn conventional_first_disk_fallback_covers_the_container_blind_spot() {
+        // This is the static backstop for exactly the bug found live: inside a container without
+        // visibility into the host's mount namespace, the dynamic findmnt-based check in
+        // inspect_device/list_whole_disks can't see that e.g. /dev/sda is actually mounted at the
+        // host's "/" — /dev/sda showed up in the Disks UI picker labeled "has data — wipeable"
+        // before this fallback existed.
+        assert!(is_conventional_first_disk("sda"));
+        assert!(is_conventional_first_disk("vda"));
+        assert!(is_conventional_first_disk("nvme0n1"));
+        assert!(!is_conventional_first_disk("sdb"));
+        assert!(!is_conventional_first_disk("nvme1n1"));
     }
 }

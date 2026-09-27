@@ -8,8 +8,11 @@ a new **ZFS pool** (direct `zpool create`) or a new **Ceph OSD** via Rook (patch
 async jobs (`202 Accepted` + `job_id`, same shape as every other write path) and both require an
 explicit `"confirm": true` — formatting a disk is irreversible.
 
-Device selection is **manual path entry only** in this first slice: there is no device
-auto-discovery/listing endpoint. The operator must already know the exact device path.
+Device selection is backed by two read-only discovery endpoints the Disks UI's picker calls
+instead of a blind free-text field: `GET /api/atlas/v1/zfs/devices` (bulk `lsblk`/`wipefs`/`zpool
+status` scan of the gateway's own host) and `GET /api/atlas/v1/ceph/nodes/{node}/devices` (passes
+through Rook's own `local-device-<node>` discovery ConfigMap for one node). Both are advisory only
+— the checks below are re-run, authoritatively, against whatever device is actually submitted.
 
 ## Safety model
 
@@ -33,10 +36,26 @@ limitation `RealZfsDriver` itself already has — ZFS has no remote query protoc
 Requires `ATLAS_ZFS_ENABLE=1` at startup. Before running `zpool create`, the job independently
 checks (via `lsblk`, `findmnt`, `wipefs`, `zpool status`) that the device: exists, is a whole disk,
 isn't read-only, has no partitions/filesystem/partition-table signature, isn't mounted, isn't
-already a zpool member, and isn't the host's actual mounted root/boot disk (resolved dynamically,
-not just by name). `zpool create` is **never** passed `-f` — that flag exists specifically to
-override zpool's own built-in in-use refusal, which stays as an independent safety net underneath
-Atlas's own checks.
+already a zpool member, and isn't the host's actual mounted root/boot disk. `zpool create` is
+**never** passed `-f` — that flag exists specifically to override zpool's own built-in in-use
+refusal, which stays as an independent safety net underneath Atlas's own checks.
+
+**Known gap, found live (2026-09-28), not yet fully closed**: the root/boot-disk check is
+*dynamic* (resolves the host's actual mounted root/boot device via `findmnt`) specifically so it
+isn't fooled by an unconventional layout where the boot disk isn't the first letter/index. That
+dynamic check is blind when the gateway runs in a container without visibility into the *host's*
+mount namespace — as it does in the current `deploy/k8s/atlas-gateway.yaml` lab deploy (privileged
++ hostPath `/dev`, but no `hostPID`/host mountinfo access). Confirmed live: on that deploy, `/dev/sda`
+(this lab host's actual root/boot disk) was **not** flagged by the dynamic check alone, and showed
+up in the Disks UI's device picker as "has data — wipeable". `atlas_common::device::validate_raw_device_path`'s
+static name-based refusal (`sda`/`vda`/`nvme0n1`) still independently blocks an actual submit
+against it regardless — so no real host has had its root disk formatted by this — but the dynamic
+check's reliability claim above only holds for a deployment where the gateway can actually see the
+host's mount table (e.g. running as a bare process directly on the host, matching `RealZfsDriver`'s
+own original "local-host-only" design assumption). Until this is closed, treat the static
+first-disk-name gate as the primary defense on any containerized deploy, not a redundant cheap
+first filter — an unconventional boot-disk layout on a containerized deploy is not fully protected
+today.
 
 `zpool create` is synchronous, so the job succeeds as soon as it returns 0. The new pool/root
 dataset are written directly into inventory (not left to a follow-up discovery pass) — because
