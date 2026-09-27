@@ -583,6 +583,32 @@ no model required for the default path. See [AI_ADVISOR.md](AI_ADVISOR.md).
   RBD RWO, and deleting the override reverted `acme` to the catalog.
 - Multi-tenancy: **complete** (quotas + service accounts + per-tenant policies, PDF §14).
 - DR: RBD mirroring, secondary-cluster restore, one-click failover runbook (PDF §16.3).
+- ✅ **Two new pluggable backends: RustFS (S3-compatible object storage) and Longhorn.**
+  `atlas-driver-rustfs`/`atlas-driver-longhorn` follow the same fake/real, never-fabricate
+  convention every other driver already has. RustFS discovery (`ListBuckets`/health) is anonymous
+  and unsigned for now; Longhorn discovery is read-only over its Kubernetes v1beta2 CRDs
+  (`nodes`/`volumes`), with PVC provisioning going through the existing Kubernetes StorageClass
+  path rather than this driver. Both are wired through the same `BackendType`/capability-catalog/
+  dynamic-registration machinery NFS/ZFS already use — see `docs/RUSTFS.md`, `docs/LONGHORN.md`.
+- ✅ **Raw disk provisioning**: `POST /zfs/pools/from-device` runs defense-in-depth safety checks
+  (`lsblk`/`findmnt`/`wipefs`/`zpool status`, dynamic root/boot-disk detection — never the
+  static-heuristic allow-list alone) before `zpool create` (never `-f`); `POST /ceph/devices`
+  patches the `CephCluster` CR's device list via a scoped merge-patch, cross-checked against
+  Rook's own device-discovery ConfigMap (fails closed if that's unavailable), then polls to
+  completion through the job engine's existing retry/backoff machinery rather than blocking its
+  single worker — Rook's reconciliation can take several minutes. Manual device-path entry only
+  in this slice (no auto-discovered device list). See `docs/DISKS.md`.
+- ✅ **RustFS is now the primary object backend** — `POST /buckets` defaults to it (a direct,
+  synchronous, signed S3 `CreateBucket`, no Kubernetes operator involved) instead of Ceph RGW;
+  `"backend_id": "bkd_ceph_lab"` keeps the original Rook `ObjectBucketClaim` path working
+  unchanged. `atlas_driver_rgw::S3Target` (already generic S3, not RGW-specific despite the name)
+  gained `create_bucket`/`delete_bucket`/`bucket_exists`; credentials resolve via
+  `StorageBackend.connection_ref` → a Kubernetes Secret. DataBridge's object-migration leg and
+  Atlas's own self-state backup were already backend-agnostic at the code level (both already
+  built on the same generic `S3Target`) — repointing either to RustFS is a config/deploy-manifest
+  change, not a code change, and neither has actually been repointed in the lab yet (no real
+  RustFS cluster to point at). See `docs/RUSTFS.md`'s known-unverified-risks list (`CreateBucket`
+  body, presigned URLs, multipart — none tested against a real RustFS server yet).
 
 ## Known limitations (current)
 
@@ -590,6 +616,17 @@ no model required for the default path. See [AI_ADVISOR.md](AI_ADVISOR.md).
   fake-mode-tested, but the real `rbd mirror` CLI paths need a live second Ceph cluster to be
   production-verified (`dataplane_verified` is hard-coded `false` until that drill runs). See
   [DR.md](DR.md).
+- **RustFS write path unverified against a real RustFS server**: bucket create/delete and object
+  PUT/GET/DELETE/presigned-URLs are implemented and unit-tested against `rusty-s3`'s own signing
+  logic, but never exercised against a live RustFS instance — `CreateBucket`'s missing request
+  body, SigV4 presigned-URL compatibility, and multipart upload are all explicitly flagged as
+  unverified in `docs/RUSTFS.md`. Treat RustFS as the default bucket backend in code, not yet as
+  production-verified.
+- **Raw disk provisioning unverified against real hardware/a real Rook cluster**: the ZFS
+  device-safety checks and the Ceph/Rook device-claim path (`docs/DISKS.md`) are fake-mode and
+  unit-tested only. The Ceph path's entire safety design further depends on the target Rook
+  install running its device-discovery DaemonSet (`ROOK_ENABLE_DISCOVERY_DAEMON`) — unconfirmed
+  for the lab's Rook install as of this writing.
 - **arm64 container images: not shipped, tested and rejected for now.** A real timing probe
   (`.github/workflows/ci.yml`'s `docker` job, temporarily, on a throwaway branch/PR) built the
   full `Dockerfile` (heaviest image — all DataBridge features: librdkafka/cmake, ODPI-C, tiberius)

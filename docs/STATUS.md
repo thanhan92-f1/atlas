@@ -12,6 +12,10 @@ below is bank or enterprise GA.
 |---|---|---|---|---|---|
 | Ceph / Rook control plane (RBD, CephFS, RGW, jobs) | yes | yes, single-node Rook lab | no | | |
 | NFS and ZFS drivers | yes, fake and real modes | no remote production target | no | real mode | SAN, cloud block, external Ceph import |
+| RustFS backend — bucket/object discovery | yes, fake and real modes | no — anonymous `ListBuckets` only, no real RustFS cluster tested | no | real mode | signed/credentialed discovery |
+| RustFS backend — bucket/object write path (primary object backend) | yes, unit-tested against `rusty-s3`'s signing logic | no — never run against a real RustFS server | no | yes — `CreateBucket` body, presigned URLs, multipart all unverified live | bucket stats/quota (no `radosgw-admin` equivalent) |
+| Longhorn backend | yes, read-only (nodes/volumes via CRDs) | no | no | | native write path (PVC provisioning goes through the Kubernetes path today, not this driver) |
+| Raw disk provisioning (ZFS pool via `zpool create`; Ceph OSD via Rook `CephCluster` patch) | yes, fake mode + safety-check unit tests | no — never run against a real disk or a Rook cluster with the device-discovery daemon enabled | no | yes — depends on the target Rook install running `ROOK_ENABLE_DISCOVERY_DAEMON` | auto-discovered device listing (this slice is manual device-path entry only) |
 | SQLite default, Postgres query layer, Helm `database.kind`, cross-replica rate limiting | yes | yes, CI `postgres-test` and `deploy/postgres-lab/` | no — needs a real HA Postgres | | enterprise IdP for OIDC (Dex lab only) |
 | Auth, tenants, quotas, audit export, Vault resolution | yes | yes, lab (Dex, Vault, SIEM receiver) | no | | |
 | DataBridge Postgres | yes | yes, through cutover | no | TLS still `sslmode=disable` | verified TLS migration |
