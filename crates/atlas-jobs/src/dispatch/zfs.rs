@@ -72,7 +72,7 @@ pub(crate) async fn dispatch_zfs(
         if wipe_existing {
             atlas_driver_zfs::wipe_device(&device_path).await?;
             let recheck = atlas_driver_zfs::inspect_device(&device_path).await?;
-            if let Some(reason) = recheck.refusal_reason() {
+            if let Some(reason) = recheck.refusal_reason_after_wipe() {
                 anyhow::bail!("refusing to format {device_path} even after wipe: {reason}");
             }
         } else if let Some(reason) = check.refusal_reason() {

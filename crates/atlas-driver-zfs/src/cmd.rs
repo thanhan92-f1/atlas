@@ -107,6 +107,43 @@ impl DeviceCheck {
         }
         None
     }
+
+    /// The recheck to run immediately after a successful `wipe_device` call — like
+    /// `refusal_reason`, except it tolerates a lingering `has_children`. Confirmed live: `wipefs
+    /// -a` genuinely clears the on-disk partition-table/filesystem signature (this device's
+    /// `fstype`/`pttype` read back `None` and a follow-up `wipefs -n` shows nothing), but the
+    /// kernel's already-parsed partition view (lsblk's `children`) can still list the old
+    /// partitions — `blockdev --rereadpt` is best-effort, not guaranteed to clear it, and that
+    /// residue no longer reflects real on-disk data. Every other check (including a lingering
+    /// filesystem/partition-table *signature*, which would mean the wipe didn't actually work)
+    /// still applies unconditionally.
+    pub fn refusal_reason_after_wipe(&self) -> Option<String> {
+        if let Some(reason) = self.hard_refusal_reason() {
+            return Some(reason);
+        }
+        if let Some(fstype) = &self.fstype {
+            return Some(format!(
+                "device still has a filesystem signature after wipe: {fstype}"
+            ));
+        }
+        if let Some(pttype) = &self.pttype {
+            return Some(format!(
+                "device still has a partition-table signature after wipe: {pttype}"
+            ));
+        }
+        if !self.wipefs_signatures.is_empty() {
+            return Some(format!(
+                "residual filesystem/RAID/LVM signature detected after wipe: {}",
+                self.wipefs_signatures.join(", ")
+            ));
+        }
+        if let Some(zpool) = &self.member_of_zpool {
+            return Some(format!(
+                "device is still a member of zpool {zpool} after wipe"
+            ));
+        }
+        None
+    }
 }
 
 fn basename(device_path: &str) -> &str {
@@ -553,6 +590,37 @@ mod tests {
         };
         assert!(check.hard_refusal_reason().is_none());
         assert!(check.refusal_reason().is_some());
+    }
+
+    #[test]
+    fn refusal_reason_after_wipe_tolerates_stale_partition_table_only() {
+        // Exactly the state found live: wipefs -a genuinely cleared the signature (fstype/pttype/
+        // wipefs_signatures all empty), but lsblk's kernel-cached `children` is still stale.
+        let stale_only = DeviceCheck {
+            exists: true,
+            is_disk: true,
+            has_children: true,
+            ..Default::default()
+        };
+        assert!(stale_only.refusal_reason_after_wipe().is_none());
+        // ... but the plain (pre-wipe) refusal_reason still refuses it, as a sanity check that
+        // this really is a distinct, more permissive check.
+        assert!(stale_only.refusal_reason().is_some());
+    }
+
+    #[test]
+    fn refusal_reason_after_wipe_still_catches_a_real_leftover_signature() {
+        let still_dirty = DeviceCheck {
+            exists: true,
+            is_disk: true,
+            has_children: true,
+            fstype: Some("ext4".into()),
+            ..Default::default()
+        };
+        assert!(still_dirty
+            .refusal_reason_after_wipe()
+            .unwrap()
+            .contains("ext4"));
     }
 
     #[test]
