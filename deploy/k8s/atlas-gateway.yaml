@@ -127,9 +127,10 @@ spec:
           image: localhost/atlas-gateway:dev
           imagePullPolicy: Never   # image is imported into k3s containerd, not pulled
           securityContext:
-            allowPrivilegeEscalation: false
-            capabilities:
-              drop: ["ALL"]
+            # Raw-disk provisioning (ATLAS_ZFS_DRIVER_MODE=real below) needs `zpool create` to open
+            # a real host block device and the host's /dev/zfs — a genuine security-posture
+            # tradeoff, not the default-deny container this used to be. See docs/DISKS.md.
+            privileged: true
           resources:
             requests:
               cpu: 100m
@@ -208,6 +209,16 @@ spec:
               value: "vm-images,backups"
             - name: ATLAS_RUSTFS_DRIVER_MODE
               value: "fake"
+            # Third ZFS backend, real mode: `zpool`/`zfs`/`lsblk`/`wipefs`/`findmnt`/`blockdev` shell
+            # out against the host's own block devices (privileged + hostPath /dev below). No pools
+            # exist yet at startup (ATLAS_ZFS_POOLS unset) — POST /zfs/pools/from-device provisions
+            # the first one; see docs/DISKS.md.
+            - name: ATLAS_ZFS_ENABLE
+              value: "1"
+            - name: ATLAS_ZFS_DRIVER_MODE
+              value: "real"
+            - name: ATLAS_ZFS_HOST
+              value: "$(NODE_IP)"
             # OIDC/SSO login against the throwaway Dex instance (see deploy/dex-lab/) — a lab-only
             # test IdP, not a real identity provider. Remove these four ATLAS_OIDC_* vars (or leave
             # Dex torn down) to disable the "Sign in with SSO" button; the feature auto-gates off
@@ -264,10 +275,19 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /var/lib/atlas
+            # Raw-disk provisioning: the host's real device nodes (including /dev/zfs) so the
+            # zpool/lsblk/wipefs/findmnt/blockdev commands above act on real hardware, not the
+            # container's own minimal devtmpfs.
+            - name: host-dev
+              mountPath: /dev
       volumes:
         - name: data
           persistentVolumeClaim:
             claimName: atlas-gateway-data
+        - name: host-dev
+          hostPath:
+            path: /dev
+            type: Directory
 ---
 # Durable SQLite storage. Uses the cluster's DEFAULT StorageClass (omit storageClassName) so this
 # deploys on any cluster — including one without Ceph yet (e.g. k3s local-path). The real-mode

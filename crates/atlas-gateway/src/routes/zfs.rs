@@ -20,6 +20,12 @@ pub(crate) struct CreateZfsPoolFromDeviceBody {
     pool_name: String,
     device_path: String,
     confirm: bool,
+    /// Explicit second opt-in to clear a residual partition table/filesystem/RAID/LVM signature
+    /// before formatting — e.g. a disk that previously backed a Ceph OSD. Without this, a device
+    /// that isn't genuinely empty is refused (see `docs/DISKS.md`). Never overrides the
+    /// unconditional refusals (root/boot disk, mounted, read-only, not a whole disk).
+    #[serde(default)]
+    wipe_existing: bool,
 }
 
 /// `POST /zfs/pools/from-device` — provision a brand-new zpool on a raw, unformatted local disk
@@ -62,6 +68,7 @@ pub(crate) async fn create_zfs_pool_from_device(
         device_path: body.device_path.clone(),
         confirmed_device_path: body.device_path.clone(),
         host,
+        wipe_existing: body.wipe_existing,
     };
     let job_id = ids::job_id();
     let job = s
@@ -77,7 +84,7 @@ pub(crate) async fn create_zfs_pool_from_device(
         "pool",
         &body.pool_name,
         "accepted",
-        Some(json!({ "device": body.device_path })),
+        Some(json!({ "device": body.device_path, "wipe_existing": body.wipe_existing })),
         None,
     )
     .await;

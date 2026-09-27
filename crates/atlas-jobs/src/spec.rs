@@ -381,6 +381,14 @@ pub enum JobSpec {
         /// between enqueue and run.
         confirmed_device_path: String,
         host: String,
+        /// Operator opt-in to clear a residual partition table/filesystem/RAID/LVM signature
+        /// (`wipefs -a`) before `zpool create`, for a disk that previously held data (e.g. a
+        /// decommissioned Ceph OSD) — without this, `dispatch_zfs` refuses any device that isn't
+        /// genuinely empty. Never overrides `DeviceCheck::hard_refusal_reason` (root/boot disk,
+        /// mounted, read-only, not a whole disk). `#[serde(default)]` so already-persisted/in-flight
+        /// jobs from before this field existed keep deserializing as `false` (identical behavior).
+        #[serde(default)]
+        wipe_existing: bool,
     },
     /// Claim a raw, unformatted disk on a specific Kubernetes node as a new Ceph OSD via Rook:
     /// patches the `CephCluster` CR's `spec.storage.nodes[].devices` list, then (each dispatch

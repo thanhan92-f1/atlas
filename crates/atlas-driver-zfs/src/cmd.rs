@@ -47,11 +47,11 @@ pub struct DeviceCheck {
 }
 
 impl DeviceCheck {
-    /// `None` means the device looks safe to format; `Some(reason)` explains why it doesn't.
-    /// Checked in order so the *first* applicable reason is the one surfaced — the most
-    /// dangerous class of mistake (touching the root/boot disk) is checked first regardless of
-    /// what else might also be true about the device.
-    pub fn refusal_reason(&self) -> Option<String> {
+    /// The refusals that `wipe_existing` can never override, checked first regardless of what
+    /// else is true about the device: touching the root/boot disk, a read-only device, something
+    /// that isn't a whole disk at all, or a device that's currently mounted (it may be actively
+    /// serving files right now — unmounting it is a separate, deliberately out-of-scope action).
+    pub fn hard_refusal_reason(&self) -> Option<String> {
         if !self.exists {
             return Some("no such block device".into());
         }
@@ -67,6 +67,22 @@ impl DeviceCheck {
                     .into(),
             );
         }
+        if let Some(target) = &self.mounted_at {
+            return Some(format!("device is mounted at {target}"));
+        }
+        None
+    }
+
+    /// `None` means the device looks safe to format; `Some(reason)` explains why it doesn't.
+    /// Checked in order so the *first* applicable reason is the one surfaced. Everything past
+    /// `hard_refusal_reason` here is stale *data* on the disk (a partition table, a filesystem or
+    /// RAID/LVM signature, prior zpool membership) rather than a structural reason the device is
+    /// unsafe to touch at all — `wipe_existing` (see `wipe_device`) clears these, so callers taking
+    /// that path check `hard_refusal_reason` alone instead of this.
+    pub fn refusal_reason(&self) -> Option<String> {
+        if let Some(reason) = self.hard_refusal_reason() {
+            return Some(reason);
+        }
         if self.has_children {
             return Some(
                 "device already has a partition table; wipe it out-of-band first if you really \
@@ -79,9 +95,6 @@ impl DeviceCheck {
         }
         if let Some(pttype) = &self.pttype {
             return Some(format!("device already has a partition table: {pttype}"));
-        }
-        if let Some(target) = &self.mounted_at {
-            return Some(format!("device is mounted at {target}"));
         }
         if !self.wipefs_signatures.is_empty() {
             return Some(format!(
@@ -254,6 +267,26 @@ fn find_zpool_member(
     None
 }
 
+/// Clears a residual partition table/filesystem/RAID/LVM signature off `device_path` so a
+/// subsequent `inspect_device` call no longer reports `has_children`/`fstype`/`pttype`/
+/// `wipefs_signatures`. Only reached when the operator has explicitly opted into `wipe_existing`
+/// (see `JobSpec::ZfsPoolCreateFromDevice`) — `hard_refusal_reason` is still checked first and is
+/// never bypassed by this, so this never runs against the root/boot disk, a mounted device, or
+/// anything that isn't a whole disk.
+pub async fn wipe_device(device_path: &str) -> Result<(), DriverError> {
+    let (ok, _stdout, stderr) = run("wipefs", &["-a", device_path]).await?;
+    if !ok {
+        return Err(DriverError::Backend(format!(
+            "wipefs -a {device_path}: {stderr}"
+        )));
+    }
+    // Best-effort: `wipefs -a` erases the on-disk partition-table signature, but the kernel's
+    // already-parsed partition entries (lsblk's `children`) can persist until it re-reads the
+    // partition table — ignore failure here, `zpool create` will surface any real problem itself.
+    let _ = run("blockdev", &["--rereadpt", device_path]).await;
+    Ok(())
+}
+
 /// `zpool create <pool_name> <device_path>` — **never** passes `-f` (force): that flag exists
 /// specifically to override zpool's own built-in "this looks like it's in use" refusal, which is
 /// the safety net underneath everything `inspect_device` already checked.
@@ -337,6 +370,43 @@ mod tests {
             ..Default::default()
         };
         assert!(check.refusal_reason().unwrap().contains("/mnt/data"));
+    }
+
+    #[test]
+    fn hard_refusal_reason_ignores_wipeable_data() {
+        // A stale partition table + filesystem signature — exactly what `wipe_existing` is for —
+        // must NOT show up in `hard_refusal_reason`, only in the full `refusal_reason`.
+        let check = DeviceCheck {
+            exists: true,
+            is_disk: true,
+            has_children: true,
+            fstype: Some("ceph_bluestore".into()),
+            pttype: Some("gpt".into()),
+            wipefs_signatures: vec!["gpt".into()],
+            member_of_zpool: Some("tank".into()),
+            ..Default::default()
+        };
+        assert!(check.hard_refusal_reason().is_none());
+        assert!(check.refusal_reason().is_some());
+    }
+
+    #[test]
+    fn hard_refusal_reason_still_blocks_mounted_and_root_disk() {
+        let mounted = DeviceCheck {
+            exists: true,
+            is_disk: true,
+            mounted_at: Some("/mnt/data".into()),
+            ..Default::default()
+        };
+        assert!(mounted.hard_refusal_reason().unwrap().contains("/mnt/data"));
+
+        let root_disk = DeviceCheck {
+            exists: true,
+            is_disk: true,
+            is_root_or_boot_disk: true,
+            ..Default::default()
+        };
+        assert!(root_disk.hard_refusal_reason().unwrap().contains("root or boot"));
     }
 
     #[test]

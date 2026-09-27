@@ -65,6 +65,20 @@ export default function Disks() {
           ? "Exact path on the host the gateway runs on. This will be wiped."
           : "Exact path as seen on the selected node. This will be wiped.",
     });
+    if (backend === "zfs") {
+      out.push({
+        name: "wipe_existing",
+        label: "If the device already has data",
+        options: [
+          { value: "refuse", label: "Refuse (default, safest)" },
+          { value: "wipe", label: "Wipe residual signatures first (destructive)" },
+        ],
+        hint:
+          "Clears a stale partition table or filesystem signature (e.g. a decommissioned Ceph " +
+          "OSD) before creating the pool. Never overrides the root/boot-disk or mounted-device " +
+          "refusal.",
+      });
+    }
     // Cross-field "type it again to confirm" gate: FormModal's own per-field `pattern` check is
     // reused here rather than a bespoke modal — the pattern is just built from the *other* field's
     // current value. "\u0000" as the fallback can never be typed into a text input, so an empty
@@ -128,7 +142,12 @@ export default function Disks() {
             await submitJob(
               "post",
               "/zfs/pools/from-device",
-              { pool_name: vals.pool_name, device_path: vals.device_path, confirm: true },
+              {
+                pool_name: vals.pool_name,
+                device_path: vals.device_path,
+                confirm: true,
+                wipe_existing: vals.wipe_existing === "wipe",
+              },
               `provision ${vals.device_path} → ZFS pool ${vals.pool_name}`,
               () => inv("pools", "nodes", "jobs"),
             );

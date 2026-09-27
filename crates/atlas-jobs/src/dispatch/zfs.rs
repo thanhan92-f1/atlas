@@ -48,6 +48,7 @@ pub(crate) async fn dispatch_zfs(
         device_path,
         confirmed_device_path,
         host,
+        wipe_existing,
     } = spec
     else {
         anyhow::bail!("not a zfs spec");
@@ -65,7 +66,16 @@ pub(crate) async fn dispatch_zfs(
         );
     } else {
         let check = atlas_driver_zfs::inspect_device(&device_path).await?;
-        if let Some(reason) = check.refusal_reason() {
+        if let Some(reason) = check.hard_refusal_reason() {
+            anyhow::bail!("refusing to format {device_path}: {reason}");
+        }
+        if wipe_existing {
+            atlas_driver_zfs::wipe_device(&device_path).await?;
+            let recheck = atlas_driver_zfs::inspect_device(&device_path).await?;
+            if let Some(reason) = recheck.refusal_reason() {
+                anyhow::bail!("refusing to format {device_path} even after wipe: {reason}");
+            }
+        } else if let Some(reason) = check.refusal_reason() {
             anyhow::bail!("refusing to format {device_path}: {reason}");
         }
         atlas_driver_zfs::zpool_create(&pool_name, &device_path).await?;

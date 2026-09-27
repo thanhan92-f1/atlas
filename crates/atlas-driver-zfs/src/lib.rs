@@ -26,7 +26,9 @@ use atlas_api_types::{
 use atlas_driver_core::{DriverError, StorageDriver};
 
 mod cmd;
-pub use cmd::{cluster_id, inspect_device, pool_id, root_volume_id, zpool_create, DeviceCheck};
+pub use cmd::{
+    cluster_id, inspect_device, pool_id, root_volume_id, wipe_device, zpool_create, DeviceCheck,
+};
 
 pub(crate) fn sanitize(s: &str) -> String {
     s.trim_matches('/')
