@@ -61,17 +61,23 @@ rules:
   - apiGroups: ["batch"]
     resources: ["jobs"]
     verbs: ["get", "list", "watch", "create", "delete"]
-  # Rook CRD read integration + pool/filesystem/object-store lifecycle automation: CephCluster is
-  # read-only (health/status cross-check); the other three are also created/deleted by Atlas.
+  # Rook CRD read integration + pool/filesystem/object-store lifecycle automation. CephCluster
+  # also needs `patch` for POST /ceph/devices (raw-disk-to-OSD provisioning), which merge-patches
+  # spec.storage.nodes — the other three CRs are also created/deleted by Atlas.
   - apiGroups: ["ceph.rook.io"]
     resources: ["cephclusters"]
-    verbs: ["get", "list", "watch"]
+    verbs: ["get", "list", "watch", "patch"]
   - apiGroups: ["ceph.rook.io"]
     resources: ["cephblockpools", "cephfilesystems", "cephobjectstores"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   # Optional ATLAS_LONGHORN_ENABLE discovery; Longhorn mutations use Kubernetes PVCs above.
   - apiGroups: ["longhorn.io"]
     resources: ["nodes", "volumes"]
+    verbs: ["get", "list", "watch"]
+  # POST /ceph/devices validates the operator-supplied node name against the real cluster before
+  # patching CephCluster against it.
+  - apiGroups: [""]
+    resources: ["nodes"]
     verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
