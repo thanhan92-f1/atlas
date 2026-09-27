@@ -493,13 +493,30 @@ pub async fn wipe_device(device_path: &str) -> Result<(), DriverError> {
 /// specifically to override zpool's own built-in "this looks like it's in use" refusal, which is
 /// the safety net underneath everything `inspect_device` already checked.
 pub async fn zpool_create(pool_name: &str, device_path: &str) -> Result<(), DriverError> {
-    let (ok, _stdout, stderr) = run("zpool", &["create", pool_name, device_path]).await?;
-    if !ok {
-        return Err(DriverError::Backend(format!(
-            "zpool create {pool_name} {device_path}: {stderr}"
-        )));
+    // `zpool create` on a whole disk writes a new GPT (BLKPG_ADD_PARTITION) and then immediately
+    // reopens the partition device node it just asked the kernel to create — a real, observed race
+    // when the gateway runs in a container whose /dev is a hostPath bind mount: the kernel creates
+    // the device (confirmed via the host's own dmesg) before devtmpfs has propagated the new node
+    // into the container's view, and zpool has no retry/settle wait of its own for this. `zpool
+    // create` never rewrites/re-labels anything on a retry here (each attempt is against the same
+    // freshly-written, still-valid label) — never passes `-f`, same rule as the first attempt.
+    const MAX_ATTEMPTS: u32 = 5;
+    let mut last_err = String::new();
+    for attempt in 1..=MAX_ATTEMPTS {
+        let (ok, _stdout, stderr) = run("zpool", &["create", pool_name, device_path]).await?;
+        if ok {
+            return Ok(());
+        }
+        last_err = stderr;
+        if attempt < MAX_ATTEMPTS && last_err.contains("failed to detect device partitions") {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            continue;
+        }
+        break;
     }
-    Ok(())
+    Err(DriverError::Backend(format!(
+        "zpool create {pool_name} {device_path}: {last_err}"
+    )))
 }
 
 /// The synthesized inventory pool/cluster ids this device-provision path writes, matching
