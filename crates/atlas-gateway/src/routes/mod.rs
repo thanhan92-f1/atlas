@@ -21,6 +21,7 @@ mod rbd;
 mod rook;
 mod util;
 mod volumes;
+mod zfs;
 
 use axum::{
     middleware,
@@ -46,6 +47,7 @@ use protection::*;
 use rbd::*;
 use rook::*;
 use volumes::*;
+use zfs::*;
 
 pub fn router(state: AppState) -> Router {
     // Password login is intentionally outside the bearer middleware (this is how you get a token).
@@ -116,6 +118,8 @@ pub fn router(state: AppState) -> Router {
             "/ceph/object-stores/{name}",
             delete(delete_ceph_object_store),
         )
+        .route("/ceph/devices", post(add_ceph_device))
+        .route("/zfs/pools/from-device", post(create_zfs_pool_from_device))
         .route("/storage-classes", get(list_storage_classes))
         .route("/kubernetes/pvcs", get(list_pvcs))
         .route("/kubernetes/pvs", get(list_pvs))

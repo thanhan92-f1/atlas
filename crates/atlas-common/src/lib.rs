@@ -4,6 +4,7 @@
 //! type, tracing setup, and resource-id helpers.
 
 pub mod config;
+pub mod device;
 pub mod error;
 pub mod ids;
 

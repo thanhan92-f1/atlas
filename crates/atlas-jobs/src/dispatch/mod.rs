@@ -6,6 +6,7 @@ mod object;
 mod rbd;
 mod rook;
 mod volumes;
+mod zfs;
 
 use std::sync::Arc;
 
@@ -53,8 +54,10 @@ pub(crate) async fn dispatch(
         | JobSpec::CephFilesystemCreate { .. }
         | JobSpec::CephFilesystemDelete { .. }
         | JobSpec::CephObjectStoreCreate { .. }
-        | JobSpec::CephObjectStoreDelete { .. } => {
-            rook::dispatch_rook(pool, k8s, tenant_id, spec).await
+        | JobSpec::CephObjectStoreDelete { .. }
+        | JobSpec::CephOsdAddDevice { .. } => rook::dispatch_rook(pool, k8s, tenant_id, spec).await,
+        JobSpec::ZfsPoolCreateFromDevice { .. } => {
+            zfs::dispatch_zfs(pool, k8s, tenant_id, spec).await
         }
         JobSpec::SourceDiscover { .. }
         | JobSpec::MigrationAssess { .. }

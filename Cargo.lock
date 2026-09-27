@@ -471,6 +471,7 @@ dependencies = [
  "atlas-driver-ceph",
  "atlas-driver-k8s",
  "atlas-driver-rgw",
+ "atlas-driver-zfs",
  "atlas-inventory",
  "atlas-policy",
  "chrono",

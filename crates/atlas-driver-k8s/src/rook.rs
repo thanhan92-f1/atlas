@@ -187,6 +187,144 @@ impl K8sDriver {
             .get(pool_name)
             .copied())
     }
+
+    /// Rook's own device-discovery ConfigMap for one node (`local-device-<node>`, populated by
+    /// Rook's discovery DaemonSet when `ROOK_ENABLE_DISCOVERY_DAEMON` is on). `None` means the
+    /// ConfigMap doesn't exist — the caller must fail closed (never assume a device is safe when
+    /// this oracle is unavailable), not silently skip the check. Rook's schema is a single
+    /// `"devices"` data key holding a JSON-encoded array of `{name, filesystem, empty, ...}`.
+    pub async fn get_local_devices(
+        &self,
+        ns: &str,
+        node_name: &str,
+    ) -> Result<Option<Vec<serde_json::Value>>, K8sError> {
+        let Some(cm) = self.get_configmap(ns, &format!("local-device-{node_name}")).await? else {
+            return Ok(None);
+        };
+        let Some(raw) = cm.get("devices") else {
+            return Ok(Some(Vec::new()));
+        };
+        Ok(Some(serde_json::from_str(raw).unwrap_or_default()))
+    }
+
+    /// Whether Rook's discovery data reports `device_basename` (bare name, e.g. `sdb`) on
+    /// `node_name` as genuinely empty (no filesystem, no partitions) — the safety oracle for the
+    /// raw-disk-provisioning path, since the gateway itself has no remote-exec mechanism to shell
+    /// `lsblk`/`findmnt` against an arbitrary Kubernetes node the way it can for a local ZFS host.
+    /// `Err` means the device wasn't found in Rook's own discovery data at all.
+    pub async fn ceph_device_reports_empty(
+        &self,
+        ns: &str,
+        node_name: &str,
+        device_basename: &str,
+    ) -> Result<bool, K8sError> {
+        let devices = self.get_local_devices(ns, node_name).await?.ok_or_else(|| {
+            K8sError::NotFound(format!(
+                "Rook device discovery ConfigMap local-device-{node_name} not found in {ns}"
+            ))
+        })?;
+        let entry = devices
+            .iter()
+            .find(|d| d.get("name").and_then(|n| n.as_str()) == Some(device_basename))
+            .ok_or_else(|| {
+                K8sError::NotFound(format!(
+                    "device {device_basename} not visible to Rook's discovery on node {node_name}"
+                ))
+            })?;
+        let empty = entry.get("empty").and_then(|v| v.as_bool()).unwrap_or(false);
+        let has_fs = entry
+            .get("filesystem")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.is_empty());
+        Ok(empty && !has_fs)
+    }
+
+    /// `CephCluster.spec.storage` — just the fields the raw-disk-provisioning path needs
+    /// (`useAllDevices` and the explicit per-node device list). `None` if the CR itself is absent.
+    pub async fn get_ceph_cluster_storage(
+        &self,
+        ns: &str,
+        name: &str,
+    ) -> Result<Option<CephClusterStorageSpec>, K8sError> {
+        let spec = self.get_cr_spec(ROOK_GROUP, ROOK_VERSION, "CephCluster", ns, name).await?;
+        Ok(spec.map(|s| {
+            s.get("storage")
+                .cloned()
+                .and_then(|storage| serde_json::from_value(storage).ok())
+                .unwrap_or_default()
+        }))
+    }
+
+    /// Add `device_basename` (bare name, e.g. `sdb` — **not** `/dev/sdb`; Rook's own CR schema
+    /// expects the bare name) to `node_name`'s entry in `spec.storage.nodes[].devices`, creating
+    /// the node entry if it doesn't exist yet. Idempotent: a no-op if the device is already
+    /// listed, so a retried invocation of the job that calls this is safe to re-run. Issues a
+    /// scoped JSON Merge Patch touching only `spec.storage.nodes` (via `patch_cr_merge`) — never a
+    /// full-spec replace, which would clobber `mon`/`dashboard`/`network`/`cephVersion` etc.
+    ///
+    /// Concurrency: safe today because the job engine has exactly one worker serializing every
+    /// job system-wide, so two Atlas-driven calls can never race each other here — only a
+    /// concurrent manual `kubectl edit cephcluster` is a residual risk, accepted (as `apply_cr`
+    /// already accepts the same class of race for pool/filesystem/objectstore CRs). If the job
+    /// engine is ever sharded to multiple workers, this needs its own compare-and-swap.
+    pub async fn add_ceph_cluster_device(
+        &self,
+        ns: &str,
+        cluster_name: &str,
+        node_name: &str,
+        device_basename: &str,
+    ) -> Result<(), K8sError> {
+        // If the CephCluster CR is genuinely absent, `storage` defaults to empty and the
+        // `patch_cr_merge` call below fails honestly with a real (404) API error — this never
+        // fabricates success against a cluster that doesn't exist.
+        let mut storage = self
+            .get_ceph_cluster_storage(ns, cluster_name)
+            .await?
+            .unwrap_or_default();
+        if let Some(node) = storage.nodes.iter_mut().find(|n| n.name == node_name) {
+            if node.devices.iter().any(|d| d.name == device_basename) {
+                return Ok(()); // already listed — nothing to do
+            }
+            node.devices.push(CephClusterDeviceSpec {
+                name: device_basename.to_string(),
+            });
+        } else {
+            storage.nodes.push(CephClusterNodeSpec {
+                name: node_name.to_string(),
+                devices: vec![CephClusterDeviceSpec {
+                    name: device_basename.to_string(),
+                }],
+            });
+        }
+        let patch = serde_json::json!({ "spec": { "storage": { "nodes": storage.nodes } } });
+        self.patch_cr_merge(ROOK_GROUP, ROOK_VERSION, "CephCluster", ns, cluster_name, patch)
+            .await
+    }
+}
+
+/// `CephCluster.spec.storage` — just the fields the raw-disk-provisioning path reads/writes.
+/// Deserialized loosely (`#[serde(default)]` everywhere) since the full Rook storage spec has many
+/// more fields (`volumeClaimTemplates`, `onlyApplyOSDPlacement`, ...) this doesn't need to model.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct CephClusterStorageSpec {
+    #[serde(default)]
+    pub use_all_nodes: bool,
+    #[serde(default)]
+    pub use_all_devices: bool,
+    #[serde(default)]
+    pub nodes: Vec<CephClusterNodeSpec>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct CephClusterNodeSpec {
+    pub name: String,
+    #[serde(default)]
+    pub devices: Vec<CephClusterDeviceSpec>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct CephClusterDeviceSpec {
+    pub name: String,
 }
 
 #[cfg(test)]

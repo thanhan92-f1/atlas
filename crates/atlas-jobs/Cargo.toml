@@ -14,6 +14,7 @@ atlas-inventory = { workspace = true }
 atlas-driver-k8s = { workspace = true }
 atlas-driver-rgw = { workspace = true }
 atlas-driver-ceph = { workspace = true }
+atlas-driver-zfs = { workspace = true }
 atlas-databridge = { workspace = true }
 atlas-policy = { workspace = true }
 sqlx = { workspace = true }

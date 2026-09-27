@@ -17,6 +17,7 @@ import {
   Cloud,
   CloudCog,
   Database,
+  Disc,
   FileClock,
   Gauge,
   GitBranch,
@@ -58,6 +59,7 @@ import Access from "../views/Access";
 import SettingsView from "../views/Settings";
 import ApiDocs from "../views/ApiDocs";
 import { Backends, Cluster, Kubernetes, Metrics, Policies } from "../views/Simple";
+import Disks from "../views/Disks";
 import Maintenance from "../views/Maintenance";
 import DR from "../views/DR";
 import Sources from "../views/databridge/Sources";
@@ -158,6 +160,7 @@ export const MODULES: NavModule[] = [
   { id: "ceph", codename: "kraken", label: "Ceph", path: "/ceph", icon: Aperture, section: "INFRASTRUCTURE", minRole: "operator", pinned: true, topPrimary: true, shortcut: "C", element: Ceph },
   { id: "maintenance", codename: "hestia", label: "Maintenance", path: "/maintenance", icon: Wrench, section: "INFRASTRUCTURE", minRole: "operator", element: Maintenance },
   { id: "dr", codename: "styx", label: "Disaster Recovery", path: "/dr", icon: GitBranch, section: "INFRASTRUCTURE", minRole: "admin", element: DR },
+  { id: "disks", codename: "vulcan", label: "Disks", path: "/disks", icon: Disc, section: "INFRASTRUCTURE", minRole: "admin", element: Disks },
 
   { id: "pool-detail", codename: "pool", label: "Pool", path: "/pools/:id", icon: Database, section: "STORAGE", minRole: "operator", hiddenFromNav: true, element: PoolDetail },
   { id: "plan-detail", codename: "plan", label: "Plan", path: "/databridge/plans/:id", icon: RouteIcon, section: "DATABRIDGE", minRole: "operator", hiddenFromNav: true, element: PlanDetail },

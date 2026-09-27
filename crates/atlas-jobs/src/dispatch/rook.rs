@@ -48,6 +48,41 @@ fn csi_secret_params(prefix: &str, ns: &str) -> Vec<(String, String)> {
     .collect()
 }
 
+/// Scan `ceph device ls -f json` output for an entry on `node_name`/`device_basename` that already
+/// has at least one OSD daemon attached — i.e. Rook has actually finished claiming the device, not
+/// just accepted the CR patch.
+fn osd_found_for_device(devices: &serde_json::Value, node_name: &str, device_basename: &str) -> bool {
+    let Some(entries) = devices.as_array() else {
+        return false;
+    };
+    entries.iter().any(|entry| {
+        let has_osd_daemon = entry
+            .get("daemons")
+            .and_then(|d| d.as_array())
+            .is_some_and(|daemons| {
+                daemons
+                    .iter()
+                    .any(|d| d.as_str().is_some_and(|s| s.starts_with("osd.")))
+            });
+        if !has_osd_daemon {
+            return false;
+        }
+        entry
+            .get("location")
+            .and_then(|l| l.as_array())
+            .is_some_and(|locations| {
+                locations.iter().any(|loc| {
+                    let host_matches = loc.get("host").and_then(|h| h.as_str()) == Some(node_name);
+                    let dev_matches = loc
+                        .get("dev")
+                        .and_then(|d| d.as_str())
+                        .is_some_and(|d| d.trim_start_matches("/dev/") == device_basename);
+                    host_matches && dev_matches
+                })
+            })
+    })
+}
+
 pub(crate) async fn dispatch_rook(
     _pool: &AnyPool,
     k8s: &Option<Arc<K8sDriver>>,
@@ -283,6 +318,45 @@ pub(crate) async fn dispatch_rook(
             )
             .await?;
             Ok(serde_json::json!({ "object_store": name, "deleted": true }))
+        }
+
+        JobSpec::CephOsdAddDevice {
+            namespace,
+            cluster_name,
+            node_name,
+            device_path,
+            confirmed_device_path,
+        } => {
+            anyhow::ensure!(
+                device_path == confirmed_device_path,
+                "device path confirmation mismatch"
+            );
+            let k8s = require_k8s(k8s)?;
+            let device_basename = device_path.trim_start_matches("/dev/").to_string();
+
+            // Idempotent — safe to re-run on every retry: no-ops if the device is already listed.
+            k8s.add_ceph_cluster_device(&namespace, &cluster_name, &node_name, &device_basename)
+                .await?;
+
+            // One-shot check, not a blocking loop: is there NOW a Ceph OSD backed by this exact
+            // device on this exact host? Rook's reconciliation can take minutes and this job
+            // engine has exactly one worker serializing every job system-wide — blocking it that
+            // long would stall every other tenant's jobs. Instead, this dispatch call returns
+            // immediately either way, letting the *existing* retry/backoff machinery in
+            // `engine.rs::run_worker` act as the poll loop (an `Err` here is automatically
+            // rescheduled with exponential backoff up to the job's configured retry budget).
+            // `ceph device ls` is Ceph's own ground truth of daemon<->device mapping — stronger
+            // than the CephCluster's aggregate `status.phase`, which can already read "Ready"
+            // while this specific device's `ceph-volume prepare` is still mid-flight.
+            let devices = atlas_driver_ceph::ceph_cmd(&["device", "ls"]).await?;
+            if osd_found_for_device(&devices, &node_name, &device_basename) {
+                return Ok(serde_json::json!({
+                    "node": node_name, "device": device_path, "ready": true
+                }));
+            }
+            anyhow::bail!(
+                "rook has not yet produced an OSD for {device_path} on {node_name} — will retry"
+            )
         }
 
         _ => anyhow::bail!("not a rook spec"),

@@ -43,6 +43,8 @@ pub enum K8sError {
     Init(String),
     #[error("kube api error: {0}")]
     Api(#[from] kube::Error),
+    #[error("not found: {0}")]
+    NotFound(String),
 }
 
 /// Ceph CSI provisioners we badge as Ceph-backed (PDF §7.1).
@@ -410,6 +412,52 @@ impl K8sDriver {
             .get_opt(name)
             .await?
             .and_then(|o| o.data.get("status").cloned()))
+    }
+
+    /// Read a custom resource's `spec` object (None if the CR is absent). Sibling of
+    /// `get_cr_status`.
+    pub async fn get_cr_spec(
+        &self,
+        group: &str,
+        version: &str,
+        kind: &str,
+        ns: &str,
+        name: &str,
+    ) -> Result<Option<serde_json::Value>, K8sError> {
+        let api = self.cr_api(group, version, kind, ns);
+        Ok(api
+            .get_opt(name)
+            .await?
+            .and_then(|o| o.data.get("spec").cloned()))
+    }
+
+    /// JSON Merge Patch (RFC 7396) against an arbitrary custom resource — scoped to whatever keys
+    /// `merge_patch` contains, unlike `apply_cr`'s full-object replace. Callers should pass the
+    /// smallest possible patch (e.g. `{"spec":{"storage":{"nodes":[...]}}}`) so fields the patch
+    /// doesn't mention (other top-level `spec` keys) are left untouched.
+    pub async fn patch_cr_merge(
+        &self,
+        group: &str,
+        version: &str,
+        kind: &str,
+        ns: &str,
+        name: &str,
+        merge_patch: serde_json::Value,
+    ) -> Result<(), K8sError> {
+        let api = self.cr_api(group, version, kind, ns);
+        api.patch(name, &PatchParams::default(), &Patch::Merge(&merge_patch))
+            .await?;
+        Ok(())
+    }
+
+    /// Minimal Kubernetes Node lookup — nothing else in this crate enumerates cluster Nodes today.
+    /// Used to validate an operator-supplied node name is real before patching a CR against it.
+    pub async fn get_node(
+        &self,
+        name: &str,
+    ) -> Result<Option<k8s_openapi::api::core::v1::Node>, K8sError> {
+        let api: Api<k8s_openapi::api::core::v1::Node> = Api::all(self.client.clone());
+        Ok(api.get_opt(name).await?)
     }
 
     /// Delete a custom resource (ignores not-found).

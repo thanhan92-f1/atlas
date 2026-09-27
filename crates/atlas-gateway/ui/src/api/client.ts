@@ -120,20 +120,34 @@ export function watchJob(jobId: string, label: string, onDone?: () => void) {
   }
 }
 
-async function pollJob(jobId: string, _label: string, finish: (s: string, e?: string | null) => void) {
-  for (let i = 0; i < 60; i++) {
+async function pollJob(jobId: string, label: string, finish: (s: string, e?: string | null) => void) {
+  // Poll for as long as the job's own reported state is still non-terminal — some jobs (e.g.
+  // claiming a raw disk as a Ceph OSD via Rook) legitimately run for many minutes. A fixed
+  // iteration cap here would fabricate a "failed" state for a job that's still genuinely in
+  // progress server-side, which is actively misleading (an operator could see "failed" and retry
+  // while the first attempt is still claiming the disk). Only give up on repeated *request*
+  // failures (the status endpoint itself unreachable), never on elapsed time.
+  let consecutiveFailures = 0;
+  const MAX_CONSECUTIVE_FAILURES = 20; // ~30s of the status request itself failing outright
+  for (;;) {
     await new Promise((r) => setTimeout(r, 1500));
     try {
       const { data } = await http.get<JobRecord>(`/jobs/${jobId}`);
+      consecutiveFailures = 0;
       useUi.getState().updateJob(jobId, { state: data.state, progress: data.progress_percent, error: data.error });
       if (data.state === "succeeded" || data.state === "failed") return finish(data.state, data.error);
     } catch {
-      /* keep trying */
+      consecutiveFailures++;
+      if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+        // Lost the ability to even ask about this job — a different situation from the job
+        // itself failing, so this must never read like a job failure: no "✗", and the tracked
+        // job's state is left alone rather than forced to "failed" (which would misleadingly
+        // badge it as a terminal failure in the header's Running-jobs flyout).
+        toast(`lost connection tracking "${label}" — check Jobs for its real status`, "info");
+        return;
+      }
     }
   }
-  // Give up after 90s of polling — without this the job stays "running" in the UI forever with
-  // no toast and no way to tell it's not actually being tracked anymore.
-  finish("failed", "Timed out waiting for job status");
 }
 
 // Extract the job id from a 202 response body (varies by endpoint).

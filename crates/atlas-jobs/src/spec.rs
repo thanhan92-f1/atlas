@@ -343,6 +343,34 @@ pub enum JobSpec {
         namespace: String,
         storage_class: String,
     },
+    /// Provision a raw, unformatted **local** block device into a brand-new ZFS pool
+    /// (`zpool create`). Local-host-only, mirroring `RealZfsDriver`'s own co-location assumption
+    /// (the gateway process must be running on the host that owns `device_path`; there is no
+    /// remote/SSH execution anywhere in this codebase).
+    #[serde(rename = "zfs.pool.create_from_device")]
+    ZfsPoolCreateFromDevice {
+        backend_id: String,
+        pool_name: String,
+        device_path: String,
+        /// Re-stated by the caller; dispatch refuses unless this equals `device_path`
+        /// byte-for-byte — defense in depth against the spec ever getting corrupted/retargeted
+        /// between enqueue and run.
+        confirmed_device_path: String,
+        host: String,
+    },
+    /// Claim a raw, unformatted disk on a specific Kubernetes node as a new Ceph OSD via Rook:
+    /// patches the `CephCluster` CR's `spec.storage.nodes[].devices` list, then (each dispatch
+    /// invocation) does one non-blocking check of whether Rook has produced a matching OSD yet —
+    /// the job engine's own retry/backoff machinery is the poll loop, since Rook's reconciliation
+    /// can take minutes and this job engine has exactly one worker serializing every job.
+    #[serde(rename = "ceph.osd.add_device")]
+    CephOsdAddDevice {
+        namespace: String,
+        cluster_name: String,
+        node_name: String,
+        device_path: String,
+        confirmed_device_path: String,
+    },
 }
 
 impl JobSpec {
@@ -389,6 +417,8 @@ impl JobSpec {
             JobSpec::CephFilesystemDelete { .. } => "ceph.filesystem.delete",
             JobSpec::CephObjectStoreCreate { .. } => "ceph.object_store.create",
             JobSpec::CephObjectStoreDelete { .. } => "ceph.object_store.delete",
+            JobSpec::ZfsPoolCreateFromDevice { .. } => "zfs.pool.create_from_device",
+            JobSpec::CephOsdAddDevice { .. } => "ceph.osd.add_device",
         }
     }
 }

@@ -280,6 +280,130 @@ pub(crate) async fn create_ceph_object_store(
     ))
 }
 
+// ---- raw disk -> OSD provisioning ----
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct AddCephDeviceBody {
+    node_name: String,
+    device_path: String,
+    confirm: bool,
+    namespace: Option<String>,
+    cluster_name: Option<String>,
+}
+
+/// `POST /ceph/devices` — claim a raw, unformatted disk on a specific Kubernetes node as a new
+/// Ceph OSD via Rook (async job: patches the `CephCluster` CR's device list, then polls — via the
+/// job engine's own retry machinery, not a blocking wait — until Rook actually produces the OSD).
+pub(crate) async fn add_ceph_device(
+    State(s): State<AppState>,
+    Extension(actor): Extension<Actor>,
+    Json(body): Json<AddCephDeviceBody>,
+) -> AppResult<(StatusCode, Json<Value>)> {
+    crate::auth::require_role(s.config.auth_required, &actor, crate::auth::ROLE_ADMIN)?;
+    if !body.confirm {
+        return Err(AppError::Validation(
+            "confirm=true is required to claim a raw device as an OSD".into(),
+        ));
+    }
+    atlas_common::device::validate_raw_device_path(&body.device_path)
+        .map_err(AppError::Validation)?;
+    require_k8s(&s)?;
+
+    let namespace = body
+        .namespace
+        .unwrap_or_else(|| s.config.rook_namespace.clone());
+    let cluster_name = body
+        .cluster_name
+        .unwrap_or_else(|| s.config.rook_cluster_name.clone());
+    let k8s = s.k8s.as_ref().unwrap();
+
+    if k8s
+        .get_node(&body.node_name)
+        .await
+        .map_err(|e| AppError::Driver(e.to_string()))?
+        .is_none()
+    {
+        return Err(AppError::Validation(format!(
+            "no such Kubernetes node: {}",
+            body.node_name
+        )));
+    }
+    let storage = k8s
+        .get_ceph_cluster_storage(&namespace, &cluster_name)
+        .await
+        .map_err(|e| AppError::Driver(e.to_string()))?
+        .ok_or_else(|| AppError::NotFound(format!("CephCluster {namespace}/{cluster_name}")))?;
+    if storage.use_all_devices {
+        return Err(AppError::Validation(
+            "this cluster has useAllDevices=true — it already auto-claims every empty device; \
+             this API only applies when devices are pinned explicitly per node"
+                .into(),
+        ));
+    }
+
+    // Safety oracle: the gateway has no remote-exec mechanism to shell `lsblk`/`findmnt` against
+    // an arbitrary Kubernetes node the way it can for a local ZFS host, so this reads Rook's own
+    // device-discovery ConfigMap instead. Fail closed (503) if that data isn't there at all —
+    // never assume a device is safe to claim when this oracle is unavailable.
+    let device_basename = body.device_path.trim_start_matches("/dev/");
+    match k8s
+        .ceph_device_reports_empty(&namespace, &body.node_name, device_basename)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(AppError::Validation(format!(
+                "device {} on node {} is not reported empty by Rook's discovery (already has a \
+                 filesystem or is in use)",
+                body.device_path, body.node_name
+            )))
+        }
+        Err(atlas_driver_k8s::K8sError::NotFound(msg)) => {
+            return Err(AppError::Unavailable(format!(
+                "cannot safety-verify {}: {msg} — enable Rook's discovery daemon \
+                 (ROOK_ENABLE_DISCOVERY_DAEMON) before using this API",
+                body.device_path
+            )))
+        }
+        Err(e) => return Err(AppError::Driver(e.to_string())),
+    }
+
+    let spec = JobSpec::CephOsdAddDevice {
+        namespace,
+        cluster_name,
+        node_name: body.node_name.clone(),
+        device_path: body.device_path.clone(),
+        confirmed_device_path: body.device_path.clone(),
+    };
+    let job_id = ids::job_id();
+    let job = s
+        .jobs
+        .enqueue(&job_id, "global", &actor.id, spec, None)
+        .await
+        .map_err(AppError::from)?;
+    // Generous retry budget: Rook's reconciliation can take several minutes. Backoff is capped at
+    // 64s/attempt (engine.rs), so 30 retries gives roughly 25-30 minutes of polling before the job
+    // is finally marked failed.
+    const CEPH_OSD_ADD_MAX_RETRIES: i64 = 30;
+    let _ = atlas_inventory::jobs::set_max_retries(&s.pool, &job_id, CEPH_OSD_ADD_MAX_RETRIES).await;
+    let _ = atlas_inventory::audit::record(
+        &s.pool,
+        None,
+        &actor.id,
+        "ceph.osd.add_device.requested",
+        "node",
+        &body.node_name,
+        "accepted",
+        Some(json!({ "device": body.device_path })),
+        None,
+    )
+    .await;
+    Ok(accepted(
+        &job,
+        json!({ "node": body.node_name, "device": body.device_path }),
+    ))
+}
+
 /// `DELETE /ceph/object-stores/{name}[?force=true]` — blocked (409) while any bucket still
 /// references the store's StorageClass.
 pub(crate) async fn delete_ceph_object_store(

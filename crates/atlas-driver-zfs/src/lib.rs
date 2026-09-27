@@ -25,7 +25,10 @@ use atlas_api_types::{
 };
 use atlas_driver_core::{DriverError, StorageDriver};
 
-fn sanitize(s: &str) -> String {
+mod cmd;
+pub use cmd::{cluster_id, inspect_device, pool_id, root_volume_id, zpool_create, DeviceCheck};
+
+pub(crate) fn sanitize(s: &str) -> String {
     s.trim_matches('/')
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
