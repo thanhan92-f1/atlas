@@ -13,7 +13,9 @@ use atlas_common::Config;
 use atlas_driver_ceph::{FakeCephDriver, RealCephDriver};
 use atlas_driver_core::{DriverRegistry, StorageDriver};
 use atlas_driver_k8s::K8sDriver;
+use atlas_driver_longhorn::LonghornDriver;
 use atlas_driver_nfs::{FakeNfsDriver, RealNfsDriver};
+use atlas_driver_rustfs::{FakeRustfsDriver, RealRustfsDriver};
 use atlas_driver_zfs::{FakeZfsDriver, RealZfsDriver};
 
 use crate::state::AppState;
@@ -24,6 +26,9 @@ pub const CEPH_BACKEND_ID: &str = "bkd_ceph_lab";
 pub const NFS_BACKEND_ID: &str = "bkd_nfs_lab";
 /// Optional third ZFS backend id (enabled via `ATLAS_ZFS_ENABLE`).
 pub const ZFS_BACKEND_ID: &str = "bkd_zfs_lab";
+pub const LONGHORN_BACKEND_ID: &str = "bkd_longhorn";
+/// Optional fourth RustFS backend id (enabled via `ATLAS_RUSTFS_ENABLE`).
+pub const RUSTFS_BACKEND_ID: &str = "bkd_rustfs_lab";
 
 pub struct BuildOptions {
     /// Attempt to attach a live Kubernetes driver (disable in unit/integration tests).
@@ -249,6 +254,47 @@ pub async fn build_state(config: Config, opts: BuildOptions) -> Result<AppState>
         None
     };
 
+    // Optionally register a fourth RustFS backend — S3-compatible object storage, same
+    // pluggable-driver contract as Ceph/NFS/ZFS.
+    let rustfs_driver: Option<Arc<dyn StorageDriver>> = if config.rustfs_enable {
+        let endpoint = config
+            .rustfs_endpoint
+            .clone()
+            .unwrap_or_else(|| "http://rustfs01.zyvor.lab:9000".into());
+        let buckets = if config.rustfs_buckets.is_empty() {
+            vec!["vm-images".to_string(), "backups".to_string()]
+        } else {
+            config.rustfs_buckets.clone()
+        };
+        let rustfs: Arc<dyn StorageDriver> = match config.rustfs_driver_mode {
+            atlas_common::config::DriverMode::Real => {
+                Arc::new(RealRustfsDriver::new(RUSTFS_BACKEND_ID, endpoint, buckets))
+            }
+            atlas_common::config::DriverMode::Fake => {
+                Arc::new(FakeRustfsDriver::new(RUSTFS_BACKEND_ID, endpoint, buckets))
+            }
+        };
+        let rustfs_backend = StorageBackend {
+            id: RUSTFS_BACKEND_ID.into(),
+            name: "zyvor-rustfs".into(),
+            backend_type: BackendType::Rustfs,
+            mode: BackendMode::External,
+            status: "active".into(),
+            capabilities: Capabilities {
+                object: true,
+                ..Capabilities::default()
+            },
+            connection_ref: None,
+            cordoned: false,
+        };
+        atlas_inventory::upsert_backend(&pool, &rustfs_backend).await?;
+        registry.register(rustfs.clone());
+        tracing::info!("rustfs backend registered ({RUSTFS_BACKEND_ID})");
+        Some(rustfs)
+    } else {
+        None
+    };
+
     // Attach a live Kubernetes driver if reachable.
     let k8s = if opts.enable_k8s {
         match K8sDriver::try_default().await {
@@ -264,6 +310,32 @@ pub async fn build_state(config: Config, opts: BuildOptions) -> Result<AppState>
     } else {
         None
     };
+
+    // Use the same in-cluster/kubeconfig identity as the Kubernetes PVC driver. Only register
+    // a live Longhorn driver when requested and when Kubernetes is reachable; never fake data.
+    let longhorn_driver: Option<Arc<dyn StorageDriver>> = if std::env::var("ATLAS_LONGHORN_ENABLE")
+        .ok().is_some_and(|v| v == "1")
+    {
+        let namespace = std::env::var("ATLAS_LONGHORN_NAMESPACE")
+            .unwrap_or_else(|_| "longhorn-system".into());
+        if !opts.enable_k8s || k8s.is_none() {
+            anyhow::bail!("ATLAS_LONGHORN_ENABLE=1 requires a working Kubernetes client");
+        }
+        let client = kube::Client::try_default().await
+            .context("Longhorn Kubernetes client initialization failed")?;
+        let longhorn: Arc<dyn StorageDriver> = Arc::new(LonghornDriver::new(
+            LONGHORN_BACKEND_ID, namespace, client,
+        ));
+        atlas_inventory::upsert_backend(&pool, &StorageBackend {
+            id: LONGHORN_BACKEND_ID.into(), name: "longhorn".into(),
+            backend_type: BackendType::Longhorn, mode: BackendMode::External,
+            status: "active".into(),
+            capabilities: Capabilities { block: true, ..Capabilities::default() },
+            connection_ref: None, cordoned: false,
+        }).await?;
+        registry.register(longhorn.clone());
+        Some(longhorn)
+    } else { None };
 
     // Start the async job engine (write path) over the same pool + k8s driver.
     // Durable DB poller (ATLAS_JOB_POLL_SECS) keeps queued work alive across channel loss;
@@ -324,6 +396,18 @@ pub async fn build_state(config: Config, opts: BuildOptions) -> Result<AppState>
             match atlas_discovery::run_discovery(&state.pool, zfs.clone(), None, None).await {
                 Ok(sum) => tracing::info!(?sum, "initial zfs discovery complete"),
                 Err(e) => tracing::warn!("initial zfs discovery failed: {e:#}"),
+            }
+        }
+        if let Some(rustfs) = &rustfs_driver {
+            match atlas_discovery::run_discovery(&state.pool, rustfs.clone(), None, None).await {
+                Ok(sum) => tracing::info!(?sum, "initial rustfs discovery complete"),
+                Err(e) => tracing::warn!("initial rustfs discovery failed: {e:#}"),
+            }
+        }
+        if let Some(longhorn) = &longhorn_driver {
+            match atlas_discovery::run_discovery(&state.pool, longhorn.clone(), None, None).await {
+                Ok(sum) => tracing::info!(?sum, "initial longhorn discovery complete"),
+                Err(e) => tracing::warn!("initial longhorn discovery failed: {e:#}"),
             }
         }
     }

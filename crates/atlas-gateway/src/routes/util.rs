@@ -81,6 +81,17 @@ pub(crate) fn ceph_default_caps(t: BackendType) -> Capabilities {
             file: true,
             ..Capabilities::default()
         },
+        // Native driver is read-only; PVC provisioning is served by the Kubernetes path.
+        BackendType::Longhorn => Capabilities {
+            block: true,
+            ..Capabilities::default()
+        },
+        // atlas-driver-rustfs only implements discover/health/list_pools/list_volumes/metrics
+        // (read-only) and classifies its volumes as VolumeKind::Object.
+        BackendType::Rustfs => Capabilities {
+            object: true,
+            ..Capabilities::default()
+        },
         _ => Capabilities::default(),
     }
 }

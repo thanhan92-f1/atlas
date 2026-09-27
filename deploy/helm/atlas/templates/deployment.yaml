@@ -245,6 +245,16 @@ spec:
             - name: ATLAS_ZFS_DRIVER_MODE
               value: {{ .Values.zfs.driverMode | default "fake" | quote }}
             {{- end }}
+            {{- if .Values.rustfs.enabled }}
+            - name: ATLAS_RUSTFS_ENABLE
+              value: "1"
+            - name: ATLAS_RUSTFS_ENDPOINT
+              value: {{ .Values.rustfs.endpoint | quote }}
+            - name: ATLAS_RUSTFS_BUCKETS
+              value: {{ .Values.rustfs.buckets | quote }}
+            - name: ATLAS_RUSTFS_DRIVER_MODE
+              value: {{ .Values.rustfs.driverMode | default "fake" | quote }}
+            {{- end }}
             {{- if .Values.service.https.enabled }}
             - name: ATLAS_HTTPS_ADDR
               value: "0.0.0.0:{{ .Values.service.https.port }}"

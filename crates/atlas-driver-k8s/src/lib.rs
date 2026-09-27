@@ -102,6 +102,8 @@ impl K8sDriver {
                 let provisioner = sc.provisioner;
                 StorageClassInfo {
                     is_ceph: is_ceph_provisioner(&provisioner),
+                    backend_type: (provisioner == "driver.longhorn.io").then(|| "longhorn".to_string())
+                        .or_else(|| is_ceph_provisioner(&provisioner).then(|| "ceph".to_string())),
                     name: sc.metadata.name.unwrap_or_default(),
                     provisioner,
                     reclaim_policy: sc.reclaim_policy,

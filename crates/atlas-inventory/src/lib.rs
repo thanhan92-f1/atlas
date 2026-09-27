@@ -139,6 +139,8 @@ fn backend_type_str(t: BackendType) -> &'static str {
         BackendType::Ceph => "ceph",
         BackendType::Nfs => "nfs",
         BackendType::Zfs => "zfs",
+        BackendType::Longhorn => "longhorn",
+        BackendType::Rustfs => "rustfs",
         BackendType::San => "san",
         BackendType::CloudBlock => "cloud_block",
         BackendType::Kubernetes => "kubernetes",
@@ -148,6 +150,8 @@ fn backend_type_from(s: &str) -> BackendType {
     match s {
         "nfs" => BackendType::Nfs,
         "zfs" => BackendType::Zfs,
+        "longhorn" => BackendType::Longhorn,
+        "rustfs" => BackendType::Rustfs,
         "san" => BackendType::San,
         "cloud_block" => BackendType::CloudBlock,
         "kubernetes" => BackendType::Kubernetes,

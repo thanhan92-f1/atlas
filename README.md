@@ -17,10 +17,10 @@
 ![Atlas — Storage, as a product.](docs/social/atlas-share-card.png)
 
 **Storage, as a product.** Atlas is the **central storage control plane** for the Zyvor
-suite. Products call stable Atlas APIs; Atlas maps intent to Ceph (and NFS/ZFS) through
-pluggable drivers — with an Apple Shop console for operators.
+suite. Products call stable Atlas APIs; Atlas maps intent to Ceph (and NFS/ZFS/Longhorn/RustFS)
+through pluggable drivers — with an Apple Shop console for operators.
 
-**3** storage backends · **6** database engines migratable via DataBridge · **80+** REST
+**5** storage backends · **6** database engines migratable via DataBridge · **80+** REST
 endpoints · **3** access surfaces (REST · gRPC · SSE)
 
 📖 **[Read the full docs](https://zyvorai.github.io/atlas/)** — quickstart, architecture, licensing.
@@ -88,6 +88,8 @@ flowchart LR
   Driver --> Ceph[("Ceph\nRBD · CephFS · RGW")]
   Driver --> NFS[("NFS")]
   Driver --> ZFS[("ZFS")]
+  Driver --> Longhorn[("Longhorn")]
+  Driver --> RustFS[("RustFS")]
   Atlas --> DataBridge["DataBridge"]
   DataBridge --> Edge[("Edge DB on Ceph\nPostgres · MySQL · MariaDB\nOracle · SQL Server · MongoDB")]
 ```
@@ -97,7 +99,7 @@ Full write-up: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 ## 🧰 Capabilities
 
 - **Intent → storage** — volumes, snapshots, clones, CephFS RWX, RGW buckets via REST + gRPC
-- **Pluggable drivers** — real Ceph first; NFS + ZFS; fake driver for local demo
+- **Pluggable drivers** — real Ceph first; NFS + ZFS + Longhorn + RustFS; fake driver for local demo
 - **DataBridge** — cloud-to-edge DB migration (six engines, CDC, cutover) on Ceph
 - **Day-2** — alerts, maintenance, governance, quotas, upgrade preflight, DR scaffolding
 - **Ops Advisor** — explainable AI-assisted risk scoring and prioritized, read-only runbooks

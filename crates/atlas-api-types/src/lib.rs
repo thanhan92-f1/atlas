@@ -15,6 +15,9 @@ pub enum BackendType {
     Ceph,
     Nfs,
     Zfs,
+    Longhorn,
+    /// S3-compatible object backend (RustFS).
+    Rustfs,
     San,
     CloudBlock,
     /// Kubernetes CSI / StorageClass view (not a physical backend of its own).
@@ -202,6 +205,9 @@ pub struct StorageClassInfo {
     /// Ceph-backed classes are tagged so the UI can badge them (PDF §7.1 labels).
     #[serde(default)]
     pub is_ceph: bool,
+    /// Known CSI backend, when recognized. Unknown provisioners remain unclassified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_type: Option<String>,
     #[serde(default)]
     pub labels: std::collections::BTreeMap<String, String>,
 }
@@ -251,6 +257,9 @@ fn default_role() -> String {
 /// Kubernetes-specific volume options.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct K8sVolumeOpts {
+    /// Explicit Atlas backend for this PVC; omit for the existing Ceph default.
+    #[serde(default)]
+    pub backend_id: Option<String>,
     pub namespace: Option<String>,
     #[serde(default = "default_true")]
     pub create_pvc: bool,

@@ -174,6 +174,15 @@ pub struct Config {
     /// `Fake` (default) serves canned fixtures; `Real` shells out to local `zpool`/`zfs` commands
     /// (assumes the gateway runs on/near the ZFS host — no remote/SSH support). See `DriverMode`.
     pub zfs_driver_mode: DriverMode,
+    /// Register a fourth RustFS backend (S3-compatible object storage).
+    pub rustfs_enable: bool,
+    /// RustFS endpoint for the RustFS backend (defaults to a demo endpoint when enabled without one).
+    pub rustfs_endpoint: Option<String>,
+    /// Comma-separated bucket names (defaults to demo buckets when enabled without any).
+    pub rustfs_buckets: Vec<String>,
+    /// `Fake` (default) serves canned fixtures; `Real` calls `rustfs_endpoint`'s health/S3
+    /// `ListBuckets` endpoints. See `DriverMode`.
+    pub rustfs_driver_mode: DriverMode,
     /// OIDC/SSO login (`None` = feature disabled — no unauthenticated OIDC routes are mounted).
     pub oidc: Option<OidcConfig>,
     /// Kubernetes namespace the Rook operator/CephCluster runs in — used when reading Rook's own
@@ -377,6 +386,29 @@ impl Config {
             zfs_driver_mode: DriverMode::from_env_str(
                 &std::env::var("ATLAS_ZFS_DRIVER_MODE").unwrap_or_else(|_| "fake".into()),
             ),
+            rustfs_enable: matches!(
+                std::env::var("ATLAS_RUSTFS_ENABLE")
+                    .unwrap_or_default()
+                    .trim()
+                    .to_lowercase()
+                    .as_str(),
+                "1" | "true" | "yes"
+            ),
+            rustfs_endpoint: std::env::var("ATLAS_RUSTFS_ENDPOINT")
+                .ok()
+                .filter(|s| !s.trim().is_empty()),
+            rustfs_buckets: std::env::var("ATLAS_RUSTFS_BUCKETS")
+                .ok()
+                .map(|s| {
+                    s.split(',')
+                        .map(|x| x.trim().to_string())
+                        .filter(|x| !x.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default(),
+            rustfs_driver_mode: DriverMode::from_env_str(
+                &std::env::var("ATLAS_RUSTFS_DRIVER_MODE").unwrap_or_else(|_| "fake".into()),
+            ),
             oidc: oidc_from_env(),
             rook_namespace: std::env::var("ATLAS_ROOK_NAMESPACE")
                 .ok()
@@ -474,6 +506,10 @@ impl Default for Config {
             zfs_host: None,
             zfs_pools: Vec::new(),
             zfs_driver_mode: DriverMode::Fake,
+            rustfs_enable: false,
+            rustfs_endpoint: None,
+            rustfs_buckets: Vec::new(),
+            rustfs_driver_mode: DriverMode::Fake,
             oidc: None,
             rook_namespace: "rook-ceph".into(),
             rook_cluster_name: "rook-ceph".into(),

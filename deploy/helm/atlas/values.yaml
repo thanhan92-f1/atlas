@@ -198,6 +198,14 @@ zfs:
   # hostPath-mounted /dev or a privileged DaemonSet), which this chart does not set up for you.
   driverMode: fake
 
+rustfs:
+  enabled: false
+  endpoint: ""
+  buckets: ""
+  # "fake" (default) reports deterministic capacity fixtures — safe with no real RustFS endpoint.
+  # "real" calls `endpoint`'s health + S3 ListBuckets/ListObjectsV2 endpoints.
+  driverMode: fake
+
 nodeSelector: {}
 tolerations: []
 affinity: {}

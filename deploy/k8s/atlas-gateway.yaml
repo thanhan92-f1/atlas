@@ -69,6 +69,10 @@ rules:
   - apiGroups: ["ceph.rook.io"]
     resources: ["cephblockpools", "cephfilesystems", "cephobjectstores"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Optional ATLAS_LONGHORN_ENABLE discovery; Longhorn mutations use Kubernetes PVCs above.
+  - apiGroups: ["longhorn.io"]
+    resources: ["nodes", "volumes"]
+    verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -187,6 +191,17 @@ spec:
                   name: atlas-gateway-auth
                   key: state-backup-secret-key
                   optional: true
+            # Fourth RustFS backend (S3-compatible object storage). No real RustFS endpoint is
+            # reachable from this cluster yet, so this stays in "fake" driver mode (deterministic
+            # fixture buckets) — flip ATLAS_RUSTFS_DRIVER_MODE to "real" once one is.
+            - name: ATLAS_RUSTFS_ENABLE
+              value: "1"
+            - name: ATLAS_RUSTFS_ENDPOINT
+              value: "http://rustfs01.zyvor.lab:9000"
+            - name: ATLAS_RUSTFS_BUCKETS
+              value: "vm-images,backups"
+            - name: ATLAS_RUSTFS_DRIVER_MODE
+              value: "fake"
             # OIDC/SSO login against the throwaway Dex instance (see deploy/dex-lab/) — a lab-only
             # test IdP, not a real identity provider. Remove these four ATLAS_OIDC_* vars (or leave
             # Dex torn down) to disable the "Sign in with SSO" button; the feature auto-gates off

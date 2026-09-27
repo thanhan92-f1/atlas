@@ -14,12 +14,18 @@ use serde_json::{json, Value};
 mod common;
 
 async fn spawn() -> SocketAddr {
-    spawn_with(atlas_common::config::DriverMode::Fake, atlas_common::config::DriverMode::Fake).await
+    spawn_with(
+        atlas_common::config::DriverMode::Fake,
+        atlas_common::config::DriverMode::Fake,
+        atlas_common::config::DriverMode::Fake,
+    )
+    .await
 }
 
 async fn spawn_with(
     nfs_driver_mode: atlas_common::config::DriverMode,
     zfs_driver_mode: atlas_common::config::DriverMode,
+    rustfs_driver_mode: atlas_common::config::DriverMode,
 ) -> SocketAddr {
     let database_url = common::fresh_database_url("backends").await;
     let config = Config {
@@ -57,6 +63,10 @@ async fn spawn_with(
         zfs_host: None,
         zfs_pools: Vec::new(),
         zfs_driver_mode,
+        rustfs_enable: false,
+        rustfs_endpoint: None,
+        rustfs_buckets: Vec::new(),
+        rustfs_driver_mode,
         oidc: None,
         rook_namespace: "rook-ceph".into(),
         rook_cluster_name: "rook-ceph".into(),
@@ -133,6 +143,7 @@ async fn post_backend_with_real_nfs_driver_never_fabricates_a_pool_when_unreacha
         spawn_with(
             atlas_common::config::DriverMode::Real,
             atlas_common::config::DriverMode::Fake,
+            atlas_common::config::DriverMode::Fake,
         )
         .await
     );
@@ -170,5 +181,90 @@ async fn post_backend_with_real_nfs_driver_never_fabricates_a_pool_when_unreacha
             .iter()
             .any(|p| p["kind"] == "nfs_export"),
         "an unreachable real NFS server must never produce a fabricated pool: {pools}"
+    );
+}
+
+#[tokio::test]
+async fn post_backend_registers_live_rustfs_driver() {
+    let base = format!("http://{}/api/atlas/v1", spawn().await);
+    let c = reqwest::Client::new();
+
+    let created: Value = c
+        .post(format!("{base}/backends"))
+        .json(&json!({ "name": "extra-rustfs", "backend_type": "rustfs", "server": "http://rustfs.lab:9000", "targets": ["catalog"] }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        created["status"], "active",
+        "rustfs backend should be live, not pending: {created}"
+    );
+    let bid = created["id"].as_str().unwrap();
+
+    // The newly-registered backend discovered its bucket as a pool.
+    let pools: Value = c
+        .get(format!("{base}/pools"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        pools.as_array().unwrap().iter().any(|p| p["kind"] == "s3"),
+        "the live RustFS backend should have discovered a bucket pool: {pools}"
+    );
+    assert!(!bid.is_empty());
+}
+
+/// With `rustfs_driver_mode: Real` and an unreachable endpoint, the live RustFS driver's discovery
+/// fails (no health response) — the backend row still ends up `active` (discovery failure is
+/// logged, not surfaced to the caller — same pre-existing behavior as the NFS case above), but
+/// critically **no pool is ever reported**, proving the real driver never falls back to fabricated
+/// fixture data the way `spawn()`'s default fake mode intentionally always does.
+#[tokio::test]
+async fn post_backend_with_real_rustfs_driver_never_fabricates_a_pool_when_unreachable() {
+    let base = format!(
+        "http://{}/api/atlas/v1",
+        spawn_with(
+            atlas_common::config::DriverMode::Fake,
+            atlas_common::config::DriverMode::Fake,
+            atlas_common::config::DriverMode::Real,
+        )
+        .await
+    );
+    let c = reqwest::Client::new();
+
+    let created: Value = c
+        .post(format!("{base}/backends"))
+        .json(&json!({
+            "name": "unreachable-rustfs",
+            "backend_type": "rustfs",
+            "server": "http://rustfs01.invalid.example.invalid:9000",
+            "targets": ["catalog"]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let bid = created["id"].as_str().unwrap().to_string();
+    assert!(!bid.is_empty());
+
+    let pools: Value = c
+        .get(format!("{base}/pools"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        !pools.as_array().unwrap().iter().any(|p| p["kind"] == "s3"),
+        "an unreachable real RustFS endpoint must never produce a fabricated pool: {pools}"
     );
 }

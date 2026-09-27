@@ -15,6 +15,7 @@ use atlas_jobs::{JobSpec, OwnerRef};
 use super::util::{accepted, validate_k8s_name, CEPH_BACKEND_ID};
 use crate::auth::Actor;
 use crate::state::AppState;
+use crate::startup::LONGHORN_BACKEND_ID;
 
 // ---- snapshots (read) ----
 
@@ -24,7 +25,7 @@ pub(crate) async fn list_snapshots(State(s): State<AppState>) -> AppResult<Json<
     )))
 }
 
-/// `POST /volumes` — create a Ceph-backed PVC as an async job (PDF §8.2).
+/// `POST /volumes` — create a PVC as an async job (Ceph by default, Longhorn when selected).
 pub(crate) async fn create_volume(
     State(s): State<AppState>,
     Extension(actor): Extension<Actor>,
@@ -48,13 +49,6 @@ pub(crate) async fn create_volume(
     validate_k8s_name(&body.name)?;
     if body.size_bytes <= 0 {
         return Err(AppError::Validation("size_bytes must be > 0".into()));
-    }
-
-    // Maintenance: a cordoned backend rejects new provisioning (existing volumes are untouched).
-    if atlas_inventory::is_backend_cordoned(&s.pool, CEPH_BACKEND_ID).await? {
-        return Err(AppError::Unavailable(format!(
-            "backend {CEPH_BACKEND_ID} is cordoned for maintenance"
-        )));
     }
 
     // Tenant quota admission (PDF §14): reject a create that would exceed the tenant's limits.
@@ -119,6 +113,24 @@ pub(crate) async fn create_volume(
         // the best available signal here — still correct for the common case of a tenant
         // overriding just the StorageClass for an existing named intent.
     }
+    let backend_id = k8s_opts.as_ref().and_then(|k| k.backend_id.as_deref())
+        .unwrap_or(CEPH_BACKEND_ID);
+    if backend_id != CEPH_BACKEND_ID {
+        if backend_id != LONGHORN_BACKEND_ID || s.driver_for(backend_id).is_none() {
+            return Err(AppError::Validation(format!("backend {backend_id} is not available for PVC provisioning")));
+        }
+        let k8s = s.k8s.as_ref().ok_or_else(|| AppError::Unavailable("Kubernetes unavailable".into()))?;
+        let classes = k8s.list_storage_classes().await
+            .map_err(|e| AppError::Unavailable(e.to_string()))?;
+        if !classes.iter().any(|sc| sc.name == placement.storage_class && sc.provisioner == "driver.longhorn.io") {
+            return Err(AppError::Validation(format!(
+                "storage class {} must use driver.longhorn.io for backend {backend_id}", placement.storage_class
+            )));
+        }
+    }
+    if atlas_inventory::is_backend_cordoned(&s.pool, backend_id).await? {
+        return Err(AppError::Unavailable(format!("backend {backend_id} is cordoned for maintenance")));
+    }
     let access_modes = k8s_opts
         .as_ref()
         .map(|k| k.access_modes.clone())
@@ -143,14 +155,14 @@ pub(crate) async fn create_volume(
     let idem = ids::stable_id(
         "idem",
         &format!(
-            "{}|{}|{}|volume.create",
-            body.tenant_id, body.name, body.size_bytes
+            "{}|{}|{}|{}|volume.create",
+            body.tenant_id, body.name, body.size_bytes, backend_id
         ),
     );
 
     let spec = JobSpec::VolumeCreate {
         volume_id: volume_id.clone(),
-        backend_id: CEPH_BACKEND_ID.into(),
+        backend_id: backend_id.into(),
         name: body.name.clone(),
         namespace: namespace.clone(),
         storage_class: placement.storage_class.clone(),

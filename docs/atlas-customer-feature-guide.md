@@ -4,9 +4,9 @@
 
 > **The central storage control plane for the Zyvor product suite.**
 
-Atlas lets products ask for intent — "give me production block storage" — instead of wrestling with pool internals, then maps that intent to a real backend through pluggable drivers. It gives you block, file, and object storage from a single gateway, with async provisioning, snapshots, backups, replication, per-tenant governance, and a live console on top. Ceph is the first driver (RBD, CephFS, RGW/S3), with NFS and ZFS backends alongside it and DataBridge adding cloud-to-edge database and object mobility.
+Atlas lets products ask for intent — "give me production block storage" — instead of wrestling with pool internals, then maps that intent to a real backend through pluggable drivers. It gives you block, file, and object storage from a single gateway, with async provisioning, snapshots, backups, replication, per-tenant governance, and a live console on top. Ceph is the first driver (RBD, CephFS, RGW/S3), with NFS, ZFS, Longhorn, and RustFS backends alongside it and DataBridge adding cloud-to-edge database and object mobility.
 
-**3** Storage backends (Ceph · NFS · ZFS) · **6** Database engines migratable via DataBridge · **80+** REST endpoints across the control plane · **3** Access surfaces — REST · gRPC · SSE
+**5** Storage backends (Ceph · NFS · ZFS · Longhorn · RustFS) · **6** Database engines migratable via DataBridge · **80+** REST endpoints across the control plane · **3** Access surfaces — REST · gRPC · SSE
 
 This is the customer-facing onboarding guide — how to access the product, your first workflows, and how to use every feature. A print-ready PDF of the same content sits alongside this file.
 
@@ -33,7 +33,7 @@ This is the customer-facing onboarding guide — how to access the product, your
 - **CLI:** `atlasctl` headless REST client — `cargo run -p atlas-cli -- ` (health, ready, discover, pools, volumes, snapshots, backups, buckets, tenants, tokens, ceph-status …); global flags `--base-url` (`ATLAS_BASE_URL`) and `--token` (`ATLAS_TOKEN`).
 - **API:** REST base `/api/atlas/v1/...` (all JSON); a `tonic` gRPC edge (`atlas.v1.AtlasStorage`) on `ATLAS_GRPC_ADDR` (`:5111`, NodePort 30512) with server-streaming `WatchJob`; async writes return `202 + job_id`, streamable over SSE at `/api/atlas/v1/jobs/{id}/watch`.
 - **Login:** Auth is off by default (dev; actor is `anonymous`). Set `ATLAS_AUTH_REQUIRED=1` to require an HS256 JWT (`Authorization: Bearer `); mint one via `POST /api/atlas/v1/auth/tokens`.
-- **Needs:** A Ceph (RBD/CephFS/RGW), NFS, or ZFS backend. For evaluation you need no cluster at all — run the fake driver with `ATLAS_CEPH_DRIVER_MODE=fake` (this is what `make run` does).
+- **Needs:** A Ceph (RBD/CephFS/RGW), NFS, ZFS, Longhorn, or RustFS backend. For evaluation you need no cluster at all — run the fake driver with `ATLAS_CEPH_DRIVER_MODE=fake` (this is what `make run` does).
 
 **Your first workflows**
 
