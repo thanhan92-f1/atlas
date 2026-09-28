@@ -57,19 +57,20 @@ first-disk-name gate as the primary defense on any containerized deploy, not a r
 first filter — an unconventional boot-disk layout on a containerized deploy is not fully protected
 today.
 
-**Second known gap, found live (2026-09-28), not yet closed**: with `wipe_existing`, the safety
-pipeline (auth → capability grants → `wipefs -a` → post-wipe recheck) verified live end-to-end,
-including a genuine wipe of a disk that had a stale Ceph OSD signature — but `zpool create` itself
-has not yet succeeded live on the containerized lab deploy. It reliably writes its own new GPT
-(confirmed via the host's own `dmesg`: `sdb: sdb1 sdb9`, the standard ZFS whole-disk layout), then
-fails reopening the partition it just created — `cannot label 'sdb': failed to detect device
-partitions on '/dev/sdb1': 19` (ENODEV) — reproducibly, even after `zpool_create`'s own 5-attempt,
-500ms-backoff retry (added specifically for this). A read-only check moments after each failure
-shows `/dev/sdb1` present and `stat`-able with the correct major:minor, so this isn't a permanent
-missing-device state — most likely a container/hostPath-`/dev` propagation or a virtualized-disk
-rescan quirk specific to this lab host, not yet root-caused. Untried candidates: also hostPath-mount
-`/run/udev` and add `udevadm settle`/`partprobe` (neither installed in the image today) between the
-label write and zpool's own reopen.
+**Resolved live (2026-09-28)**: `zpool create` (whole-disk mode) writes a new GPT and then
+immediately reopens the partition device it just asked the kernel to create — but that reopen
+polls udev's device database (`/run/udev/data/b<major>:<minor>`), root-caused via `strace` attached
+directly to the live `zpool` process: `openat("/run/udev/data/b8:17", …) = -1 ENOENT`. The lab
+manifest only ever hostPath-mounted `/dev`, never `/run/udev`, so that file could **never** appear
+from inside the container — not a transient race, a permanently missing mount, which is why
+`zpool_create`'s own 5-attempt retry never helped. Fixed by also hostPath-mounting `/run/udev`
+(read-only) in `deploy/k8s/atlas-gateway.yaml`. The exact same udev-database-propagation lag showed
+up one step earlier too — the post-wipe recheck (`refusal_reason_after_wipe`) could see a stale
+cached `pttype` for a short window right after `wipefs -a` genuinely finished — so that recheck also
+retries a few times with backoff before giving up. With both fixes, a full `wipe_existing` +
+`zpool create` run against a disk carrying a stale Ceph OSD partition table (real bluestore
+signature, not a fixture) succeeded end-to-end through the console: `zpool status` confirms
+`tank0`/`ONLINE`, backed by the real device, zero errors.
 
 `zpool create` is synchronous, so the job succeeds as soon as it returns 0. The new pool/root
 dataset are written directly into inventory (not left to a follow-up discovery pass) — because
