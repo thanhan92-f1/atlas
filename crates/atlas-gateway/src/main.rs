@@ -13,6 +13,15 @@ use tracing::info;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Pin rustls's process-wide crypto provider to `ring` before anything builds a TLS client (the
+    // Kubernetes client in build_state, outbound reqwest, the HTTPS/gRPC listeners below). Without
+    // this rustls falls back to guessing from crate features, and it panics when more than one
+    // provider is enabled — which is exactly what happened after the reqwest 0.13 upgrade: its
+    // default rustls backend uses `aws-lc-rs` while kube/tonic here use `ring`, so both features
+    // were on and the gateway crashed at startup building the k8s client. The install calls further
+    // down (HTTPS/gRPC TLS branches) are now redundant but harmless (idempotent).
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     atlas_common::init_tracing();
 
     let mut config = Config::from_env();
