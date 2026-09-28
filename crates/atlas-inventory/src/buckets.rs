@@ -82,7 +82,7 @@ pub async fn delete_bucket_row(pool: &AnyPool, id: &str) -> Result<()> {
 }
 
 pub async fn get_bucket(pool: &AnyPool, id: &str) -> Result<Option<StorageBucket>> {
-    let row = sqlx::query(&select("WHERE id = $1"))
+    let row = sqlx::query(select("WHERE id = $1"))
         .bind(id)
         .fetch_optional(pool)
         .await?;
@@ -90,17 +90,19 @@ pub async fn get_bucket(pool: &AnyPool, id: &str) -> Result<Option<StorageBucket
 }
 
 pub async fn list_buckets(pool: &AnyPool) -> Result<Vec<StorageBucket>> {
-    let rows = sqlx::query(&select("ORDER BY created_at DESC"))
+    let rows = sqlx::query(select("ORDER BY created_at DESC"))
         .fetch_all(pool)
         .await?;
     Ok(rows.into_iter().map(row_to_bucket).collect())
 }
 
-fn select(tail: &str) -> String {
-    format!(
+// `tail` is only ever a string literal from this module's own call sites (never user input — user
+// data always goes through `$N` bind parameters), so asserting the assembled SQL safe is sound.
+fn select(tail: &str) -> sqlx::AssertSqlSafe<String> {
+    sqlx::AssertSqlSafe(format!(
         "SELECT id, tenant_id, name, backend_id, bucket_name, endpoint, region, secret_ref, namespace, state, created_at
          FROM storage_buckets {tail}"
-    )
+    ))
 }
 
 fn row_to_bucket(r: sqlx::any::AnyRow) -> StorageBucket {

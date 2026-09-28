@@ -52,7 +52,7 @@ pub async fn set_result(
 }
 
 pub async fn get_validation(pool: &AnyPool, id: &str) -> Result<Option<ValidationRun>> {
-    let row = sqlx::query(&select("WHERE id = $1"))
+    let row = sqlx::query(select("WHERE id = $1"))
         .bind(id)
         .fetch_optional(pool)
         .await?;
@@ -62,13 +62,13 @@ pub async fn get_validation(pool: &AnyPool, id: &str) -> Result<Option<Validatio
 pub async fn list_validations(pool: &AnyPool, plan_id: Option<&str>) -> Result<Vec<ValidationRun>> {
     let rows = match plan_id {
         Some(pid) => {
-            sqlx::query(&select("WHERE plan_id = $1 ORDER BY created_at DESC"))
+            sqlx::query(select("WHERE plan_id = $1 ORDER BY created_at DESC"))
                 .bind(pid)
                 .fetch_all(pool)
                 .await?
         }
         None => {
-            sqlx::query(&select("ORDER BY created_at DESC"))
+            sqlx::query(select("ORDER BY created_at DESC"))
                 .fetch_all(pool)
                 .await?
         }
@@ -78,7 +78,7 @@ pub async fn list_validations(pool: &AnyPool, plan_id: Option<&str>) -> Result<V
 
 /// Validations in a given state — used by the reconciler to watch running validation Jobs.
 pub async fn list_by_state(pool: &AnyPool, state: &str) -> Result<Vec<ValidationRun>> {
-    let rows = sqlx::query(&select("WHERE state = $1 ORDER BY created_at DESC"))
+    let rows = sqlx::query(select("WHERE state = $1 ORDER BY created_at DESC"))
         .bind(state)
         .fetch_all(pool)
         .await?;
@@ -87,7 +87,7 @@ pub async fn list_by_state(pool: &AnyPool, state: &str) -> Result<Vec<Validation
 
 /// The most recent validation for a plan — used by the cutover guard.
 pub async fn latest_for_plan(pool: &AnyPool, plan_id: &str) -> Result<Option<ValidationRun>> {
-    let row = sqlx::query(&select(
+    let row = sqlx::query(select(
         "WHERE plan_id = $1 ORDER BY created_at DESC LIMIT 1",
     ))
     .bind(plan_id)
@@ -96,12 +96,14 @@ pub async fn latest_for_plan(pool: &AnyPool, plan_id: &str) -> Result<Option<Val
     Ok(row.map(row_to_validation))
 }
 
-fn select(tail: &str) -> String {
-    format!(
+// `tail` is only ever a string literal from this module's own call sites (never user input — user
+// data always goes through `$N` bind parameters), so asserting the assembled SQL safe is sound.
+fn select(tail: &str) -> sqlx::AssertSqlSafe<String> {
+    sqlx::AssertSqlSafe(format!(
         "SELECT id, tenant_id, plan_id, kind, state, tables_total, tables_mismatched, summary,
                 created_at, completed_at
          FROM validation_runs {tail}"
-    )
+    ))
 }
 
 fn row_to_validation(r: sqlx::any::AnyRow) -> ValidationRun {

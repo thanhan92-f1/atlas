@@ -109,10 +109,11 @@ impl SourceConnector for MysqlSourceConnector {
 
         // NB: information_schema string columns use a binary-ish collation that sqlx-mysql won't
         // decode as `String` directly — CAST them to CHAR or the names come back empty.
-        let databases: Vec<String> = sqlx::query(&format!(
+        // Only the `SYSTEM_SCHEMAS` const is interpolated (never source-DB-controlled data).
+        let databases: Vec<String> = sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT CAST(schema_name AS CHAR) AS s FROM information_schema.schemata \
              WHERE schema_name NOT IN ({SYSTEM_SCHEMAS}) ORDER BY 1"
-        ))
+        )))
         .fetch_all(&mut conn)
         .await
         .context("list databases")?
@@ -134,7 +135,8 @@ impl SourceConnector for MysqlSourceConnector {
         })
         .unwrap_or_default();
 
-        let rows = sqlx::query(&format!(
+        // Only the `SYSTEM_SCHEMAS` const is interpolated (never source-DB-controlled data).
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT CAST(t.table_schema AS CHAR) AS s, CAST(t.table_name AS CHAR) AS n, \
                     CAST(COALESCE(t.table_rows,0) AS SIGNED) AS est_rows, \
                     CAST(COALESCE(t.data_length,0)+COALESCE(t.index_length,0) AS SIGNED) AS size_bytes, \
@@ -144,7 +146,7 @@ impl SourceConnector for MysqlSourceConnector {
              FROM information_schema.tables t \
              WHERE t.table_type='BASE TABLE' AND t.table_schema NOT IN ({SYSTEM_SCHEMAS}) \
              ORDER BY 1,2"
-        ))
+        )))
         .fetch_all(&mut conn)
         .await
         .context("introspect tables")?;

@@ -111,7 +111,7 @@ pub async fn delete_plan_row(pool: &AnyPool, id: &str) -> Result<()> {
 }
 
 pub async fn get_plan(pool: &AnyPool, id: &str) -> Result<Option<MigrationPlan>> {
-    let row = sqlx::query(&select("WHERE id = $1"))
+    let row = sqlx::query(select("WHERE id = $1"))
         .bind(id)
         .fetch_optional(pool)
         .await?;
@@ -119,7 +119,7 @@ pub async fn get_plan(pool: &AnyPool, id: &str) -> Result<Option<MigrationPlan>>
 }
 
 pub async fn list_plans(pool: &AnyPool) -> Result<Vec<MigrationPlan>> {
-    let rows = sqlx::query(&select("ORDER BY created_at DESC"))
+    let rows = sqlx::query(select("ORDER BY created_at DESC"))
         .fetch_all(pool)
         .await?;
     Ok(rows.into_iter().map(row_to_plan).collect())
@@ -127,7 +127,7 @@ pub async fn list_plans(pool: &AnyPool) -> Result<Vec<MigrationPlan>> {
 
 /// Plans in a given pipeline state — used by the reconciler to advance in-flight work.
 pub async fn list_by_state(pool: &AnyPool, state: &str) -> Result<Vec<MigrationPlan>> {
-    let rows = sqlx::query(&select("WHERE state = $1 ORDER BY created_at DESC"))
+    let rows = sqlx::query(select("WHERE state = $1 ORDER BY created_at DESC"))
         .bind(state)
         .fetch_all(pool)
         .await?;
@@ -137,19 +137,21 @@ pub async fn list_by_state(pool: &AnyPool, state: &str) -> Result<Vec<MigrationP
 /// Plans referencing a source — used to block deleting a source out from under a live migration
 /// (the FK is `ON DELETE CASCADE`, so an unguarded delete silently destroys the plan's history).
 pub async fn list_for_source(pool: &AnyPool, source_id: &str) -> Result<Vec<MigrationPlan>> {
-    let rows = sqlx::query(&select("WHERE source_id = $1 ORDER BY created_at DESC"))
+    let rows = sqlx::query(select("WHERE source_id = $1 ORDER BY created_at DESC"))
         .bind(source_id)
         .fetch_all(pool)
         .await?;
     Ok(rows.into_iter().map(row_to_plan).collect())
 }
 
-fn select(tail: &str) -> String {
-    format!(
+// `tail` is only ever a string literal from this module's own call sites (never user input — user
+// data always goes through `$N` bind parameters), so asserting the assembled SQL safe is sound.
+fn select(tail: &str) -> sqlx::AssertSqlSafe<String> {
+    sqlx::AssertSqlSafe(format!(
         "SELECT id, tenant_id, name, source_id, edge_cluster_id, cdc_stream_id, readiness_score,
                 assessment, rollback_window_secs, cutover_at, state, created_at
          FROM migration_plans {tail}"
-    )
+    ))
 }
 
 fn row_to_plan(r: sqlx::any::AnyRow) -> MigrationPlan {

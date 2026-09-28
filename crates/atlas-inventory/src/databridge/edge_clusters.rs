@@ -90,7 +90,7 @@ pub async fn delete_edge_cluster(pool: &AnyPool, id: &str) -> Result<()> {
 }
 
 pub async fn get_edge_cluster(pool: &AnyPool, id: &str) -> Result<Option<EdgeDbCluster>> {
-    let row = sqlx::query(&select("WHERE id = $1"))
+    let row = sqlx::query(select("WHERE id = $1"))
         .bind(id)
         .fetch_optional(pool)
         .await?;
@@ -98,7 +98,7 @@ pub async fn get_edge_cluster(pool: &AnyPool, id: &str) -> Result<Option<EdgeDbC
 }
 
 pub async fn list_edge_clusters(pool: &AnyPool) -> Result<Vec<EdgeDbCluster>> {
-    let rows = sqlx::query(&select("ORDER BY created_at DESC"))
+    let rows = sqlx::query(select("ORDER BY created_at DESC"))
         .fetch_all(pool)
         .await?;
     Ok(rows.into_iter().map(row_to_edge).collect())
@@ -106,19 +106,21 @@ pub async fn list_edge_clusters(pool: &AnyPool) -> Result<Vec<EdgeDbCluster>> {
 
 /// Clusters in a given state — used by the reconciler to poll provisioning ones.
 pub async fn list_by_state(pool: &AnyPool, state: &str) -> Result<Vec<EdgeDbCluster>> {
-    let rows = sqlx::query(&select("WHERE state = $1 ORDER BY created_at DESC"))
+    let rows = sqlx::query(select("WHERE state = $1 ORDER BY created_at DESC"))
         .bind(state)
         .fetch_all(pool)
         .await?;
     Ok(rows.into_iter().map(row_to_edge).collect())
 }
 
-fn select(tail: &str) -> String {
-    format!(
+// `tail` is only ever a string literal from this module's own call sites (never user input — user
+// data always goes through `$N` bind parameters), so asserting the assembled SQL safe is sound.
+fn select(tail: &str) -> sqlx::AssertSqlSafe<String> {
+    sqlx::AssertSqlSafe(format!(
         "SELECT id, tenant_id, plan_id, engine, operator, namespace, cr_name, storage_class,
                 wal_storage_class, instances, size_bytes, service_endpoint, secret_ref, state, created_at
          FROM edge_db_clusters {tail}"
-    )
+    ))
 }
 
 fn row_to_edge(r: sqlx::any::AnyRow) -> EdgeDbCluster {

@@ -60,13 +60,13 @@ pub async fn resolve(pool: &AnyPool, id: &str) -> Result<()> {
 pub async fn list(pool: &AnyPool, state: Option<&str>) -> Result<Vec<AlertRecord>> {
     let rows = match state {
         Some(st) => {
-            sqlx::query(&select("WHERE state = $1 ORDER BY created_at DESC"))
+            sqlx::query(select("WHERE state = $1 ORDER BY created_at DESC"))
                 .bind(st)
                 .fetch_all(pool)
                 .await?
         }
         None => {
-            sqlx::query(&select("ORDER BY created_at DESC"))
+            sqlx::query(select("ORDER BY created_at DESC"))
                 .fetch_all(pool)
                 .await?
         }
@@ -77,7 +77,7 @@ pub async fn list(pool: &AnyPool, state: Option<&str>) -> Result<Vec<AlertRecord
 /// Open alerts that have not yet been pushed to the webhook (drives the notifier). Silenced alerts
 /// (silence window still in the future) are skipped so an operator can mute known-noisy conditions.
 pub async fn list_unnotified_open(pool: &AnyPool) -> Result<Vec<AlertRecord>> {
-    let rows = sqlx::query(&select(
+    let rows = sqlx::query(select(
         "WHERE state='open' AND notified_at IS NULL \
          AND (silenced_until IS NULL OR silenced_until < $1) \
          ORDER BY created_at ASC",
@@ -145,12 +145,14 @@ pub async fn count_open(pool: &AnyPool) -> Result<i64> {
     )
 }
 
-fn select(tail: &str) -> String {
-    format!(
+// `tail` is only ever a string literal from this module's own call sites (never user input — user
+// data always goes through `$N` bind parameters), so asserting the assembled SQL safe is sound.
+fn select(tail: &str) -> sqlx::AssertSqlSafe<String> {
+    sqlx::AssertSqlSafe(format!(
         "SELECT id, severity, source, resource_type, resource_id, title, description, evidence, state, \
                 created_at, resolved_at, acknowledged_at, acknowledged_by, silenced_until
          FROM storage_alerts {tail}"
-    )
+    ))
 }
 
 pub(crate) fn row_to_alert(r: sqlx::any::AnyRow) -> AlertRecord {

@@ -68,7 +68,8 @@ async fn postgres_database_url(admin_url: &str, label: &str) -> String {
     let admin_pool = atlas_inventory::connect(admin_url)
         .await
         .expect("connect to ATLAS_TEST_DATABASE_URL (admin Postgres connection)");
-    sqlx::query(&format!("CREATE DATABASE \"{db_name}\""))
+    // `db_name` is built from a sanitized test label plus a unique suffix — test-only, never user input.
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE \"{db_name}\"")))
         .execute(&admin_pool)
         .await
         .unwrap_or_else(|e| panic!("CREATE DATABASE \"{db_name}\" failed: {e}"));

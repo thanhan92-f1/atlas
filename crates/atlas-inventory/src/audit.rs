@@ -156,7 +156,9 @@ pub async fn delete_ids(pool: &AnyPool, ids: &[i64]) -> Result<u64> {
         .collect::<Vec<_>>()
         .join(",");
     let sql = format!("DELETE FROM storage_audit_logs WHERE id IN ({placeholders})");
-    let mut q = sqlx::query(&sql);
+    // `sql` only interpolates a generated `$1,$2,…` placeholder list (an integer count, never user
+    // input); the actual values are bound below.
+    let mut q = sqlx::query(sqlx::AssertSqlSafe(sql));
     for id in ids {
         q = q.bind(id);
     }

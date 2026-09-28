@@ -9,12 +9,14 @@ use sqlx::{AnyPool, Row};
 
 use crate::now_rfc3339;
 
-fn select(tail: &str) -> String {
-    format!(
+// `tail` is only ever a string literal from this module's own call sites (never user input — user
+// data always goes through `$N` bind parameters), so asserting the assembled SQL safe is sound.
+fn select(tail: &str) -> sqlx::AssertSqlSafe<String> {
+    sqlx::AssertSqlSafe(format!(
         "SELECT id, tenant_id, volume_id, kind, bucket_id, mode, interval_secs, keep, enabled,
                 last_run_at, next_run_at, created_at
          FROM snapshot_schedules {tail}"
-    )
+    ))
 }
 
 fn row_to_schedule(r: sqlx::any::AnyRow) -> SnapshotSchedule {
@@ -69,7 +71,7 @@ pub async fn insert(
 }
 
 pub async fn get(pool: &AnyPool, id: &str) -> Result<Option<SnapshotSchedule>> {
-    let row = sqlx::query(&select("WHERE id = $1"))
+    let row = sqlx::query(select("WHERE id = $1"))
         .bind(id)
         .fetch_optional(pool)
         .await?;
@@ -79,13 +81,13 @@ pub async fn get(pool: &AnyPool, id: &str) -> Result<Option<SnapshotSchedule>> {
 pub async fn list(pool: &AnyPool, volume_id: Option<&str>) -> Result<Vec<SnapshotSchedule>> {
     let rows = match volume_id {
         Some(v) => {
-            sqlx::query(&select("WHERE volume_id = $1 ORDER BY created_at DESC"))
+            sqlx::query(select("WHERE volume_id = $1 ORDER BY created_at DESC"))
                 .bind(v)
                 .fetch_all(pool)
                 .await?
         }
         None => {
-            sqlx::query(&select("ORDER BY created_at DESC"))
+            sqlx::query(select("ORDER BY created_at DESC"))
                 .fetch_all(pool)
                 .await?
         }
@@ -103,7 +105,7 @@ pub async fn delete(pool: &AnyPool, id: &str) -> Result<bool> {
 
 /// Enabled schedules whose `next_run_at` is in the past (i.e. due to run now).
 pub async fn due(pool: &AnyPool) -> Result<Vec<SnapshotSchedule>> {
-    let rows = sqlx::query(&select(
+    let rows = sqlx::query(select(
         "WHERE enabled = 1 AND next_run_at <= $1 ORDER BY next_run_at ASC",
     ))
     .bind(now_rfc3339(chrono::Utc::now()))

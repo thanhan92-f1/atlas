@@ -154,7 +154,7 @@ pub async fn finish(
 }
 
 pub async fn get(pool: &AnyPool, id: &str) -> Result<Option<ObjectMigration>> {
-    let row = sqlx::query(&select("WHERE id = $1"))
+    let row = sqlx::query(select("WHERE id = $1"))
         .bind(id)
         .fetch_optional(pool)
         .await?;
@@ -164,13 +164,13 @@ pub async fn get(pool: &AnyPool, id: &str) -> Result<Option<ObjectMigration>> {
 pub async fn list(pool: &AnyPool, tenant_id: Option<&str>) -> Result<Vec<ObjectMigration>> {
     let rows = match tenant_id {
         Some(t) => {
-            sqlx::query(&select("WHERE tenant_id = $1 ORDER BY created_at DESC"))
+            sqlx::query(select("WHERE tenant_id = $1 ORDER BY created_at DESC"))
                 .bind(t)
                 .fetch_all(pool)
                 .await?
         }
         None => {
-            sqlx::query(&select("ORDER BY created_at DESC"))
+            sqlx::query(select("ORDER BY created_at DESC"))
                 .fetch_all(pool)
                 .await?
         }
@@ -186,8 +186,10 @@ pub async fn delete(pool: &AnyPool, id: &str) -> Result<()> {
     Ok(())
 }
 
-fn select(tail: &str) -> String {
-    format!(
+// `tail` is only ever a string literal from this module's own call sites (never user input — user
+// data always goes through `$N` bind parameters), so asserting the assembled SQL safe is sound.
+fn select(tail: &str) -> sqlx::AssertSqlSafe<String> {
+    sqlx::AssertSqlSafe(format!(
         "SELECT id, tenant_id, name, source_provider, source_endpoint, source_region,
                 source_bucket, source_prefix, source_secret_ref, dest_provider, dest_endpoint,
                 dest_region, dest_bucket, dest_secret_ref, secret_namespace, mode, state,
@@ -195,7 +197,7 @@ fn select(tail: &str) -> String {
                 concurrency, part_size_mb, throughput_mbps, started_at, last_error,
                 job_id, created_at, updated_at
          FROM object_migrations {tail}"
-    )
+    ))
 }
 
 fn row_to(r: sqlx::any::AnyRow) -> ObjectMigration {

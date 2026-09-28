@@ -84,7 +84,7 @@ pub async fn update_lag(
 }
 
 pub async fn get_stream(pool: &AnyPool, id: &str) -> Result<Option<CdcStream>> {
-    let row = sqlx::query(&select("WHERE id = $1"))
+    let row = sqlx::query(select("WHERE id = $1"))
         .bind(id)
         .fetch_optional(pool)
         .await?;
@@ -92,27 +92,29 @@ pub async fn get_stream(pool: &AnyPool, id: &str) -> Result<Option<CdcStream>> {
 }
 
 pub async fn list_streams(pool: &AnyPool) -> Result<Vec<CdcStream>> {
-    let rows = sqlx::query(&select("ORDER BY created_at DESC"))
+    let rows = sqlx::query(select("ORDER BY created_at DESC"))
         .fetch_all(pool)
         .await?;
     Ok(rows.into_iter().map(row_to_stream).collect())
 }
 
 pub async fn list_by_state(pool: &AnyPool, state: &str) -> Result<Vec<CdcStream>> {
-    let rows = sqlx::query(&select("WHERE state = $1 ORDER BY created_at DESC"))
+    let rows = sqlx::query(select("WHERE state = $1 ORDER BY created_at DESC"))
         .bind(state)
         .fetch_all(pool)
         .await?;
     Ok(rows.into_iter().map(row_to_stream).collect())
 }
 
-fn select(tail: &str) -> String {
-    format!(
+// `tail` is only ever a string literal from this module's own call sites (never user input — user
+// data always goes through `$N` bind parameters), so asserting the assembled SQL safe is sound.
+fn select(tail: &str) -> sqlx::AssertSqlSafe<String> {
+    sqlx::AssertSqlSafe(format!(
         "SELECT id, tenant_id, plan_id, engine, connect_name, connector_name, topic_prefix, state,
                 lag_bytes, lag_seconds, last_source_lsn, last_applied_lsn, events_total,
                 lag_updated_at, restart_count, created_at
          FROM cdc_streams {tail}"
-    )
+    ))
 }
 
 fn row_to_stream(r: sqlx::any::AnyRow) -> CdcStream {

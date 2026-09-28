@@ -959,7 +959,7 @@ pub async fn list_osds(pool: &AnyPool) -> Result<Vec<Osd>> {
 }
 
 pub async fn list_volumes(pool: &AnyPool) -> Result<Vec<StorageVolume>> {
-    let rows = sqlx::query(&volume_select("ORDER BY name"))
+    let rows = sqlx::query(volume_select("ORDER BY name"))
         .fetch_all(pool)
         .await?;
     Ok(rows.into_iter().map(row_to_volume).collect())
@@ -1041,7 +1041,7 @@ pub async fn list_volumes_filtered(
     backend_id: Option<&str>,
     kind: Option<&str>,
 ) -> Result<Vec<StorageVolume>> {
-    let rows = sqlx::query(&volume_select(
+    let rows = sqlx::query(volume_select(
         "WHERE ($1 IS NULL OR state = $2) AND ($3 IS NULL OR tenant_id = $4)
            AND ($5 IS NULL OR backend_id = $6) AND ($7 IS NULL OR kind = $8) ORDER BY name",
     ))
@@ -1059,19 +1059,21 @@ pub async fn list_volumes_filtered(
 }
 
 pub async fn get_volume(pool: &AnyPool, id: &str) -> Result<Option<StorageVolume>> {
-    let row = sqlx::query(&volume_select("WHERE id = $1"))
+    let row = sqlx::query(volume_select("WHERE id = $1"))
         .bind(id)
         .fetch_optional(pool)
         .await?;
     Ok(row.map(row_to_volume))
 }
 
-fn volume_select(tail: &str) -> String {
-    format!(
+// `tail` is only ever a string literal from this module's own call sites (never user input — user
+// data always goes through `$N` bind parameters), so asserting the assembled SQL safe is sound.
+fn volume_select(tail: &str) -> sqlx::AssertSqlSafe<String> {
+    sqlx::AssertSqlSafe(format!(
         "SELECT id, cluster_id, pool_id, name, kind, backend_native_id, size_bytes, used_bytes, state, health,
                 kubernetes_namespace, pvc_name, storage_class_name
          FROM storage_volumes {tail}"
-    )
+    ))
 }
 
 /// List volumes owned by a product (via `product_bindings`), optionally scoped to a single owning

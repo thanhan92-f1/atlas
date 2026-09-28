@@ -54,7 +54,7 @@ pub async fn set_protected(pool: &AnyPool, id: &str, protected: bool) -> Result<
 }
 
 pub async fn get_snapshot(pool: &AnyPool, id: &str) -> Result<Option<StorageSnapshot>> {
-    let row = sqlx::query(&select("WHERE id = $1"))
+    let row = sqlx::query(select("WHERE id = $1"))
         .bind(id)
         .fetch_optional(pool)
         .await?;
@@ -67,13 +67,13 @@ pub async fn list_snapshots(
 ) -> Result<Vec<StorageSnapshot>> {
     let rows = match volume_id {
         Some(v) => {
-            sqlx::query(&select("WHERE volume_id = $1 ORDER BY created_at DESC"))
+            sqlx::query(select("WHERE volume_id = $1 ORDER BY created_at DESC"))
                 .bind(v)
                 .fetch_all(pool)
                 .await?
         }
         None => {
-            sqlx::query(&select("ORDER BY created_at DESC"))
+            sqlx::query(select("ORDER BY created_at DESC"))
                 .fetch_all(pool)
                 .await?
         }
@@ -84,7 +84,7 @@ pub async fn list_snapshots(
 /// Snapshots in a given state — used to reconcile ones the create job's bounded bind-poll gave up
 /// on (so they'd otherwise show "creating" forever even once the underlying VolumeSnapshot binds).
 pub async fn list_by_state(pool: &AnyPool, state: &str) -> Result<Vec<StorageSnapshot>> {
-    let rows = sqlx::query(&select("WHERE state = $1 ORDER BY created_at DESC"))
+    let rows = sqlx::query(select("WHERE state = $1 ORDER BY created_at DESC"))
         .bind(state)
         .fetch_all(pool)
         .await?;
@@ -121,11 +121,13 @@ pub async fn latest_by_volume(
     Ok(out)
 }
 
-fn select(tail: &str) -> String {
-    format!(
+// `tail` is only ever a string literal from this module's own call sites (never user input — user
+// data always goes through `$N` bind parameters), so asserting the assembled SQL safe is sound.
+fn select(tail: &str) -> sqlx::AssertSqlSafe<String> {
+    sqlx::AssertSqlSafe(format!(
         "SELECT id, tenant_id, volume_id, name, backend_native_id, consistency, state, protected, parent_snapshot_id, created_at
          FROM storage_snapshots {tail}"
-    )
+    ))
 }
 
 fn row_to_snapshot(r: sqlx::any::AnyRow) -> StorageSnapshot {

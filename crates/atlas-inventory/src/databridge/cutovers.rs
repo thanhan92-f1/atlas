@@ -54,7 +54,7 @@ pub async fn set_complete(pool: &AnyPool, id: &str, state: &str) -> Result<()> {
 }
 
 pub async fn get_cutover(pool: &AnyPool, id: &str) -> Result<Option<Cutover>> {
-    let row = sqlx::query(&select("WHERE id = $1"))
+    let row = sqlx::query(select("WHERE id = $1"))
         .bind(id)
         .fetch_optional(pool)
         .await?;
@@ -62,14 +62,14 @@ pub async fn get_cutover(pool: &AnyPool, id: &str) -> Result<Option<Cutover>> {
 }
 
 pub async fn list_cutovers(pool: &AnyPool) -> Result<Vec<Cutover>> {
-    let rows = sqlx::query(&select("ORDER BY created_at DESC"))
+    let rows = sqlx::query(select("ORDER BY created_at DESC"))
         .fetch_all(pool)
         .await?;
     Ok(rows.into_iter().map(row_to_cutover).collect())
 }
 
 pub async fn list_by_state(pool: &AnyPool, state: &str) -> Result<Vec<Cutover>> {
-    let rows = sqlx::query(&select("WHERE state = $1 ORDER BY created_at"))
+    let rows = sqlx::query(select("WHERE state = $1 ORDER BY created_at"))
         .bind(state)
         .fetch_all(pool)
         .await?;
@@ -77,7 +77,7 @@ pub async fn list_by_state(pool: &AnyPool, state: &str) -> Result<Vec<Cutover>> 
 }
 
 pub async fn latest_for_plan(pool: &AnyPool, plan_id: &str) -> Result<Option<Cutover>> {
-    let row = sqlx::query(&select(
+    let row = sqlx::query(select(
         "WHERE plan_id = $1 ORDER BY created_at DESC LIMIT 1",
     ))
     .bind(plan_id)
@@ -86,12 +86,14 @@ pub async fn latest_for_plan(pool: &AnyPool, plan_id: &str) -> Result<Option<Cut
     Ok(row.map(row_to_cutover))
 }
 
-fn select(tail: &str) -> String {
-    format!(
+// `tail` is only ever a string literal from this module's own call sites (never user input — user
+// data always goes through `$N` bind parameters), so asserting the assembled SQL safe is sound.
+fn select(tail: &str) -> sqlx::AssertSqlSafe<String> {
+    sqlx::AssertSqlSafe(format!(
         "SELECT id, tenant_id, plan_id, state, from_endpoint, to_endpoint, drain_deadline,
                 rollback_deadline, created_at, completed_at
          FROM cutovers {tail}"
-    )
+    ))
 }
 
 fn row_to_cutover(r: sqlx::any::AnyRow) -> Cutover {

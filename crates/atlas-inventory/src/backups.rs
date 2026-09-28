@@ -73,7 +73,7 @@ pub async fn count_for_bucket(pool: &AnyPool, bucket_id: &str) -> Result<i64> {
 }
 
 pub async fn get_backup(pool: &AnyPool, id: &str) -> Result<Option<BackupRecord>> {
-    let row = sqlx::query(&select("WHERE id = $1"))
+    let row = sqlx::query(select("WHERE id = $1"))
         .bind(id)
         .fetch_optional(pool)
         .await?;
@@ -83,13 +83,13 @@ pub async fn get_backup(pool: &AnyPool, id: &str) -> Result<Option<BackupRecord>
 pub async fn list_backups(pool: &AnyPool, volume_id: Option<&str>) -> Result<Vec<BackupRecord>> {
     let rows = match volume_id {
         Some(v) => {
-            sqlx::query(&select("WHERE volume_id = $1 ORDER BY created_at DESC"))
+            sqlx::query(select("WHERE volume_id = $1 ORDER BY created_at DESC"))
                 .bind(v)
                 .fetch_all(pool)
                 .await?
         }
         None => {
-            sqlx::query(&select("ORDER BY created_at DESC"))
+            sqlx::query(select("ORDER BY created_at DESC"))
                 .fetch_all(pool)
                 .await?
         }
@@ -101,7 +101,7 @@ pub async fn list_backups(pool: &AnyPool, volume_id: Option<&str>) -> Result<Vec
 /// (unlike snapshots, which cascade), so deleting a volume leaves its backups dangling in the
 /// catalog. Day-2 hygiene surfaces these so an operator can reclaim them.
 pub async fn list_orphans(pool: &AnyPool) -> Result<Vec<BackupRecord>> {
-    let rows = sqlx::query(&select(
+    let rows = sqlx::query(select(
         "WHERE NOT EXISTS (SELECT 1 FROM storage_volumes v WHERE v.id = storage_backups.volume_id) \
          ORDER BY created_at DESC",
     ))
@@ -117,7 +117,7 @@ pub async fn list_older_than(
     volume_id: &str,
     cutoff: &str,
 ) -> Result<Vec<BackupRecord>> {
-    let rows = sqlx::query(&select(
+    let rows = sqlx::query(select(
         "WHERE volume_id = $1 AND state IN ('verified', 'completed') AND created_at < $2 \
          ORDER BY created_at ASC",
     ))
@@ -150,11 +150,13 @@ pub async fn latest_by_volume(
     Ok(out)
 }
 
-fn select(tail: &str) -> String {
-    format!(
+// `tail` is only ever a string literal from this module's own call sites (never user input — user
+// data always goes through `$N` bind parameters), so asserting the assembled SQL safe is sound.
+fn select(tail: &str) -> sqlx::AssertSqlSafe<String> {
+    sqlx::AssertSqlSafe(format!(
         "SELECT id, tenant_id, volume_id, snapshot_id, bucket_id, object_key, format, checksum, state, created_at
          FROM storage_backups {tail}"
-    )
+    ))
 }
 
 fn row_to_backup(r: sqlx::any::AnyRow) -> BackupRecord {

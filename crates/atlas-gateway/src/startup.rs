@@ -675,7 +675,8 @@ async fn backup_state_once(
         }
     } else {
         // VACUUM INTO writes a transactionally-consistent copy while the DB stays in use.
-        sqlx::query(&format!("VACUUM INTO '{}'", snap.display()))
+        // `snap` is a temp path this function itself built from a numeric timestamp — never user input.
+        sqlx::query(sqlx::AssertSqlSafe(format!("VACUUM INTO '{}'", snap.display())))
             .execute(pool)
             .await
             .context("VACUUM INTO snapshot")?;

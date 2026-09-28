@@ -18,13 +18,14 @@ const SELECT_COLS: &str = "id, severity, source, resource_type, resource_id, tit
 
 /// Open, not-silenced alerts not yet trigger-notified for `sink`.
 pub async fn pending_triggers(pool: &AnyPool, sink: &str) -> Result<Vec<AlertRecord>> {
-    let rows = sqlx::query(&format!(
+    // Only the `SELECT_COLS` const is interpolated (never user input); values are `$N` binds.
+    let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
         "SELECT {SELECT_COLS} FROM storage_alerts
          WHERE state='open'
            AND (silenced_until IS NULL OR silenced_until < $1)
            AND id NOT IN (SELECT alert_id FROM alert_notifications WHERE sink=$2 AND event='trigger')
          ORDER BY created_at ASC"
-    ))
+    )))
     .bind(now_rfc3339(chrono::Utc::now()))
     .bind(sink)
     .fetch_all(pool)
@@ -37,13 +38,14 @@ pub async fn pending_triggers(pool: &AnyPool, sink: &str) -> Result<Vec<AlertRec
 /// too. Only fires for alerts the sink actually knew about (skips ones that resolved before the
 /// sink was ever enabled).
 pub async fn pending_resolves(pool: &AnyPool, sink: &str) -> Result<Vec<AlertRecord>> {
-    let rows = sqlx::query(&format!(
+    // Only the `SELECT_COLS` const is interpolated (never user input); values are `$N` binds.
+    let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
         "SELECT {SELECT_COLS} FROM storage_alerts
          WHERE state='resolved'
            AND id IN (SELECT alert_id FROM alert_notifications WHERE sink=$1 AND event='trigger')
            AND id NOT IN (SELECT alert_id FROM alert_notifications WHERE sink=$2 AND event='resolve')
          ORDER BY resolved_at ASC"
-    ))
+    )))
     .bind(sink)
     .bind(sink)
     .fetch_all(pool)

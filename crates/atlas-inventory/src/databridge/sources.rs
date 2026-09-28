@@ -78,7 +78,7 @@ pub async fn delete_source_row(pool: &AnyPool, id: &str) -> Result<()> {
 }
 
 pub async fn get_source(pool: &AnyPool, id: &str) -> Result<Option<MigrationSource>> {
-    let row = sqlx::query(&select("WHERE id = $1"))
+    let row = sqlx::query(select("WHERE id = $1"))
         .bind(id)
         .fetch_optional(pool)
         .await?;
@@ -86,18 +86,20 @@ pub async fn get_source(pool: &AnyPool, id: &str) -> Result<Option<MigrationSour
 }
 
 pub async fn list_sources(pool: &AnyPool) -> Result<Vec<MigrationSource>> {
-    let rows = sqlx::query(&select("ORDER BY created_at DESC"))
+    let rows = sqlx::query(select("ORDER BY created_at DESC"))
         .fetch_all(pool)
         .await?;
     Ok(rows.into_iter().map(row_to_source).collect())
 }
 
-fn select(tail: &str) -> String {
-    format!(
+// `tail` is only ever a string literal from this module's own call sites (never user input — user
+// data always goes through `$N` bind parameters), so asserting the assembled SQL safe is sound.
+fn select(tail: &str) -> sqlx::AssertSqlSafe<String> {
+    sqlx::AssertSqlSafe(format!(
         "SELECT id, tenant_id, name, kind, cloud, endpoint, port, database, secret_ref,
                 secret_namespace, tls_mode, driver_mode, state, discovered, created_at
          FROM migration_sources {tail}"
-    )
+    ))
 }
 
 fn row_to_source(r: sqlx::any::AnyRow) -> MigrationSource {

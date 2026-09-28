@@ -35,7 +35,7 @@ pub async fn insert_job(
 
 /// Return an existing job for an idempotency key, if any (PDF §17.4).
 pub async fn find_by_idempotency(pool: &AnyPool, key: &str) -> Result<Option<JobRecord>> {
-    let row = sqlx::query(&job_select(
+    let row = sqlx::query(job_select(
         "WHERE idempotency_key = $1 ORDER BY created_at DESC LIMIT 1",
     ))
     .bind(key)
@@ -45,7 +45,7 @@ pub async fn find_by_idempotency(pool: &AnyPool, key: &str) -> Result<Option<Job
 }
 
 pub async fn get_job(pool: &AnyPool, id: &str) -> Result<Option<JobRecord>> {
-    let row = sqlx::query(&job_select("WHERE id = $1"))
+    let row = sqlx::query(job_select("WHERE id = $1"))
         .bind(id)
         .fetch_optional(pool)
         .await?;
@@ -65,7 +65,7 @@ pub async fn list_jobs_filtered(
     let limit = limit.max(1);
     let rows = match state {
         Some(s) if !s.is_empty() => {
-            sqlx::query(&job_select(
+            sqlx::query(job_select(
                 "WHERE state = $1 ORDER BY created_at DESC LIMIT $2",
             ))
             .bind(s)
@@ -74,7 +74,7 @@ pub async fn list_jobs_filtered(
             .await?
         }
         _ => {
-            sqlx::query(&job_select("ORDER BY created_at DESC LIMIT $1"))
+            sqlx::query(job_select("ORDER BY created_at DESC LIMIT $1"))
                 .bind(limit)
                 .fetch_all(pool)
                 .await?
@@ -192,7 +192,9 @@ pub async fn ids_by_states(pool: &AnyPool, states: &[&str]) -> Result<Vec<String
     let sql = format!(
         "SELECT id FROM storage_jobs WHERE state IN ({placeholders}) ORDER BY created_at ASC"
     );
-    let mut q = sqlx::query(&sql);
+    // `sql` only interpolates a generated `$1,$2,…` placeholder list (an integer count, never user
+    // input); the actual values are bound below.
+    let mut q = sqlx::query(sqlx::AssertSqlSafe(sql));
     for s in states {
         q = q.bind(*s);
     }
@@ -321,11 +323,13 @@ pub async fn bump_retry(pool: &AnyPool, id: &str, delay_secs: i64) -> Result<()>
     Ok(())
 }
 
-fn job_select(tail: &str) -> String {
-    format!(
+// `tail` is only ever a string literal from this module's own call sites (never user input — user
+// data always goes through `$N` bind parameters), so asserting the assembled SQL safe is sound.
+fn job_select(tail: &str) -> sqlx::AssertSqlSafe<String> {
+    sqlx::AssertSqlSafe(format!(
         "SELECT id, tenant_id, job_type, state, requested_by, progress_percent, error, result, created_at, updated_at
          FROM storage_jobs {tail}"
-    )
+    ))
 }
 
 fn row_to_job(r: sqlx::any::AnyRow) -> JobRecord {
