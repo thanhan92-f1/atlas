@@ -76,6 +76,15 @@ the same steps on demand: Storage → RustFS → Drives & pools. The chart also 
 `atlas-rustfs-installer` ServiceAccount/Role the console's installer Job runs under, and grants the
 gateway read access to Deployments/Services plus `patch` on its **own** Deployment only.
 
+### Upgrading a release installed before the official RustFS chart
+
+The in-chart RustFS server used to be templates of our own (Deployment/Service `rustfs`); it is now
+RustFS's official chart under the `rustfsserver` alias, with different resource names. Both hold the same
+NodePorts, so a single `helm upgrade` fails ("provided port is already allocated"). Upgrade in two steps:
+first `--set rustfs.server.enabled=false` (removes the old server; the credentials Secret and the generated
+auth Secret are kept), then upgrade again with the server enabled. Data on the old chart-managed volume is
+not carried over — copy it first with DataBridge → Object Migrations if you need it. Verified live.
+
 ## Lab side-by-side install
 
 `scripts/helm-lab-remote.sh <host> <user> --set auth.createSecret=true` installs the chart as release
