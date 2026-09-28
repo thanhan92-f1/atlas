@@ -694,6 +694,13 @@ async fn backup_state_once(
             .await
             .context("VACUUM INTO snapshot")?;
     }
+    // RustFS (unlike the RGW user this used to target) has no pre-created bucket: make sure it
+    // exists, so the first backup after repointing the endpoint doesn't fail on a missing bucket.
+    if !s3.bucket_exists().await {
+        s3.create_bucket()
+            .await
+            .context("create state backup bucket")?;
+    }
     let bytes = tokio::fs::read(&snap).await.context("read snapshot file")?;
     let _ = tokio::fs::remove_file(&snap).await;
     let size = bytes.len();

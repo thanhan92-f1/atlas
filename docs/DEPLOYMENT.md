@@ -43,6 +43,11 @@ Override only together: `ROOK_VERSION=… CEPH_IMAGE=… ./up.sh …`.
 # e.g. ./scripts/deploy-remote.sh <ephemeral-ip> operator
 ```
 
+It also stands up a real RustFS object store first ([`deploy/rustfs-lab/up.sh`](../deploy/rustfs-lab/up.sh),
+NodePorts 30900/30901, credentials Secret `rustfs-credentials` generated once) — pass
+`--without-rustfs` (and set `ATLAS_RUSTFS_ENABLE=0`) on a cluster that has none. See
+[`RUSTFS.md`](RUSTFS.md).
+
 NodePort **30510**. Verifies `/health`, `/version`, and `/storage-classes`. Gates automatically on
 `GET /upgrade/preflight` before rolling out (pass `--force` to override a blocked pre-flight).
 

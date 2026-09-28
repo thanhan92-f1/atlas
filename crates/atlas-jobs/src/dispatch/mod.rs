@@ -5,6 +5,7 @@ mod helpers;
 mod object;
 mod rbd;
 mod rook;
+mod selftest;
 mod volumes;
 mod zfs;
 
@@ -60,9 +61,10 @@ pub(crate) async fn dispatch(
         | JobSpec::CephObjectStoreCreate { .. }
         | JobSpec::CephObjectStoreDelete { .. }
         | JobSpec::CephOsdAddDevice { .. } => rook::dispatch_rook(pool, k8s, tenant_id, spec).await,
-        JobSpec::ZfsPoolCreateFromDevice { .. } => {
+        JobSpec::ZfsPoolCreateFromDevice { .. } | JobSpec::ZfsPoolDestroy { .. } => {
             zfs::dispatch_zfs(pool, k8s, tenant_id, spec).await
         }
+        JobSpec::S3BackendSelfTest { .. } => selftest::dispatch_selftest(pool, k8s, spec).await,
         JobSpec::SourceDiscover { .. }
         | JobSpec::MigrationAssess { .. }
         | JobSpec::EdgeDbProvision { .. }

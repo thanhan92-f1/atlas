@@ -5,14 +5,19 @@
 // button on Backends/Cluster, and deliberately kept thin: one form, one recent-jobs table.
 import { useState } from "react";
 import { submitJob } from "../api/client";
-import { useCephNodeDevices, useInvalidate, useJobs, useNodes, useZfsDevices } from "../api/hooks";
+import { useCephNodeDevices, useInvalidate, useJobs, useNodes, usePools, useZfsDevices } from "../api/hooks";
 import { Badge, FormModal, type FormField } from "../ui/kit";
 import { Table } from "../ui/Table";
 import { ListPage } from "../ui/templates/ListPage";
 import { navCrumbs } from "../nav/routes";
 import { fmtBytes, stateKind, timeAgo } from "../lib/format";
 
-const JOB_TYPES = new Set(["zfs.pool.create_from_device", "ceph.osd.add_device"]);
+const JOB_TYPES = new Set(["zfs.pool.create_from_device", "zfs.pool.destroy", "ceph.osd.add_device"]);
+
+const JOB_KIND: Record<string, string> = {
+  "ceph.osd.add_device": "Ceph OSD",
+  "zfs.pool.destroy": "ZFS pool destroy",
+};
 
 // Devices in these states are never a valid target (mirrors the server's own unconditional
 // refusals) — left out of the picker entirely rather than shown disabled, since the plain
@@ -30,10 +35,13 @@ function escapeRegExp(s: string): string {
 
 export default function Disks() {
   const [open, setOpen] = useState(false);
+  const [destroyPool, setDestroyPool] = useState<string | null>(null);
   const [selectedNode, setSelectedNode] = useState("");
   const { data: nodes } = useNodes();
   const { data: jobs } = useJobs();
   const { data: zfsDevices } = useZfsDevices();
+  const { data: pools } = usePools();
+  const zpools = (pools || []).filter((p) => p.kind === "zpool");
   const { data: cephDevices } = useCephNodeDevices(selectedNode);
   const inv = useInvalidate();
 
@@ -144,6 +152,26 @@ export default function Disks() {
     >
       <Table
         soundings
+        panelTitle="ZFS pools on this host"
+        rows={zpools}
+        rowKey={(p) => p.id}
+        empty="No ZFS pools."
+        cols={[
+          { h: "Pool", f: (p) => p.name, mono: true },
+          { h: "Health", f: (p) => <Badge kind={stateKind(p.health)} dot>{p.health}</Badge> },
+          {
+            h: "",
+            f: (p) => (
+              <button type="button" className="at-btn danger" onClick={() => setDestroyPool(p.name)}>
+                Destroy…
+              </button>
+            ),
+          },
+        ]}
+      />
+
+      <Table
+        soundings
         panelTitle="Recent provisioning jobs"
         rows={recentJobs}
         rowKey={(j) => j.id}
@@ -152,7 +180,7 @@ export default function Disks() {
           { h: "Job", f: (j) => j.id, mono: true },
           {
             h: "Kind",
-            f: (j) => (j.job_type === "ceph.osd.add_device" ? "Ceph OSD" : "ZFS pool"),
+            f: (j) => JOB_KIND[j.job_type] ?? "ZFS pool",
           },
           { h: "State", f: (j) => <Badge kind={stateKind(j.state)} dot>{j.state}</Badge> },
           { h: "Requested", f: (j) => timeAgo(j.created_at) },
@@ -190,6 +218,34 @@ export default function Disks() {
               () => inv("pools", "nodes", "jobs"),
             );
           }
+        }}
+      />
+      <FormModal
+        open={destroyPool !== null}
+        onClose={() => setDestroyPool(null)}
+        title={`Destroy ZFS pool ${destroyPool ?? ""}`}
+        submitLabel="Destroy pool (irreversible)"
+        danger
+        fields={[
+          {
+            name: "confirm_pool_name",
+            label: `Type "${destroyPool ?? ""}" to confirm`,
+            placeholder: destroyPool ?? "",
+            pattern: new RegExp(`^${escapeRegExp(destroyPool || "\u0000")}$`),
+            hint:
+              "Refused while the pool still holds any dataset or volume. The disk keeps its ZFS " +
+              "labels and then shows up in the device picker as wipeable.",
+          },
+        ]}
+        onSubmit={async (vals) => {
+          if (!destroyPool) return;
+          await submitJob(
+            "post",
+            `/zfs/pools/${encodeURIComponent(destroyPool)}/destroy`,
+            { confirm_pool_name: vals.confirm_pool_name },
+            `destroy ZFS pool ${destroyPool}`,
+            () => inv("pools", "nodes", "jobs"),
+          );
         }}
       />
     </ListPage>

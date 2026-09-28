@@ -179,7 +179,7 @@ secret-redacting `Debug`:
 | `ATLAS_HOST_MOUNTINFO_PATH` | *(unset)* | Path to a hostPath-mounted `/proc/1/mountinfo` (e.g. `/host-mountinfo`) so the ZFS root/boot-disk safety check can see the *host's* real mount table from inside a container, not just its own mount namespace — see `docs/DISKS.md` |
 | `ATLAS_RATE_LIMIT_RPM` | `600` | Per-actor per-minute request budget |
 | `ATLAS_RATE_LIMIT_SYNC_SECS` | `2` | Cross-replica rate-limit counter sync interval (Postgres only) |
-| `ATLAS_STATE_BACKUP_SECS` | *(unset)* | Interval for periodic self-state backup to S3 (RGW today; repointing to RustFS is a config change, not yet done in the lab — see `docs/RUSTFS.md`) |
+| `ATLAS_STATE_BACKUP_SECS` | *(unset)* | Interval for periodic self-state backup to any S3 endpoint (the lab points it at RustFS — see `docs/RUSTFS.md`; the bucket is created on first use) |
 | `ATLAS_KUBECONFIG` | *(unset)* | Explicit kubeconfig; else in-cluster/default |
 | `ATLAS_JWT_SECRET` | dev default | HS256 secret (≥32 bytes required when auth is on) |
 | `ATLAS_AUTH_REQUIRED` | `0` (local) / `1` (k8s) | Require JWT on `/api` routes |

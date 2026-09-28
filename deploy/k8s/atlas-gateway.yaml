@@ -192,27 +192,28 @@ spec:
             - name: ATLAS_RGW_PUBLIC_ENDPOINT
               value: "http://$(NODE_IP):30800"
             # Self-state backup: periodic VACUUM INTO snapshots of Atlas's own control-plane DB
-            # (inventory/jobs/audit/quotas/DataBridge state) uploaded to RGW, separate from the
-            # tenant-volume backups Atlas already does. Uses a dedicated RGW user/bucket
-            # (atlas-state-backup / atlas-self-state) created via radosgw-admin, not an OBC — this
-            # needs a standing S3 credential up front, which OBCs don't provide.
+            # (inventory/jobs/audit/quotas/DataBridge state) uploaded to RustFS (the lab's real
+            # object store, deploy/rustfs-lab/), separate from the tenant-volume backups Atlas
+            # already does. The bucket is created on first run if missing; credentials are the
+            # same `rustfs-credentials` Secret the RustFS write path uses (lab shortcut — a
+            # production deploy should give the backup its own least-privilege RustFS user).
             - name: ATLAS_STATE_BACKUP_SECS
               value: "3600"
             - name: ATLAS_STATE_BACKUP_ENDPOINT
-              value: "http://$(NODE_IP):30800"
+              value: "http://$(NODE_IP):30900"
             - name: ATLAS_STATE_BACKUP_BUCKET
               value: "atlas-self-state"
             - name: ATLAS_STATE_BACKUP_ACCESS_KEY
               valueFrom:
                 secretKeyRef:
-                  name: atlas-gateway-auth
-                  key: state-backup-access-key
+                  name: rustfs-credentials
+                  key: AWS_ACCESS_KEY_ID
                   optional: true
             - name: ATLAS_STATE_BACKUP_SECRET_KEY
               valueFrom:
                 secretKeyRef:
-                  name: atlas-gateway-auth
-                  key: state-backup-secret-key
+                  name: rustfs-credentials
+                  key: AWS_SECRET_ACCESS_KEY
                   optional: true
             # RustFS backend — Atlas's primary object store (default for new buckets), running for
             # real: deploy/rustfs-lab/up.sh (run by scripts/deploy-remote.sh before this rollout)

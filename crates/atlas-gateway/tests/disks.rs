@@ -182,6 +182,61 @@ async fn zfs_from_device_fixture_succeeds_and_pool_appears() {
     );
 }
 
+#[tokio::test]
+async fn zfs_pool_destroy_requires_matching_confirmation_and_removes_the_pool() {
+    let base = format!("http://{}/api/atlas/v1", spawn(true).await);
+    let c = reqwest::Client::new();
+    let resp = c
+        .post(format!("{base}/zfs/pools/from-device"))
+        .json(&json!({ "pool_name": "tank3", "device_path": "/dev/vdz", "confirm": true }))
+        .send()
+        .await
+        .unwrap();
+    let accepted: Value = resp.json().await.unwrap();
+    let job = poll_job_to_terminal(&base, accepted["job_id"].as_str().unwrap()).await;
+    assert_eq!(job["state"], "succeeded", "job: {job}");
+
+    let wrong = c
+        .post(format!("{base}/zfs/pools/tank3/destroy"))
+        .json(&json!({ "confirm_pool_name": "other" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    let unknown = c
+        .post(format!("{base}/zfs/pools/nosuch/destroy"))
+        .json(&json!({ "confirm_pool_name": "nosuch" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unknown.status(), reqwest::StatusCode::NOT_FOUND);
+
+    let resp = c
+        .post(format!("{base}/zfs/pools/tank3/destroy"))
+        .json(&json!({ "confirm_pool_name": "tank3" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::ACCEPTED);
+    let accepted: Value = resp.json().await.unwrap();
+    let job = poll_job_to_terminal(&base, accepted["job_id"].as_str().unwrap()).await;
+    assert_eq!(job["state"], "succeeded", "job: {job}");
+
+    let pools: Value = c
+        .get(format!("{base}/pools"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        !pools.as_array().unwrap().iter().any(|p| p["name"] == "tank3"),
+        "destroyed pool should be gone from inventory: {pools}"
+    );
+}
+
 /// Fake mode only ever "succeeds" against its one fixture device path — proving it never
 /// fabricates having formatted an arbitrary operator-supplied device it never actually touched.
 #[tokio::test]

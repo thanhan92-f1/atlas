@@ -18,6 +18,7 @@ export default function Buckets() {
   const inv = useInvalidate();
   const refetch = () => inv("buckets", "summary");
   const [create, setCreate] = useState(false);
+  const [selftest, setSelftest] = useState(false);
   const [objBucket, setObjBucket] = useState<StorageBucket | null>(null);
   const n = data?.length || 0;
 
@@ -45,9 +46,16 @@ export default function Buckets() {
           : "No buckets yet. Create the first bucket to begin exports and backups."
       }
       actions={
-        <button type="button" className="at-btn primary" onClick={() => setCreate(true)}>
-          <Plus size={14} /> Bucket
-        </button>
+        <>
+          {objectBackends.some((b) => b.backend_type === "rustfs") && (
+            <button type="button" className="at-btn" onClick={() => setSelftest(true)}>
+              RustFS self-test
+            </button>
+          )}
+          <button type="button" className="at-btn primary" onClick={() => setCreate(true)}>
+            <Plus size={14} /> Bucket
+          </button>
+        </>
       }
     >
       <Table
@@ -93,6 +101,36 @@ export default function Buckets() {
             <Button size="sm" variant="danger" onClick={() => del(`bucket ${b.bucket_name || b.name || b.id}`, () => submitJob("delete", `/buckets/${b.id}?force=true`, null, "delete bucket", refetch))}>Del</Button>
           </>
         )}
+      />
+
+      <FormModal
+        open={selftest}
+        onClose={() => setSelftest(false)}
+        title="RustFS self-test"
+        submitLabel="Run self-test"
+        fields={[
+          {
+            name: "region",
+            label: "Region (optional)",
+            optional: true,
+            placeholder: "us-east-1",
+            hint:
+              "Runs against a throwaway bucket on the live server: create, put/get, 11 MiB multipart " +
+              "upload, listing, versioned-key prune, non-empty-bucket delete refusal, delete. Per-step " +
+              "results are in the job's output (Jobs page).",
+          },
+        ]}
+        onSubmit={async (v) => {
+          const rustfs = objectBackends.find((b) => b.backend_type === "rustfs");
+          if (!rustfs) return;
+          await submitJob(
+            "post",
+            `/backends/${rustfs.id}/selftest`,
+            { region: (v.region || "").trim() },
+            "RustFS self-test",
+            () => inv("jobs", "buckets", "summary"),
+          );
+        }}
       />
 
       <FormModal open={create} onClose={() => setCreate(false)} title="Create bucket" submitLabel="Create"

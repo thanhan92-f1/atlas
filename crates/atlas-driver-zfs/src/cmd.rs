@@ -598,6 +598,43 @@ pub async fn zpool_create(pool_name: &str, device_path: &str) -> Result<(), Driv
     )))
 }
 
+/// Names of every imported zpool on this host (`zpool list -H -o name`).
+pub async fn list_zpool_names() -> Result<Vec<String>, DriverError> {
+    let (ok, stdout, stderr) = run("zpool", &["list", "-H", "-o", "name"]).await?;
+    if !ok {
+        return Err(DriverError::Backend(format!("zpool list: {stderr}")));
+    }
+    Ok(stdout.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect())
+}
+
+/// Every dataset/zvol below (and including) `pool_name` (`zfs list -H -r -o name`).
+pub async fn list_pool_datasets(pool_name: &str) -> Result<Vec<String>, DriverError> {
+    let (ok, stdout, stderr) = run("zfs", &["list", "-H", "-r", "-o", "name", pool_name]).await?;
+    if !ok {
+        return Err(DriverError::Backend(format!("zfs list {pool_name}: {stderr}")));
+    }
+    Ok(stdout.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect())
+}
+
+/// Datasets that would be destroyed along with the pool, i.e. everything except the root
+/// dataset itself. Non-empty means the pool holds real data and destroy must be refused.
+pub fn non_root_datasets<'a>(pool_name: &str, datasets: &'a [String]) -> Vec<&'a String> {
+    datasets.iter().filter(|d| d.as_str() != pool_name).collect()
+}
+
+/// `zpool destroy <pool_name>` — **never** passes `-f`: without it zpool itself refuses a pool
+/// with mounted, in-use datasets ("pool is busy"), an independent safety net under Atlas's own
+/// dataset check. The member disk keeps its ZFS labels afterwards and is then offered by the
+/// Disks picker as a wipeable `zfs_member` device.
+pub async fn zpool_destroy(pool_name: &str) -> Result<(), DriverError> {
+    let (ok, _stdout, stderr) = run("zpool", &["destroy", pool_name]).await?;
+    if ok {
+        Ok(())
+    } else {
+        Err(DriverError::Backend(format!("zpool destroy {pool_name}: {stderr}")))
+    }
+}
+
 /// The synthesized inventory pool/cluster ids this device-provision path writes, matching
 /// `RealZfsDriver`/`FakeZfsDriver`'s own id-derivation scheme exactly, so a later real discovery
 /// pass (once the pool name is added to `ATLAS_ZFS_POOLS`) upserts onto the same row.
@@ -620,6 +657,14 @@ pub fn root_volume_id(pool_name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn non_root_datasets_ignores_only_the_root() {
+        let all = vec!["tank0".to_string(), "tank0/data".to_string(), "tank00".to_string()];
+        let extra = non_root_datasets("tank0", &all);
+        assert_eq!(extra, vec![&all[1], &all[2]]);
+        assert!(non_root_datasets("tank0", &all[..1]).is_empty());
+    }
 
     #[test]
     fn refuses_root_disk_before_anything_else() {

@@ -4,7 +4,11 @@
 //! `routes::rook`'s create-pool shape (async job, `202 Accepted`), but this mutation is genuinely
 //! destructive (formats a disk), so it additionally requires an explicit `confirm: true`.
 
-use axum::{extract::State, http::StatusCode, Extension, Json};
+use axum::{
+    extract::{Path, State},
+    http::StatusCode,
+    Extension, Json,
+};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -134,4 +138,75 @@ pub(crate) async fn list_zfs_devices(State(s): State<AppState>) -> AppResult<Jso
         })
         .collect();
     Ok(Json(json!(rows)))
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct DestroyZfsPoolBody {
+    /// Must equal the pool name in the URL — typed by the operator as the explicit confirmation.
+    confirm_pool_name: String,
+}
+
+/// `POST /zfs/pools/{name}/destroy` — `zpool destroy` a pool Atlas knows about (async job). Refused
+/// while inventory or the host still shows any dataset/volume inside it; the member disk is left
+/// carrying ZFS labels and reappears in the Disks picker as a wipeable device.
+pub(crate) async fn destroy_zfs_pool(
+    State(s): State<AppState>,
+    Extension(actor): Extension<Actor>,
+    Path(name): Path<String>,
+    Json(body): Json<DestroyZfsPoolBody>,
+) -> AppResult<(StatusCode, Json<Value>)> {
+    crate::auth::require_role(s.config.auth_required, &actor, crate::auth::ROLE_ADMIN)?;
+    super::util::validate_k8s_name(&name)?;
+    if body.confirm_pool_name != name {
+        return Err(AppError::Validation(
+            "confirm_pool_name must equal the pool name".into(),
+        ));
+    }
+    if !s.config.zfs_enable {
+        return Err(AppError::Unavailable(
+            "the ZFS backend is not enabled (set ATLAS_ZFS_ENABLE=1 and restart the gateway)"
+                .into(),
+        ));
+    }
+    let pool_row_id = atlas_driver_zfs::pool_id(&name);
+    if !atlas_inventory::pool_row_exists(&s.pool, &pool_row_id).await? {
+        return Err(AppError::NotFound(format!("zfs pool {name} is not in inventory")));
+    }
+    let root_volume = atlas_driver_zfs::root_volume_id(&name);
+    let extra: Vec<String> = atlas_inventory::volume_ids_in_pool(&s.pool, &pool_row_id)
+        .await?
+        .into_iter()
+        .filter(|v| *v != root_volume)
+        .collect();
+    if !extra.is_empty() {
+        return Err(AppError::Conflict(format!(
+            "pool {name} still holds {} volume(s): {}",
+            extra.len(),
+            extra.join(", ")
+        )));
+    }
+    let spec = JobSpec::ZfsPoolDestroy {
+        backend_id: crate::startup::ZFS_BACKEND_ID.into(),
+        pool_name: name.clone(),
+        confirmed_pool_name: body.confirm_pool_name.clone(),
+    };
+    let job_id = ids::job_id();
+    let job = s
+        .jobs
+        .enqueue(&job_id, "global", &actor.id, spec, None)
+        .await
+        .map_err(AppError::from)?;
+    let _ = atlas_inventory::audit::record(
+        &s.pool,
+        None,
+        &actor.id,
+        "zfs.pool.destroy.requested",
+        "pool",
+        &name,
+        "accepted",
+        None,
+        None,
+    )
+    .await;
+    Ok(accepted(&job, json!({ "pool_name": name })))
 }

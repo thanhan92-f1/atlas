@@ -71,7 +71,9 @@ Fake mode skips the `rbd` CLI so drills succeed locally.
 ## Upgrades
 - **Pre-flight** `GET /upgrade/preflight` — no HEALTH_ERR cluster / open critical alerts / in-flight
   jobs / lagging CDC → `{ ready, blockers }`. `scripts/deploy-remote.sh` gates on it and supports
-  `--rollback` (`kubectl rollout undo`) + `--force`.
+  `--rollback` (`kubectl rollout undo`) + `--force`. The script also (re)applies `deploy/rustfs-lab/`
+  (the lab RustFS server; `--without-rustfs` skips it) — the server's data PVC and credentials Secret
+  are never recreated or rotated by a re-run.
 
 ## Standard procedures
 - **Rolling upgrade**: `GET /upgrade/preflight` → if `ready:false`, `POST /maintenance {paused:true}`

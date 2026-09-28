@@ -89,6 +89,25 @@ subsequent discovery pass alone would never notice a pool that wasn't in that li
 process started. **Known limitation**: this pool's capacity/health numbers go stale until the
 gateway is restarted with the pool name added to `ATLAS_ZFS_POOLS`.
 
+## ZFS: `POST /api/atlas/v1/zfs/pools/{name}/destroy`
+
+```json
+{ "confirm_pool_name": "tank2" }
+```
+
+Async job (`zfs.pool.destroy`), admin-only; the Disks console page lists the host's pools with a
+**Destroy…** button that asks for the pool name to be typed back. Refusals: the confirmation must
+equal the pool name; the pool must be in Atlas's inventory (`404` otherwise); inventory must show
+no volume in it other than the pool's own root dataset (`409`); and on the host `zfs list -r` must
+show no dataset below the root. `zpool destroy` is **never** passed `-f`, so zpool's own "pool is
+busy" refusal stays underneath. The inventory pool/volume rows are dropped only after the destroy
+succeeded (or after `zpool list` shows the pool is already gone). The member disk keeps its ZFS
+labels, so it reappears in the Disks picker as a `zfs_member` device that can be re-provisioned with
+the explicit wipe option — that is the destroy → wipe → re-provision cycle.
+
+Status: unit- and fake-mode-tested (`tests/disks.rs`); **not yet run against a real pool** on the lab
+(the only pool there is `tank0`, and destroying it was left to the operator).
+
 ## Ceph: `POST /api/atlas/v1/ceph/devices`
 
 ```json

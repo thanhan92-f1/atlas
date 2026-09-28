@@ -42,6 +42,75 @@ pub(crate) async fn dispatch_zfs(
     _tenant_id: &str,
     spec: JobSpec,
 ) -> Result<serde_json::Value> {
+    match spec {
+        JobSpec::ZfsPoolDestroy {
+            backend_id,
+            pool_name,
+            confirmed_pool_name,
+        } => destroy_pool(pool, &backend_id, &pool_name, &confirmed_pool_name).await,
+        spec => create_pool_from_device(pool, spec).await,
+    }
+}
+
+/// `zpool destroy`, then drop the pool's inventory rows. Every refusal below is checked again here
+/// (the route checked too) because the job may run long after it was enqueued.
+async fn destroy_pool(
+    pool: &AnyPool,
+    backend_id: &str,
+    pool_name: &str,
+    confirmed_pool_name: &str,
+) -> Result<serde_json::Value> {
+    anyhow::ensure!(
+        pool_name == confirmed_pool_name,
+        "pool name confirmation mismatch"
+    );
+    let pool_row_id = atlas_driver_zfs::pool_id(pool_name);
+    anyhow::ensure!(
+        atlas_inventory::pool_row_exists(pool, &pool_row_id).await?,
+        "pool {pool_name} is not in Atlas's inventory — refusing to destroy a pool Atlas did not provision or discover"
+    );
+    let root_volume = atlas_driver_zfs::root_volume_id(pool_name);
+    let extra_volumes: Vec<String> = atlas_inventory::volume_ids_in_pool(pool, &pool_row_id)
+        .await?
+        .into_iter()
+        .filter(|v| *v != root_volume)
+        .collect();
+    anyhow::ensure!(
+        extra_volumes.is_empty(),
+        "refusing to destroy {pool_name}: inventory still lists {} volume(s) in it ({})",
+        extra_volumes.len(),
+        extra_volumes.join(", ")
+    );
+
+    let mut destroyed = false;
+    if !is_fake_zfs_mode() {
+        let present = atlas_driver_zfs::list_zpool_names().await?;
+        if present.iter().any(|p| p == pool_name) {
+            let datasets = atlas_driver_zfs::list_pool_datasets(pool_name).await?;
+            let extra = atlas_driver_zfs::non_root_datasets(pool_name, &datasets);
+            anyhow::ensure!(
+                extra.is_empty(),
+                "refusing to destroy {pool_name}: it still holds {} dataset(s) ({})",
+                extra.len(),
+                extra.iter().map(|d| d.as_str()).collect::<Vec<_>>().join(", ")
+            );
+            atlas_driver_zfs::zpool_destroy(pool_name).await?;
+            destroyed = true;
+        }
+        // Absent from a successful `zpool list`: the pool is already gone on the host (destroyed
+        // or exported out of band), so only the stale inventory rows remain to be dropped.
+    } else {
+        destroyed = true;
+    }
+    atlas_inventory::delete_pool_with_volumes(pool, &pool_row_id).await?;
+    Ok(serde_json::json!({
+        "pool": pool_name,
+        "backend_id": backend_id,
+        "destroyed_on_host": destroyed,
+    }))
+}
+
+async fn create_pool_from_device(pool: &AnyPool, spec: JobSpec) -> Result<serde_json::Value> {
     let JobSpec::ZfsPoolCreateFromDevice {
         backend_id,
         pool_name,

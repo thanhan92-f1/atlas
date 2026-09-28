@@ -14,7 +14,7 @@ use crate::spec::JobSpec;
 
 /// `ATLAS_RUSTFS_ENDPOINT`, mirroring the same env var `atlas-driver-rustfs`'s `from_env()` reads
 /// — job dispatch has no `AppState`/`Config` handle, same convention as `is_fake_zfs_mode()`.
-fn rustfs_endpoint() -> String {
+pub(crate) fn rustfs_endpoint() -> String {
     std::env::var("ATLAS_RUSTFS_ENDPOINT").unwrap_or_else(|_| "http://127.0.0.1:9000".into())
 }
 

@@ -84,6 +84,24 @@ uses). The gateway's ClusterRole already grants cluster-wide `get/list/watch` on
 never writes secrets itself — `deploy/rustfs-lab/up.sh` creates it for the lab; a real deployment
 provisions it however it provisions every other credential this gateway consumes.
 
+## Self-test (conformance check, console button)
+
+`POST /api/atlas/v1/backends/bkd_rustfs_lab/selftest` (body `{"region": "eu-west-1"}`, optional;
+admin) — the Buckets page's **RustFS self-test** button. An async job (`s3.backend.selftest`) that
+creates a throwaway `atlas-selftest-*` bucket on the live server and checks: create/head bucket,
+put/get of a small object, an **11 MiB multipart upload** (3 parts, SHA-256 checked against the
+source) and its streaming download, listing by prefix with sizes, the key-suffix "versioned" upload +
+prune scheme (`ver.db.<n>`), that deleting a **non-empty bucket is refused** (`409 BucketNotEmpty`),
+object delete and bucket delete. It cleans up after itself even on failure. Every step's outcome is
+in the job output (a failing job's error carries the per-step report). For any region other than
+`us-east-1`, `CreateBucket` sends a `LocationConstraint` body.
+
+## Self-state backup
+
+The lab gateway's `ATLAS_STATE_BACKUP_*` now targets RustFS (`http://<node-ip>:30900`, bucket
+`atlas-self-state`, credentials from `rustfs-credentials`). The backup creates the bucket on first
+use (`HeadBucket` → `CreateBucket`).
+
 ## Verified live (2026-09-28, lab host, RustFS 1.0.0, through the Atlas console)
 
 - Real, SigV4-signed discovery against the live server (cluster registered, health OK).
@@ -92,15 +110,23 @@ provisions it however it provisions every other credential this gateway consumes
 - **Object upload** from the browser via a presigned PUT straight to RustFS (after fixing CORS —
   see above), listed back with the exact byte size, and **presigned download** returned the exact
   content.
+- **Self-test, default region and `eu-west-1`**: both runs succeeded — multipart upload/download
+  round-trip, prefix listing, versioned-key prune, non-empty-bucket delete refusal, object delete
+  and bucket delete against the real server. The first run caught a real bug: `HeadBucket` was
+  signed for HEAD but sent as GET, so `bucket_exists` always answered "missing" (harmless for the
+  create path, but it would have made the state backup's ensure-bucket step fail every run after the
+  first).
+- **Self-state backup**: two uploads (`atlas-state/atlas-state-*.db`, ~545 KB) into RustFS, the
+  second into the already-existing bucket.
 
 ## Still unverified against a real RustFS
 
-- **Multipart upload** (`put_multipart_streaming`) — large-object backups and DataBridge object
-  copies depend on it.
-- **Bucket delete**, versioned uploads/`prune`, and objects large enough to matter.
-- `CreateBucket` sends no body (no `LocationConstraint`) — worked here with the default
-  `us-east-1`; not tested with any other region.
+- **DataBridge object migration with a RustFS destination** — it uses the same `S3Target`
+  multipart path the self-test just exercised, but a full migration run needs source/destination
+  credentials in the request body and has not been run.
+- **Volume backups to RustFS** (`export-diff` → S3) — needs Ceph RBD, which the lab host has none of.
+- Real S3 object *versioning* (the `?versions` API) — Atlas's "versioned uploads" are a key-suffix
+  convention, which the self-test does cover.
 - Bucket stats/quota (no equivalent wired up) and per-bucket capacity.
-- **Self-state backup and DataBridge object migration destinations** — both use the same generic
-  `S3Target` and could be repointed at RustFS as a config change, but neither has been (the lab's
-  `ATLAS_STATE_BACKUP_*` still targets a Ceph RGW that isn't deployed on this host).
+- Whether RustFS itself enforces the region: with the lab's default server config both
+  `us-east-1` and `eu-west-1` were accepted.

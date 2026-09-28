@@ -1,11 +1,11 @@
 // Copyright (c) 2026 ZyvorAI Labs Private Limited.
 // SPDX-License-Identifier: LicenseRef-Zyvor-Production-1.0
 
-//! Object-storage migration — the *object* leg of Atlas DataBridge (AWS S3 → Ceph RGW).
+//! Object-storage migration — the *object* leg of Atlas DataBridge (AWS S3 → RustFS or Ceph RGW).
 //!
 //! Mirrors the database DataBridge shape (discover → copy → verify) but for S3 objects.
 //! Reuses [`atlas_driver_rgw::S3Target`] as the byte-mover for BOTH endpoints: the AWS
-//! source and the RGW destination are both S3-compatible (SigV4, path-style), so one
+//! source and the destination (RustFS or Ceph RGW) are both S3-compatible (SigV4, path-style), so one
 //! client type serves both. The copy is:
 //!
 //!   list source → diff vs dest (full | incremental by key+size) → stream each object,
@@ -57,13 +57,13 @@ impl ObjectProvider {
     }
 }
 
-/// Connection to one S3-compatible endpoint (AWS source or Ceph RGW destination).
+/// Connection to one S3-compatible endpoint (AWS source, or RustFS / Ceph RGW destination).
 ///
 /// Deliberately does NOT derive `Debug`/`Serialize` — the access/secret keys must never
 /// reach a log line or a persisted record. Use [`redacted`](Self::redacted) for display.
 #[derive(Clone, Deserialize)]
 pub struct S3Endpoint {
-    /// Full endpoint URL, e.g. `https://s3.us-east-1.amazonaws.com` (AWS) or the RGW URL.
+    /// Full endpoint URL, e.g. `https://s3.us-east-1.amazonaws.com` (AWS) or the RustFS / RGW URL.
     pub endpoint: String,
     #[serde(default)]
     pub region: String,
@@ -180,7 +180,7 @@ pub trait ObjectSource: Send + Sync {
     ) -> Result<(u64, String)>;
 }
 
-/// A write destination for the migration (Ceph RGW). Pluggable so the copy loop can be
+/// A write destination for the migration (RustFS or Ceph RGW). Pluggable so the copy loop can be
 /// unit-tested against an in-memory sink instead of a live S3 endpoint.
 #[async_trait::async_trait]
 pub trait ObjectSink: Send + Sync {
@@ -213,7 +213,7 @@ impl ObjectSource for S3ObjectSource {
     }
 }
 
-/// S3-protocol destination (Ceph RGW): wraps an [`S3Target`], streaming via multipart upload.
+/// S3-protocol destination (RustFS or Ceph RGW): wraps an [`S3Target`], streaming via multipart upload.
 pub struct S3ObjectSink(pub S3Target);
 
 #[async_trait::async_trait]
@@ -249,7 +249,7 @@ impl ObjectMigrator {
         })
     }
 
-    /// Build a migrator from an arbitrary source (e.g. Azure Blob) into an RGW destination.
+    /// Build a migrator from an arbitrary source (e.g. Azure Blob) into a RustFS / RGW destination.
     pub fn with_source(
         source: Box<dyn ObjectSource>,
         dest: S3Target,
@@ -494,7 +494,7 @@ async fn run_migration_inner(
     let (src_ak, src_sk) = resolve_creds(&k8s, &rec.secret_namespace, src_ref).await?;
     let (dst_ak, dst_sk) = resolve_creds(&k8s, &rec.secret_namespace, dst_ref).await?;
 
-    // Destination endpoint (Ceph RGW).
+    // Destination endpoint (RustFS or Ceph RGW).
     let dest = S3Endpoint {
         endpoint: rec.dest_endpoint.clone(),
         region: rec.dest_region.clone(),

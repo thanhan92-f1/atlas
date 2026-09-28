@@ -384,6 +384,41 @@ pub async fn delete_volume_row(pool: &AnyPool, id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Ids of every inventory volume attached to `pool_id`.
+pub async fn volume_ids_in_pool(pool: &AnyPool, pool_id: &str) -> Result<Vec<String>> {
+    let rows = sqlx::query("SELECT id FROM storage_volumes WHERE pool_id=$1")
+        .bind(pool_id)
+        .fetch_all(pool)
+        .await?;
+    rows.iter()
+        .map(|r| r.try_get::<String, _>("id").map_err(Into::into))
+        .collect()
+}
+
+/// Whether a pool row with this id exists in inventory.
+pub async fn pool_row_exists(pool: &AnyPool, pool_id: &str) -> Result<bool> {
+    let row = sqlx::query("SELECT id FROM storage_pools WHERE id=$1")
+        .bind(pool_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.is_some())
+}
+
+/// Delete a pool row and its volume rows (after the backend pool itself is gone).
+pub async fn delete_pool_with_volumes(pool: &AnyPool, pool_id: &str) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM storage_volumes WHERE pool_id=$1")
+        .bind(pool_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM storage_pools WHERE id=$1")
+        .bind(pool_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
 /// Rename a volume's primary key, re-pointing every table that references it (foreign-key
 /// constrained or not) in one transaction — used when a backend-side move changes what a
 /// deterministic id derives to (e.g. `rbd migrate` moving an image to a new pool: its id is

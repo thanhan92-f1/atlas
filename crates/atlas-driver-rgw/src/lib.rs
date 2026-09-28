@@ -364,25 +364,27 @@ impl S3Target {
     }
 
     /// Whether the bucket itself already exists and is reachable with these credentials
-    /// (S3 `HeadBucket`).
+    /// (S3 `HeadBucket`). The presigned URL is signed for HEAD, so it must be sent as HEAD — a GET
+    /// fails signature verification and would always read as "missing".
     pub async fn bucket_exists(&self) -> bool {
         let action = self.bucket.head_bucket(Some(&self.creds));
         matches!(
-            self.http.get(action.sign(SIGN_TTL)).send().await,
+            self.http.head(action.sign(SIGN_TTL)).send().await,
             Ok(r) if r.status().is_success()
         )
     }
 
-    /// Create the bucket itself (S3 `CreateBucket`). Sends no request body (no
-    /// `LocationConstraint`) — real AWS S3 requires that body for any region other than
-    /// `us-east-1`; MinIO-family servers are generally lenient, but this has not been verified
-    /// against a real RustFS server. Not idempotent by itself — callers that want
-    /// create-if-missing semantics should check `bucket_exists` first.
+    /// Create the bucket itself (S3 `CreateBucket`). For any region other than `us-east-1` the
+    /// request carries a `CreateBucketConfiguration` body naming it as `LocationConstraint` — real
+    /// AWS S3 rejects a non-default-region create without it. Not idempotent by itself — callers
+    /// that want create-if-missing semantics should check `bucket_exists` first.
     pub async fn create_bucket(&self) -> Result<()> {
         let action = self.bucket.create_bucket(&self.creds);
-        let resp = self
-            .http
-            .put(action.sign(SIGN_TTL))
+        let mut req = self.http.put(action.sign(SIGN_TTL));
+        if let Some(body) = create_bucket_body(self.bucket.region()) {
+            req = req.header("content-type", "application/xml").body(body);
+        }
+        let resp = req
             .send()
             .await
             .with_context(|| format!("CreateBucket {}", self.bucket.name()))?;
@@ -420,9 +422,29 @@ impl S3Target {
     }
 }
 
+/// The `CreateBucket` request body for `region`: none for the default `us-east-1`, otherwise a
+/// `CreateBucketConfiguration` with the region as `LocationConstraint`.
+fn create_bucket_body(region: &str) -> Option<String> {
+    if region.is_empty() || region == "us-east-1" {
+        return None;
+    }
+    Some(format!(
+        "<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+         <LocationConstraint>{region}</LocationConstraint></CreateBucketConfiguration>"
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn create_bucket_body_only_for_non_default_regions() {
+        assert!(create_bucket_body("us-east-1").is_none());
+        assert!(create_bucket_body("").is_none());
+        let body = create_bucket_body("eu-west-1").unwrap();
+        assert!(body.contains("<LocationConstraint>eu-west-1</LocationConstraint>"));
+    }
 
     /// A port nothing is listening on — connection refused immediately, no real network I/O.
     /// Same "never fabricates success" convention used elsewhere in this codebase (e.g.

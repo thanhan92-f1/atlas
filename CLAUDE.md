@@ -20,13 +20,16 @@ Implemented:
   backend**, see `docs/RUSTFS.md`) and read-only **Longhorn** — plus a live K8s driver. Real drivers
   never fabricate data; they propagate a real error when the target is unreachable. Discovery worker
   → inventory. **RustFS is deployed for real** in the lab (`deploy/rustfs-lab/`, run by
-  `scripts/deploy-remote.sh`); bucket create/upload/download verified live through the console.
+  `scripts/deploy-remote.sh`); bucket create/upload/download, multipart, delete and a console
+  **self-test** (`POST /backends/{id}/selftest`) verified live; the lab's self-state backup targets it.
 - **Raw disk provisioning** (`docs/DISKS.md`): Disks console page + `GET /zfs/devices`,
   `GET /ceph/nodes/{node}/devices` pickers, `POST /zfs/pools/from-device` (with explicit
   `wipe_existing`) and `POST /ceph/devices`. **ZFS verified live on a real disk** (wiped a stale Ceph
   OSD signature, created a pool). The gateway pod needs `privileged` + hostPath `/dev`, `/run/udev`
   and `/proc/1/mountinfo` for this (`deploy/k8s/atlas-gateway.yaml`); active-pool members, the
   root/boot disk and mounted devices are hard refusals that `wipe_existing` can never override.
+  `POST /zfs/pools/{name}/destroy` (Disks page **Destroy…**, typed-name confirm) tears a pool down
+  again (fake-mode-tested; not yet run on the lab's real pool).
 - Write path: volumes (PVC + direct RBD), snapshots/clone/restore, CephFS RWX, buckets (RustFS default, RGW) + backups
   (`export-diff`→S3, retention, presigned), scheduled snapshots/backups, per-tenant quotas + policies.
 - Observability: monitor/alerts + webhook, `/metrics` (Prometheus self), `/metrics/{history,forecast,ceph}`,

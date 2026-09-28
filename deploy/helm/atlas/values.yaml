@@ -113,9 +113,10 @@ logLevel: "info,atlas_gateway=debug"
 # only supported open-dev path — see CLAUDE.md's "Run locally" section).
 authRequired: true
 
-# Self-state backup (periodic SQLite snapshot to RGW) — off by default; set enabled true and
-# fill in bucket/endpoint once you have a dedicated RGW user (see
-# deploy/k8s/atlas-gateway-ceph.yaml's comment on ATLAS_STATE_BACKUP_*).
+# Self-state backup (periodic SQLite/pg_dump snapshot to any S3 endpoint — RustFS or RGW) — off by
+# default; set enabled true and fill in bucket/endpoint plus a Secret holding the access/secret
+# keys. The bucket is created on the first run if it does not exist. The lab manifest
+# (deploy/k8s/atlas-gateway.yaml) points this at RustFS.
 stateBackup:
   enabled: false
   intervalSecs: 3600

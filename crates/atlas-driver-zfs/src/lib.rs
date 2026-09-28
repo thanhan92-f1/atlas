@@ -27,8 +27,9 @@ use atlas_driver_core::{DriverError, StorageDriver};
 
 mod cmd;
 pub use cmd::{
-    cluster_id, inspect_device, list_whole_disks, pool_id, root_volume_id, wipe_device,
-    zpool_create, BlockDevice, DeviceCheck,
+    cluster_id, inspect_device, list_pool_datasets, list_whole_disks, list_zpool_names,
+    non_root_datasets, pool_id, root_volume_id, wipe_device, zpool_create, zpool_destroy,
+    BlockDevice, DeviceCheck,
 };
 
 pub(crate) fn sanitize(s: &str) -> String {

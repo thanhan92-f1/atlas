@@ -403,6 +403,25 @@ pub enum JobSpec {
         device_path: String,
         confirmed_device_path: String,
     },
+    /// `zpool destroy` a ZFS pool Atlas itself provisioned. Local-host-only like
+    /// `ZfsPoolCreateFromDevice`. Refuses a pool that holds any dataset besides its root, never
+    /// passes `-f`, and drops the pool's inventory rows only after the destroy succeeded.
+    #[serde(rename = "zfs.pool.destroy")]
+    ZfsPoolDestroy {
+        backend_id: String,
+        pool_name: String,
+        /// Re-stated by the caller; dispatch refuses unless equal to `pool_name` byte-for-byte.
+        confirmed_pool_name: String,
+    },
+    /// Conformance self-test of an S3-compatible backend (RustFS): creates a throwaway bucket and
+    /// exercises put/get, multipart upload, prefix listing, delete, non-empty-bucket refusal and
+    /// bucket delete against the live server, always cleaning up after itself.
+    #[serde(rename = "s3.backend.selftest")]
+    S3BackendSelfTest {
+        backend_id: String,
+        region: String,
+        credentials_namespace: String,
+    },
 }
 
 impl JobSpec {
@@ -452,6 +471,8 @@ impl JobSpec {
             JobSpec::CephObjectStoreCreate { .. } => "ceph.object_store.create",
             JobSpec::CephObjectStoreDelete { .. } => "ceph.object_store.delete",
             JobSpec::ZfsPoolCreateFromDevice { .. } => "zfs.pool.create_from_device",
+            JobSpec::ZfsPoolDestroy { .. } => "zfs.pool.destroy",
+            JobSpec::S3BackendSelfTest { .. } => "s3.backend.selftest",
             JobSpec::CephOsdAddDevice { .. } => "ceph.osd.add_device",
         }
     }
