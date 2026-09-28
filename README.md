@@ -29,7 +29,7 @@ Products call stable Atlas APIs; Atlas maps intent to Ceph, NFS, ZFS, Longhorn a
 
 **5** storage backends · **6** database engines migratable via DataBridge · **80+** REST endpoints · **3** access surfaces (REST · gRPC · SSE)
 
-Atlas is the **central storage control plane** for the Zyvor suite. Products call stable Atlas APIs; Atlas maps intent to Ceph (and NFS/ZFS/Longhorn/RustFS) through pluggable drivers — with an Apple Shop console for operators. Read the [full docs](https://zyvorai.github.io/atlas/): quickstart, architecture, licensing.
+A gateway with an Apple Shop console for operators. Read the [full docs](https://zyvorai.github.io/atlas/): quickstart, architecture, licensing.
 
 <div align="center">
 
