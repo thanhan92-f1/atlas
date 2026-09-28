@@ -148,6 +148,15 @@ verified until an equivalent live run has actually been done against one (see `d
 known-unverified-risks list — presigned URLs and multipart upload wire compatibility with RustFS
 specifically haven't been exercised yet either).
 
+### Object migration in the console
+
+**DataBridge → Object Migrations** (`/databridge/object`). Either side can be **RustFS (the Atlas
+backend)** — then the endpoint and credentials Secret are filled in server-side
+(`source_backend_id` / `dest_backend_id` in the create body; only the enabled RustFS backend is
+accepted) and no key is ever typed — or an **external S3 endpoint** with a credentials Secret name.
+The destination bucket must already exist (create it on the Buckets page). Verified live: RustFS
+bucket → RustFS bucket, `completed`, 1/1 objects, verified.
+
 ### Object REST endpoints (`/api/atlas/v1`, `require_role(operator)`, tenant-scoped)
 | Method | Path | Purpose |
 |---|---|---|

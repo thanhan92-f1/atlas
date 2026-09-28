@@ -60,6 +60,10 @@ namespace:
   # Namespace the fake/k8s-driver deployment runs in. Ignored when ceph.enabled (uses
   # ceph.rookNamespace instead, matching deploy/k8s/atlas-gateway-ceph.yaml's placement).
   name: zyvor-system
+  # Render the Namespace object. Set false when installing with `helm install -n <ns>
+  # --create-namespace` (Helm then owns namespace creation; rendering it here as well fails with an
+  # "exists and cannot be imported" ownership error).
+  create: true
 
 service:
   type: NodePort
@@ -125,6 +129,10 @@ stateBackup:
   prefix: ""
   accessKeySecretKey: state-backup-access-key
   secretKeySecretKey: state-backup-secret-key
+  # Back up to the RustFS backend: endpoint defaults to the RustFS endpoint and the credentials come
+  # from `rustfs.credentialsSecret` (keys AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY) instead of the
+  # auth Secret. The bucket is created on the first run.
+  useRustfs: false
 
 # OIDC/SSO — off by default; the console's "Sign in with SSO" button only renders when this is
 # enabled (see crates/atlas-common/src/config.rs's oidc_from_env()).
@@ -194,18 +202,55 @@ zfs:
   pools: ""
   # "fake" (default) reports deterministic capacity fixtures. "real" shells out to `zpool`/`zfs`
   # — locally, on whatever host the gateway pod itself runs on (ZFS has no remote query protocol;
-  # `host` above is cosmetic only in real mode). The gateway image needs `zfsutils-linux` (or
-  # equivalent) on PATH, and the pod needs to actually be co-located with the zpools (e.g. a
-  # hostPath-mounted /dev or a privileged DaemonSet), which this chart does not set up for you.
+  # `host` above is cosmetic only in real mode). The gateway image needs `zfsutils-linux` (the
+  # default `Dockerfile` image has it). To let the console format raw disks, set `disks.enabled`
+  # below — that sets everything the pod needs (privileged, hostPath /dev, /run/udev and the
+  # host mount table) and forces real mode.
   driverMode: fake
+
+# Raw-disk provisioning from the console's Disks page: wipe + `zpool create` / `zpool destroy`
+# (ZFS) and the Ceph-OSD-via-Rook path. Renders a PRIVILEGED gateway pod with hostPath mounts of the
+# node's /dev, /run/udev (read-only) and /proc/1/mountinfo (read-only) — see docs/DISKS.md for why
+# each is needed (device cgroup, udev database, root/boot-disk detection). Forces the ZFS backend on
+# in `real` mode with ATLAS_ZFS_HOST set to the node's IP. ZFS is node-local: pin the pod to the
+# disk-owning node with `nodeSelector`, keep `replicaCount: 1`, and run only one disk-enabled
+# gateway per node. Needs the default (non-Ceph) gateway image, which bundles zfsutils-linux.
+disks:
+  enabled: false
 
 rustfs:
   enabled: false
+  # Address browsers AND the gateway use to reach the S3 API (presigned upload/download URLs are
+  # built from it, so it must be browser-reachable). Empty with `server.enabled`: http://<node-ip>:
+  # <server.s3NodePort>, resolved from the pod's NODE_IP.
   endpoint: ""
   buckets: ""
   # "fake" (default) reports deterministic capacity fixtures — safe with no real RustFS endpoint.
-  # "real" calls `endpoint`'s health + S3 ListBuckets/ListObjectsV2 endpoints.
+  # "real" calls `endpoint`'s health + signed S3 ListBuckets/ListObjectsV2 endpoints.
   driverMode: fake
+  # Secret (in the gateway's namespace) holding AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY — used for
+  # signed discovery and for bucket create/delete. Created by the chart when
+  # `server.generateCredentials`, otherwise it must already exist.
+  credentialsSecret: rustfs-credentials
+
+  # Optional in-chart RustFS server (mirrors deploy/rustfs-lab/deployment.yaml): a single-replica,
+  # single-volume LAB topology — not HA. A production RustFS wants multiple drives/nodes (erasure
+  # coding); point `rustfs.endpoint` at that instead and leave `server.enabled` false.
+  server:
+    enabled: false
+    image: rustfs/rustfs:1.0.0
+    storage: 20Gi
+    storageClassName: ""
+    # NodePorts: the S3 API must be reachable from browsers (object bytes go browser <-> RustFS).
+    s3NodePort: 30900
+    consoleNodePort: 30901
+    # Console origin allowed by RustFS's CORS (default empty on the server = no CORS headers, which
+    # breaks every browser upload). Empty: http://<node-ip>:<service.httpNodePort>.
+    corsOrigin: ""
+    # Generate `credentialsSecret` once via `lookup` + `randAlphaNum` and keep it on upgrade (never
+    # rotated, never printed). `helm template`/`--dry-run` cannot see the cluster, so they render a
+    # throwaway value — only a real install/upgrade persists one. Set false to supply your own Secret.
+    generateCredentials: true
 
 nodeSelector: {}
 tolerations: []

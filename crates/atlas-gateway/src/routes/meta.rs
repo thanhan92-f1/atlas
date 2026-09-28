@@ -201,7 +201,11 @@ pub(crate) async fn readyz(State(s): State<AppState>) -> (StatusCode, Json<Value
         .workers
         .ages()
         .into_iter()
-        .map(|(name, age)| json!({ "worker": name, "age_secs": age, "stale": age > stale_after }))
+        .map(|(name, age, own_interval)| {
+            // A worker with its own declared interval is stale after two missed ticks (+30s).
+            let limit = own_interval.map_or(stale_after, |i| i.saturating_mul(2).saturating_add(30));
+            json!({ "worker": name, "age_secs": age, "stale": age > limit })
+        })
         .collect();
 
     // Gate readiness on the DB and a reachable backend driver.

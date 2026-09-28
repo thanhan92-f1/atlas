@@ -146,6 +146,9 @@ pub async fn build_oidc_runtime(cfg: &Config) -> Option<Arc<OidcRuntime>> {
 #[derive(Clone, Default)]
 pub struct WorkerHealth {
     beats: Arc<Mutex<HashMap<&'static str, Instant>>>,
+    /// Workers whose tick interval is not the monitor interval (e.g. the hourly state backup), so
+    /// `/readyz` doesn't flag them stale between two healthy ticks.
+    intervals: Arc<Mutex<HashMap<&'static str, u64>>>,
 }
 
 impl WorkerHealth {
@@ -156,11 +159,28 @@ impl WorkerHealth {
         }
     }
 
-    /// `(worker, seconds_since_last_beat)` for every worker that has beat at least once.
-    pub fn ages(&self) -> Vec<(&'static str, u64)> {
+    /// Declare `worker`'s own tick interval in seconds.
+    pub fn set_interval(&self, worker: &'static str, secs: u64) {
+        if let Ok(mut g) = self.intervals.lock() {
+            g.insert(worker, secs);
+        }
+    }
+
+    /// `(worker, seconds_since_last_beat, declared_interval_secs)` for every worker that has beat
+    /// at least once.
+    pub fn ages(&self) -> Vec<(&'static str, u64, Option<u64>)> {
+        let intervals = self
+            .intervals
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default();
         self.beats
             .lock()
-            .map(|g| g.iter().map(|(k, v)| (*k, v.elapsed().as_secs())).collect())
+            .map(|g| {
+                g.iter()
+                    .map(|(k, v)| (*k, v.elapsed().as_secs(), intervals.get(k).copied()))
+                    .collect()
+            })
             .unwrap_or_default()
     }
 }

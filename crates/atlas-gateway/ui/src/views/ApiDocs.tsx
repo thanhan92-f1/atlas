@@ -32,7 +32,7 @@ const SECTIONS: { title: string; items: DocsRow[] }[] = [
       { method: "GET", path: "/api/atlas/v1/pools", note: "Pools (?kind=)" },
       { method: "GET", path: "/api/atlas/v1/volumes", note: "Volumes (?state=&kind=)" },
       { method: "GET", path: "/api/atlas/v1/snapshots", note: "Snapshots" },
-      { method: "GET", path: "/api/atlas/v1/buckets", note: "RGW / object buckets" },
+      { method: "GET", path: "/api/atlas/v1/buckets", note: "Object buckets (RustFS default, Ceph RGW)" },
       { method: "GET", path: "/api/atlas/v1/osds", note: "OSD inventory" },
     ],
   },
@@ -44,6 +44,25 @@ const SECTIONS: { title: string; items: DocsRow[] }[] = [
       { method: "POST", path: "/api/atlas/v1/volumes/{id}/expand", note: "Expand → job" },
       { method: "POST", path: "/api/atlas/v1/snapshots", note: "Create snapshot → job" },
       { method: "GET", path: "/api/atlas/v1/jobs/{id}", note: "Job status" },
+    ],
+  },
+  {
+    title: "Object storage (RustFS)",
+    items: [
+      { method: "POST", path: "/api/atlas/v1/buckets", note: "Create bucket (backend_id; RustFS default) → job" },
+      { method: "DELETE", path: "/api/atlas/v1/buckets/{id}", note: "Delete bucket (must be empty) → job" },
+      { method: "POST", path: "/api/atlas/v1/buckets/{id}/objects/upload-url", note: "Presigned PUT (browser → RustFS)" },
+      { method: "POST", path: "/api/atlas/v1/backends/{id}/selftest", note: "S3 conformance self-test → job" },
+      { method: "POST", path: "/api/atlas/v1/databridge/object", note: "Bucket-to-bucket migration (source/dest_backend_id)" },
+    ],
+  },
+  {
+    title: "Disks (raw device provisioning)",
+    items: [
+      { method: "GET", path: "/api/atlas/v1/zfs/devices", note: "Whole disks on this host + status" },
+      { method: "POST", path: "/api/atlas/v1/zfs/pools/from-device", note: "Wipe + zpool create (confirm, wipe_existing) → job" },
+      { method: "POST", path: "/api/atlas/v1/zfs/pools/{name}/destroy", note: "zpool destroy (confirm_pool_name) → job" },
+      { method: "POST", path: "/api/atlas/v1/ceph/devices", note: "Claim a disk as a Ceph OSD via Rook → job" },
     ],
   },
   {

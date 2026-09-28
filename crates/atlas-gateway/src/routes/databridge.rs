@@ -532,6 +532,7 @@ pub(crate) struct CreateObjectMigrationBody {
     /// aws | gcs | s3-compatible | azure-blob | vmware (S3-protocol providers copy today).
     #[serde(default)]
     source_provider: Option<String>,
+    #[serde(default)]
     source_endpoint: String,
     #[serde(default)]
     source_region: Option<String>,
@@ -540,13 +541,21 @@ pub(crate) struct CreateObjectMigrationBody {
     source_prefix: Option<String>,
     /// k8s Secret {access_key,secret_key} for the source; never the creds themselves.
     source_secret_ref: Option<String>,
+    /// Use an Atlas object backend (RustFS) as the source: its endpoint, credentials Secret and
+    /// Secret namespace are filled in server-side, so no endpoint or key is ever typed.
+    #[serde(default)]
+    source_backend_id: Option<String>,
     #[serde(default)]
     dest_provider: Option<String>,
+    #[serde(default)]
     dest_endpoint: String,
     #[serde(default)]
     dest_region: Option<String>,
     dest_bucket: String,
     dest_secret_ref: Option<String>,
+    /// Same as `source_backend_id`, for the destination.
+    #[serde(default)]
+    dest_backend_id: Option<String>,
     #[serde(default)]
     secret_namespace: Option<String>,
     /// full | incremental (default)
@@ -567,8 +576,44 @@ pub(crate) async fn db_object_create(
     Json(body): Json<CreateObjectMigrationBody>,
 ) -> AppResult<(StatusCode, Json<Value>)> {
     crate::auth::require_role(s.config.auth_required, &actor, crate::auth::ROLE_OPERATOR)?;
+    let mut body = body;
     if body.name.trim().is_empty() {
         return Err(AppError::Validation("name is required".into()));
+    }
+    // A backend id resolves endpoint + credentials Secret from the gateway's own RustFS config.
+    let mut backend_secret_namespace = None;
+    for (which, backend_id) in [
+        ("source", body.source_backend_id.clone()),
+        ("dest", body.dest_backend_id.clone()),
+    ] {
+        let Some(backend_id) = backend_id.filter(|b| !b.trim().is_empty()) else {
+            continue;
+        };
+        if backend_id != crate::startup::RUSTFS_BACKEND_ID || !s.config.rustfs_enable {
+            return Err(AppError::Validation(format!(
+                "{which}_backend_id must be the enabled RustFS backend"
+            )));
+        }
+        let endpoint = s.config.rustfs_endpoint.clone().ok_or_else(|| {
+            AppError::Unavailable("ATLAS_RUSTFS_ENDPOINT is not configured".into())
+        })?;
+        let secret = std::env::var("ATLAS_RUSTFS_CREDENTIALS_SECRET")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| {
+                AppError::Unavailable("ATLAS_RUSTFS_CREDENTIALS_SECRET is not configured".into())
+            })?;
+        if which == "source" {
+            body.source_endpoint = endpoint;
+            body.source_secret_ref = Some(secret);
+        } else {
+            body.dest_endpoint = endpoint;
+            body.dest_secret_ref = Some(secret);
+        }
+        backend_secret_namespace = Some(s.config.rustfs_credentials_namespace.clone());
+    }
+    if body.secret_namespace.is_none() {
+        body.secret_namespace = backend_secret_namespace;
     }
     if body.source_endpoint.trim().is_empty() || body.dest_endpoint.trim().is_empty() {
         return Err(AppError::Validation(

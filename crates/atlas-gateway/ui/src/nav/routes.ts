@@ -68,6 +68,7 @@ import PlanDetail from "../views/databridge/PlanDetail";
 import EdgeClusters from "../views/databridge/EdgeClusters";
 import Replication from "../views/databridge/Replication";
 import Validation from "../views/databridge/Validation";
+import ObjectMigrations from "../views/databridge/ObjectMigrations";
 
 export type SectionId =
   | "STORAGE"
@@ -139,6 +140,7 @@ export const MODULES: NavModule[] = [
   { id: "edge-clusters", codename: "epimetheus", label: "Edge DB Clusters", path: "/databridge/edge-clusters", icon: Database, section: "DATABRIDGE", minRole: "operator", element: EdgeClusters },
   { id: "replication", codename: "echo", label: "Replication", path: "/databridge/replication", icon: Radio, section: "DATABRIDGE", minRole: "operator", element: Replication },
   { id: "validation", codename: "astraea", label: "Validation", path: "/databridge/validation", icon: BadgeCheck, section: "DATABRIDGE", minRole: "operator", element: Validation },
+  { id: "object-migrations", codename: "hyperion", label: "Object Migrations", path: "/databridge/object", icon: Database, section: "DATABRIDGE", minRole: "operator", element: ObjectMigrations },
 
   { id: "observatory", codename: "orrery", label: "Observatory", path: "/observatory", icon: Orbit, section: "OBSERVABILITY", pinned: true, topPrimary: true, shortcut: "O", element: Observatory },
   { id: "ops-advisor", codename: "metis", label: "Ops Advisor", path: "/ops-advisor", icon: BrainCircuit, section: "OBSERVABILITY", minRole: "operator", element: OpsAdvisor },

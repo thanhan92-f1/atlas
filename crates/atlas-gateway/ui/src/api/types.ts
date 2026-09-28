@@ -434,3 +434,24 @@ export interface Cutover {
   from_endpoint?: string | null; to_endpoint?: string | null;
   drain_deadline?: string | null; rollback_deadline?: string | null; created_at?: string | null; completed_at?: string | null;
 }
+
+export interface ObjectMigration {
+  id: string;
+  name: string;
+  source_endpoint: string;
+  source_bucket: string;
+  source_prefix?: string | null;
+  dest_endpoint: string;
+  dest_bucket: string;
+  mode: string;
+  state: string;
+  objects_total: number;
+  objects_done: number;
+  bytes_total: number;
+  bytes_done: number;
+  verified: boolean;
+  throughput_mbps?: number;
+  last_error?: string | null;
+  job_id?: string | null;
+  created_at?: string | null;
+}

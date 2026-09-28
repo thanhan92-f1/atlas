@@ -31,12 +31,20 @@ RUN cargo build --release -p atlas-gateway -p atlasctl \
 
 # ---- runtime (debian + ceph squid client) ----
 FROM docker.io/library/debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171 AS runtime
-RUN apt-get update \
+# zfsutils-linux/util-linux/setcap: same raw-disk provisioning tooling as `Dockerfile` (Disks page,
+# helm `disks.enabled`) — see the long comment there for the file-capabilities rationale and
+# docs/DISKS.md. zfsutils-linux is in Debian's `contrib` component.
+RUN echo "deb http://deb.debian.org/debian bookworm contrib" >> /etc/apt/sources.list \
+    && apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl gnupg \
     && curl -fsSL https://download.ceph.com/keys/release.asc | gpg --dearmor -o /usr/share/keyrings/ceph.gpg \
     && echo "deb [signed-by=/usr/share/keyrings/ceph.gpg] https://download.ceph.com/debian-squid/ bookworm main" > /etc/apt/sources.list.d/ceph.list \
     && apt-get update \
-    && apt-get install -y --no-install-recommends ceph-common \
+    && apt-get install -y --no-install-recommends ceph-common zfsutils-linux util-linux libcap2-bin \
+    && for bin in /usr/sbin/wipefs /usr/sbin/zpool /usr/sbin/zfs /usr/bin/lsblk /usr/bin/findmnt /usr/sbin/blockdev; do \
+         setcap cap_dac_override,cap_sys_admin=ep "$bin"; \
+       done \
+    && apt-get purge -y --auto-remove libcap2-bin \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --uid 10001 --home /var/lib/atlas atlas \
     && mkdir -p /var/lib/atlas /etc/ceph && chown atlas:atlas /var/lib/atlas /etc/ceph

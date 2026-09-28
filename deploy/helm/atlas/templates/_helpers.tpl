@@ -43,3 +43,28 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- .Values.auth.existingSecret -}}
 {{- end -}}
 {{- end -}}
+
+{{/* Browser- and gateway-reachable RustFS S3 endpoint. $(NODE_IP) is expanded by Kubernetes from
+     the NODE_IP downward-API env this chart defines before it uses this value. */}}
+{{- define "atlas.rustfsEndpoint" -}}
+{{- if .Values.rustfs.endpoint -}}
+{{- .Values.rustfs.endpoint -}}
+{{- else if .Values.rustfs.server.enabled -}}
+{{- printf "http://$(NODE_IP):%d" (int .Values.rustfs.server.s3NodePort) -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "atlas.stateBackupEndpoint" -}}
+{{- if and .Values.stateBackup.useRustfs (not .Values.stateBackup.endpoint) -}}
+{{- include "atlas.rustfsEndpoint" . -}}
+{{- else -}}
+{{- .Values.stateBackup.endpoint -}}
+{{- end -}}
+{{- end -}}
+
+{{/* Cluster-scoped names must be unique per release: two installs (or one next to the raw
+     deploy/k8s manifest, which owns `atlas-gateway-readonly`) would otherwise collide on the
+     ClusterRole/ClusterRoleBinding. */}}
+{{- define "atlas.clusterRoleName" -}}
+{{- printf "%s-%s-readonly" (include "atlas.fullname" .) (include "atlas.namespace" .) -}}
+{{- end -}}

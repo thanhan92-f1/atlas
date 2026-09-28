@@ -36,6 +36,46 @@ Expects to run in `ceph.rookNamespace` (default `rook-ceph`) with Rook's mon end
 and admin keyring Secret already present — this chart doesn't stand up Ceph itself, see
 `deploy/rook-ceph-lab/`.
 
+## RustFS object storage (server + gateway wiring)
+
+```bash
+helm install atlas ./deploy/helm/atlas --create-namespace --set auth.createSecret=true \
+  --set rustfs.enabled=true --set rustfs.driverMode=real --set rustfs.server.enabled=true \
+  --set stateBackup.enabled=true --set stateBackup.useRustfs=true
+```
+
+`rustfs.server.enabled` renders a single-replica RustFS (`templates/rustfs.yaml`, a templated mirror of
+`deploy/rustfs-lab/deployment.yaml`, image pinned to `rustfs/rustfs:1.0.0`) with NodePorts
+`rustfs.server.s3NodePort` (30900) / `consoleNodePort` (30901) and a CORS origin for the console's
+NodePort (browser uploads/downloads go straight to RustFS via presigned URLs, so the S3 port must be
+browser-reachable). `rustfs.server.generateCredentials` creates the `rustfs.credentialsSecret`
+Secret once (`lookup` + `randAlphaNum`, kept across upgrades, `helm.sh/resource-policy: keep`, never
+printed); set it false to supply your own. The gateway gets the endpoint, the credentials Secret name
+and namespace, and the access/secret key env, so bucket create/delete, signed discovery, the console
+self-test and DataBridge object migrations all work. `stateBackup.useRustfs` points the self-state
+backup at it (bucket created on first run). This is a **lab topology** (one volume, not HA) — for
+production point `rustfs.endpoint` at a real multi-drive/multi-node RustFS and leave the server off.
+`helm template` cannot `lookup`, so it renders throwaway credentials; only a real install persists them.
+
+## Raw-disk formatting from the console (`disks.enabled`)
+
+`disks.enabled=true` makes the Disks page able to wipe and format raw disks (ZFS pool create/destroy):
+the gateway pod runs **privileged** with hostPath mounts of the node's `/dev`, `/run/udev` and
+`/proc/1/mountinfo`, the ZFS backend is forced on in `real` mode with `ATLAS_ZFS_HOST=$(NODE_IP)`, and
+`ATLAS_HOST_MOUNTINFO_PATH` is set (see `docs/DISKS.md` for why each is needed). ZFS is node-local:
+pin the pod with `nodeSelector`, keep `replicaCount: 1` (the template fails otherwise), and run one
+disk-enabled gateway per node. The default image has `zfsutils-linux`; `Dockerfile.ceph` now does too.
+The Ceph-OSD path additionally needs Rook with `ROOK_ENABLE_DISCOVERY_DAEMON`.
+
+## Lab side-by-side install
+
+`scripts/helm-lab-remote.sh <host> <user> --set auth.createSecret=true` installs the chart as release
+`atlas-helm` in namespace `atlas-helm` from `values-lab.yaml` (own PVC, console NodePort 30520,
+RustFS 30920/30921, image `localhost/atlas-gateway:dev` already imported by `deploy-remote.sh`) next
+to the raw-manifest gateway. `namespace.create: false` is used there because `--create-namespace`
+already creates the namespace. Cluster-scoped RBAC names include the release namespace, so two
+installs (or the raw manifest's `atlas-gateway-readonly`) do not collide.
+
 ## Published images (0.4.0)
 
 Lab quickstart above keeps `localhost/atlas-gateway:dev`. A tagged release is

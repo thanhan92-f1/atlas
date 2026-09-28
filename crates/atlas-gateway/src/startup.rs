@@ -639,6 +639,7 @@ fn spawn_state_backup(
                     return;
                 }
             };
+        workers.set_interval("state_backup", secs);
         tracing::info!(secs, bucket, prefix, keep, "state backup worker started");
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(secs));
         loop {

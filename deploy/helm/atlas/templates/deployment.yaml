@@ -1,5 +1,8 @@
 # Copyright (c) 2026 ZyvorAI Labs Private Limited.
 # SPDX-License-Identifier: LicenseRef-Zyvor-Production-1.0
+{{- if and .Values.disks.enabled (gt (int .Values.replicaCount) 1) }}
+{{- fail "disks.enabled requires replicaCount: 1 (ZFS/raw disks are node-local; pin the pod with nodeSelector)" }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -85,9 +88,15 @@ spec:
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           securityContext:
+            {{- if .Values.disks.enabled }}
+            # Raw-disk formatting needs the device cgroup opened (privileged) plus the file
+            # capabilities the image sets on wipefs/zpool/zfs — see docs/DISKS.md.
+            privileged: true
+            {{- else }}
             allowPrivilegeEscalation: false
             capabilities:
               drop: ["ALL"]
+            {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
           env:
@@ -141,7 +150,7 @@ spec:
             - name: ATLAS_STATE_BACKUP_SECS
               value: {{ .Values.stateBackup.intervalSecs | quote }}
             - name: ATLAS_STATE_BACKUP_ENDPOINT
-              value: {{ .Values.stateBackup.endpoint | quote }}
+              value: {{ include "atlas.stateBackupEndpoint" . | quote }}
             - name: ATLAS_STATE_BACKUP_BUCKET
               value: {{ .Values.stateBackup.bucket | quote }}
             {{- if .Values.stateBackup.prefix }}
@@ -151,14 +160,24 @@ spec:
             - name: ATLAS_STATE_BACKUP_ACCESS_KEY
               valueFrom:
                 secretKeyRef:
+                  {{- if .Values.stateBackup.useRustfs }}
+                  name: {{ .Values.rustfs.credentialsSecret }}
+                  key: AWS_ACCESS_KEY_ID
+                  {{- else }}
                   name: {{ include "atlas.authSecretName" . }}
                   key: {{ .Values.stateBackup.accessKeySecretKey }}
+                  {{- end }}
                   optional: true
             - name: ATLAS_STATE_BACKUP_SECRET_KEY
               valueFrom:
                 secretKeyRef:
+                  {{- if .Values.stateBackup.useRustfs }}
+                  name: {{ .Values.rustfs.credentialsSecret }}
+                  key: AWS_SECRET_ACCESS_KEY
+                  {{- else }}
                   name: {{ include "atlas.authSecretName" . }}
                   key: {{ .Values.stateBackup.secretKeySecretKey }}
+                  {{- end }}
                   optional: true
             {{- end }}
             {{- if .Values.oidc.enabled }}
@@ -235,25 +254,45 @@ spec:
             - name: ATLAS_NFS_DRIVER_MODE
               value: {{ .Values.nfs.driverMode | default "fake" | quote }}
             {{- end }}
-            {{- if .Values.zfs.enabled }}
+            {{- if or .Values.zfs.enabled .Values.disks.enabled }}
             - name: ATLAS_ZFS_ENABLE
               value: "1"
             - name: ATLAS_ZFS_HOST
-              value: {{ .Values.zfs.host | quote }}
+              value: {{ .Values.disks.enabled | ternary "$(NODE_IP)" .Values.zfs.host | quote }}
             - name: ATLAS_ZFS_POOLS
               value: {{ .Values.zfs.pools | quote }}
             - name: ATLAS_ZFS_DRIVER_MODE
-              value: {{ .Values.zfs.driverMode | default "fake" | quote }}
+              value: {{ .Values.disks.enabled | ternary "real" (.Values.zfs.driverMode | default "fake") | quote }}
+            {{- end }}
+            {{- if .Values.disks.enabled }}
+            - name: ATLAS_HOST_MOUNTINFO_PATH
+              value: "/host-mountinfo"
             {{- end }}
             {{- if .Values.rustfs.enabled }}
             - name: ATLAS_RUSTFS_ENABLE
               value: "1"
             - name: ATLAS_RUSTFS_ENDPOINT
-              value: {{ .Values.rustfs.endpoint | quote }}
+              value: {{ include "atlas.rustfsEndpoint" . | quote }}
             - name: ATLAS_RUSTFS_BUCKETS
               value: {{ .Values.rustfs.buckets | quote }}
             - name: ATLAS_RUSTFS_DRIVER_MODE
               value: {{ .Values.rustfs.driverMode | default "fake" | quote }}
+            - name: ATLAS_RUSTFS_CREDENTIALS_SECRET
+              value: {{ .Values.rustfs.credentialsSecret | quote }}
+            - name: ATLAS_RUSTFS_CREDENTIALS_NAMESPACE
+              value: {{ include "atlas.namespace" . | quote }}
+            - name: ATLAS_RUSTFS_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.rustfs.credentialsSecret }}
+                  key: AWS_ACCESS_KEY_ID
+                  optional: true
+            - name: ATLAS_RUSTFS_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.rustfs.credentialsSecret }}
+                  key: AWS_SECRET_ACCESS_KEY
+                  optional: true
             {{- end }}
             {{- if .Values.service.https.enabled }}
             - name: ATLAS_HTTPS_ADDR
@@ -306,6 +345,16 @@ spec:
               mountPath: /etc/atlas-tls
               readOnly: true
             {{- end }}
+            {{- if .Values.disks.enabled }}
+            - name: host-dev
+              mountPath: /dev
+            - name: host-run-udev
+              mountPath: /run/udev
+              readOnly: true
+            - name: host-mountinfo
+              mountPath: /host-mountinfo
+              readOnly: true
+            {{- end }}
       volumes:
         {{- if .Values.ceph.enabled }}
         - name: ceph-config
@@ -321,6 +370,20 @@ spec:
           secret:
             secretName: atlas-tls
             optional: true
+        {{- end }}
+        {{- if .Values.disks.enabled }}
+        - name: host-dev
+          hostPath:
+            path: /dev
+            type: Directory
+        - name: host-run-udev
+          hostPath:
+            path: /run/udev
+            type: Directory
+        - name: host-mountinfo
+          hostPath:
+            path: /proc/1/mountinfo
+            type: File
         {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:

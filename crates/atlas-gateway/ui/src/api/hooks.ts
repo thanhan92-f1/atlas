@@ -8,7 +8,7 @@ import type {
   ActivityEvent, AlertRecord, AuditRow, BackupRecord, CephNodeDevice, ClusterHealthState, JobRecord, MetricForecast, MetricHistoryPoint, MetricSample, MetricsSummary, Osd,
   SnapshotSchedule, StorageBucket, StorageCluster, StoragePool, StorageSnapshot, StorageVolume,
   TenantPolicy, TenantQuota, VolumeProtectionStatus, ZfsBlockDevice,
-  MigrationSource, MigrationPlan, EdgeDbCluster, CdcStream, ValidationRun,
+  MigrationSource, MigrationPlan, EdgeDbCluster, CdcStream, ValidationRun, ObjectMigration
 } from "./types";
 
 const g = async <T,>(path: string): Promise<T> => (await http.get<T>(path)).data;
@@ -136,6 +136,7 @@ export const useSource = (id: string) => useApiQuery<MigrationSource>(["db-sourc
 export const usePlans = () => useApiQuery<MigrationPlan[]>(["db-plans"], "/databridge/plans", 6000);
 export const usePlan = (id: string) => useApiQuery<MigrationPlan>(["db-plan", id], `/databridge/plans/${id}`, 4000);
 export const useEdgeClusters = () => useApiQuery<EdgeDbCluster[]>(["db-edge"], "/databridge/edge-clusters", 8000);
+export const useObjectMigrations = () => useApiQuery<ObjectMigration[]>(["db-object"], "/databridge/object", 4000);
 export const useCdcStreams = () => useApiQuery<CdcStream[]>(["db-cdc"], "/databridge/cdc-streams", 4000);
 export const useValidations = (planId?: string) =>
   useApiQuery<ValidationRun[]>(["db-val", planId], `/databridge/validations${planId ? "?plan_id=" + planId : ""}`, 6000);
