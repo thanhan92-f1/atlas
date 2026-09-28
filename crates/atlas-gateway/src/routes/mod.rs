@@ -135,6 +135,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/rustfs/instances/{name}", delete(delete_rustfs_instance))
         .route("/rustfs/instances/{name}/activate", post(activate_rustfs_instance))
+        .route("/rustfs/instances/{name}/credentials", post(use_rustfs_credentials))
         .route("/rustfs/buckets/import", post(import_rustfs_buckets))
         .route("/rustfs/drives/from-device", post(provision_rustfs_drive))
         .route("/zfs/devices", get(list_zfs_devices))

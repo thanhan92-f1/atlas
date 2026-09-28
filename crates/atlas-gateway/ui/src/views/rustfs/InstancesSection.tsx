@@ -19,6 +19,7 @@ export default function InstancesSection() {
   const inv = useInvalidate();
   const refresh = () => inv("rustfs-instances", "jobs", "rustfs-drives");
   const [deploy, setDeploy] = useState(false);
+  const [credsFor, setCredsFor] = useState<string | null>(null);
 
   const usedClaims = new Set((instances || []).map((i) => i.claim).filter(Boolean));
   const claimOptions = [
@@ -85,6 +86,9 @@ export default function InstancesSection() {
                 Use for Atlas
               </Button>
             )}
+            {i.active && (
+              <Button size="sm" onClick={() => setCredsFor(i.name)}>Use different credentials…</Button>
+            )}
             {i.managed_by === "helm" && !i.active && (
               <Button
                 size="sm"
@@ -119,6 +123,39 @@ export default function InstancesSection() {
             },
             `deploy RustFS ${v.name}`,
             refresh,
+          );
+        }}
+      />
+      <FormModal
+        open={credsFor !== null}
+        onClose={() => setCredsFor(null)}
+        title={`Credentials for ${credsFor ?? ""}`}
+        submitLabel="Switch and restart"
+        danger
+        fields={[
+          {
+            name: "secret_name",
+            label: "Credentials Secret name",
+            placeholder: "rustfs-sdb-atlas-scoped",
+            hint:
+              "An existing Secret in Atlas's namespace with keys AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY " +
+              "— e.g. a least-privilege RustFS service account (Access → Service accounts, restricting policy " +
+              "deploy/rustfs-lab/atlas-service-policy.json). Atlas does not create this Secret for you.",
+          },
+        ]}
+        onSubmit={async (v) => {
+          if (!credsFor) return;
+          await confirmThen(
+            { title: "Switch credentials?", message: "The gateway restarts to pick up the new key.", confirmLabel: "Switch" },
+            () => {
+              submitJob(
+                "post",
+                `/rustfs/instances/${credsFor}/credentials`,
+                { secret_name: v.secret_name },
+                `switch ${credsFor} credentials`,
+                refresh,
+              ).catch(() => {});
+            },
           );
         }}
       />

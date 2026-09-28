@@ -138,6 +138,44 @@ alone; then it installs RustFS from the official chart on the resulting drive an
 `ATLAS_RUSTFS_AUTO_ACTIVATE=1`, points Atlas at it. Data already in a previous RustFS is not moved
 automatically — use Object Migrations.
 
+## Least-privilege credential for Atlas (do this before production)
+
+Every setup in this doc so far puts RustFS's **root** access/secret key in `rustfs.credentialsSecret` —
+fine for a lab, not for production: Atlas's own compromise would mean full control of the RustFS server
+(every bucket, every user, server config). RustFS's admin API is policy-driven like everything else in
+it (verified by reading the source: every admin handler calls `authorize_admin_request` against an
+`Action`, the same mechanism as S3 bucket actions — nothing is root-only), so a scoped credential covers
+everything the console's RustFS proxy (`routes/rustfs.rs`) forwards, and nothing else.
+
+**The policy** — [`deploy/rustfs-lab/atlas-service-policy.json`](../deploy/rustfs-lab/atlas-service-policy.json) —
+grants exactly the actions the proxy's allow-lists use, cross-checked against RustFS's own handler source
+(`crates/policy/src/policy/action.rs` and each `rustfs/src/admin/handlers/*.rs`'s `authorize_admin_request`
+call): bucket/object CRUD and configuration (versioning, lifecycle, policy, tagging, CORS, quota), and the
+admin actions behind Overview/Drives & pools/Access (server/storage/usage info, pools, heal, rebalance,
+users, groups, canned policies, service accounts). It does **not** grant KMS, replication, tiering, object
+lock configuration changes, server update/restart/config, or IAM import/export — those stay root-only,
+matching what the console already refuses to forward (see `admin_allowed`/`s3_allowed` in `routes/rustfs.rs`).
+A handful of read-only admin calls (pool/decommission/rebalance *status*, heal status, quota stats/check)
+have no explicit action check in the RustFS source as of this writing — they are covered by the same
+statements as their sibling write actions; if one ever 403s, add its specific action once identified.
+
+**Provisioning** (through the console you already have; nothing new to deploy):
+1. Storage → RustFS → Access → Service accounts. Leave "Owner access key" blank (creates it under the
+   currently-configured root user). Paste the policy JSON above into "Restricting policy". Create.
+2. Copy the one-time access/secret key the console shows (it cannot be retrieved again).
+3. `kubectl -n <namespace> create secret generic rustfs-sdb-atlas-scoped \`
+   `  --from-literal=AWS_ACCESS_KEY_ID=<copied> --from-literal=AWS_SECRET_ACCESS_KEY=<copied>` — Atlas
+   never creates this Secret itself (same "Atlas never writes secrets" rule as every other credential here).
+4. On the instance's row, **Use different credentials…** → the Secret name from step 3 → Switch and
+   restart. This patches only the credentials env vars (`POST /rustfs/instances/{name}/credentials`, no
+   new RBAC — it's the same own-Deployment `patch` the console's "Use for Atlas" already has) and keeps
+   the endpoint unchanged.
+
+Status: the policy is verified against RustFS's source, not yet exercised live with the scoped key end to
+end (that needs the key itself, which this flow deliberately never lets Atlas or its operator's tooling
+see except once, in the browser) — after switching, watch the Overview/Drives & pools/Access tabs and the
+bucket write path for any 403, and widen the specific missing action rather than reverting to root.
+
 ## Self-test (conformance check, console button)
 
 `POST /api/atlas/v1/backends/bkd_rustfs_lab/selftest` (body `{"region": "eu-west-1"}`, optional;

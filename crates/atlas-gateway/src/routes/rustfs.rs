@@ -546,10 +546,6 @@ async fn enqueue_instance_job(
 /// Patch the gateway's own Deployment so Atlas uses `inst` (endpoint, credentials Secret, and the
 /// state backup when it is enabled); the resulting rollout restarts the gateway. Returns the S3 port.
 async fn switch_atlas_to(s: &AppState, inst: &Instance) -> AppResult<i64> {
-    let k8s = s
-        .k8s
-        .as_ref()
-        .ok_or_else(|| AppError::Unavailable("Kubernetes is not available".into()))?;
     if inst.ready == 0 {
         return Err(AppError::Conflict("the instance is not ready yet".into()));
     }
@@ -561,22 +557,42 @@ async fn switch_atlas_to(s: &AppState, inst: &Instance) -> AppResult<i64> {
     } else {
         ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY")
     };
-    let endpoint = format!("http://$(NODE_IP):{port}");
+    repoint_credentials(s, Some(port), &inst.secret, ak_key, sk_key).await?;
+    Ok(port)
+}
+
+/// Patch the gateway's own Deployment to read its RustFS credentials (and, when the state backup is
+/// enabled, the backup's credentials) from `secret_name`/`ak_key`/`sk_key`. `port` also repoints the
+/// endpoint (switching instance); `None` leaves the endpoint as-is (same instance, a different — e.g.
+/// least-privilege — credential). The resulting rollout restarts the gateway.
+async fn repoint_credentials(
+    s: &AppState,
+    port: Option<i64>,
+    secret_name: &str,
+    ak_key: &str,
+    sk_key: &str,
+) -> AppResult<()> {
+    let k8s = s
+        .k8s
+        .as_ref()
+        .ok_or_else(|| AppError::Unavailable("Kubernetes is not available".into()))?;
     let secret_ref = |key: &str| {
-        json!({ "secretKeyRef": { "name": inst.secret, "key": key, "optional": true } })
+        json!({ "secretKeyRef": { "name": secret_name, "key": key, "optional": true } })
     };
     let mut env = vec![
-        json!({ "name": "ATLAS_RUSTFS_ENDPOINT", "value": endpoint }),
-        json!({ "name": "ATLAS_RUSTFS_CREDENTIALS_SECRET", "value": inst.secret }),
+        json!({ "name": "ATLAS_RUSTFS_CREDENTIALS_SECRET", "value": secret_name }),
         json!({ "name": "ATLAS_RUSTFS_ACCESS_KEY", "valueFrom": secret_ref(ak_key) }),
         json!({ "name": "ATLAS_RUSTFS_SECRET_KEY", "valueFrom": secret_ref(sk_key) }),
     ];
+    if let Some(port) = port {
+        env.push(json!({ "name": "ATLAS_RUSTFS_ENDPOINT", "value": format!("http://$(NODE_IP):{port}") }));
+    }
     if std::env::var("ATLAS_STATE_BACKUP_SECS").is_ok() {
-        env.extend([
-            json!({ "name": "ATLAS_STATE_BACKUP_ENDPOINT", "value": endpoint }),
-            json!({ "name": "ATLAS_STATE_BACKUP_ACCESS_KEY", "valueFrom": secret_ref(ak_key) }),
-            json!({ "name": "ATLAS_STATE_BACKUP_SECRET_KEY", "valueFrom": secret_ref(sk_key) }),
-        ]);
+        env.push(json!({ "name": "ATLAS_STATE_BACKUP_ACCESS_KEY", "valueFrom": secret_ref(ak_key) }));
+        env.push(json!({ "name": "ATLAS_STATE_BACKUP_SECRET_KEY", "valueFrom": secret_ref(sk_key) }));
+        if let Some(port) = port {
+            env.push(json!({ "name": "ATLAS_STATE_BACKUP_ENDPOINT", "value": format!("http://$(NODE_IP):{port}") }));
+        }
     }
     let deployment =
         std::env::var("ATLAS_DEPLOYMENT_NAME").unwrap_or_else(|_| "atlas-gateway".into());
@@ -589,7 +605,65 @@ async fn switch_atlas_to(s: &AppState, inst: &Instance) -> AppResult<i64> {
     )
     .await
     .map_err(|e| AppError::Driver(e.to_string()))?;
-    Ok(port)
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct UseCredentialsBody {
+    /// Name of an existing Secret (in the gateway's namespace) with keys AWS_ACCESS_KEY_ID /
+    /// AWS_SECRET_ACCESS_KEY — e.g. one holding a least-privilege RustFS service account created via
+    /// Storage -> RustFS -> Access -> Service accounts (restricting policy:
+    /// deploy/rustfs-lab/atlas-service-policy.json). Atlas never writes this Secret itself; create it
+    /// with `kubectl create secret generic <name> --from-literal=AWS_ACCESS_KEY_ID=... --from-literal=AWS_SECRET_ACCESS_KEY=...`
+    /// after copying the one-time credentials the console showed you.
+    secret_name: String,
+}
+
+/// `POST /rustfs/instances/{name}/credentials` — keep using this instance (same endpoint) but read
+/// its access/secret key from a *different* Secret, e.g. a least-privilege credential instead of the
+/// server's root key. No new RBAC: the gateway only patches its own Deployment, as `activate` does.
+pub(crate) async fn use_rustfs_credentials(
+    State(s): State<AppState>,
+    Extension(actor): Extension<Actor>,
+    Path(name): Path<String>,
+    Json(body): Json<UseCredentialsBody>,
+) -> AppResult<(StatusCode, Json<Value>)> {
+    crate::auth::require_role(s.config.auth_required, &actor, crate::auth::ROLE_ADMIN)?;
+    super::util::validate_k8s_name(&body.secret_name)?;
+    let instances = find_instances(&s).await?;
+    let inst = instances
+        .iter()
+        .find(|i| i.name == name)
+        .ok_or_else(|| AppError::NotFound(format!("RustFS instance {name}")))?;
+    if !is_active(&s, inst) {
+        return Err(AppError::Conflict(
+            "Atlas is not currently using this instance — activate it first".into(),
+        ));
+    }
+    repoint_credentials(
+        &s,
+        None,
+        &body.secret_name,
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+    )
+    .await?;
+    let _ = atlas_inventory::audit::record(
+        &s.pool,
+        None,
+        &actor.id,
+        "rustfs.instance.credentials_changed",
+        "rustfs-instance",
+        &name,
+        "success",
+        Some(json!({ "secret_name": body.secret_name })),
+        None,
+    )
+    .await;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(json!({ "instance": name, "secret_name": body.secret_name, "restarting": true })),
+    ))
 }
 
 /// Opt-in install-time automation (`ATLAS_RUSTFS_AUTO_DEVICE=/dev/sdX`): get RustFS running on one
