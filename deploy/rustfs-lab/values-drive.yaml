@@ -1,5 +1,5 @@
 # Copyright (c) 2026 ZyvorAI Labs Private Limited.
-# SPDX-License-Identifier: LicenseRef-Zyvor-Production-1.0
+# SPDX-License-Identifier: Apache-2.0
 # Values for RustFS's OFFICIAL Helm chart (https://charts.rustfs.com, vendored at
 # deploy/helm/atlas/charts/rustfs-1.0.0.tgz), standalone mode, with the data on a drive prepared
 # from the console's Disks page ("RustFS drive"): that flow leaves a PVC named `rustfs-<disk>-data`

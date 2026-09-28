@@ -1,13 +1,12 @@
 <!-- Copyright (c) 2026 ZyvorAI Labs Private Limited. -->
-<!-- SPDX-License-Identifier: LicenseRef-Zyvor-Production-1.0 -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 
 # Contributor License Agreement (CLA)
 
 Thank you for your interest in contributing to Atlas, developed by
 **ZyvorAI Labs Private Limited** ("Zyvor", "we", "us").
 
-Atlas is licensed under the [Zyvor Production License v1.0](LICENSE).
-Production use requires a separate commercial license from Zyvor. To accept
+Atlas is licensed under the [Apache License, Version 2.0](LICENSE). To accept
 your contribution, we need you to agree to the terms below.
 
 This CLA is a short grant of rights. It does **not** transfer copyright
@@ -31,8 +30,8 @@ irrevocable license to:
    publicly perform, sublicense, and distribute your Contribution and such
    derivative works; and
 2. License your Contribution (and derivative works thereof) under the
-   **Zyvor Production License**, under any **commercial license** Zyvor
-   offers for Atlas, and/or under any other license Zyvor offers for Atlas.
+   **Apache License, Version 2.0**, and/or under any other license Zyvor
+   offers for Atlas.
 
 You also grant Zyvor a perpetual, worldwide, non-exclusive, royalty-free,
 irrevocable patent license to make, have made, use, sell, offer to sell,
@@ -54,10 +53,9 @@ You represent that:
 
 ## 4. Purpose
 
-You acknowledge that Zyvor offers Atlas under the Zyvor Production License
-for non-production use and under separate commercial licenses for production
-use, and that the grants in §2 exist so Zyvor can continue that model for
-Contributions without requiring a separate negotiation for each Contribution.
+You acknowledge that Zyvor offers Atlas under the Apache License, Version 2.0
+and that the grants in §2 exist so Zyvor can keep licensing Atlas, including
+your Contribution, without a separate negotiation for each Contribution.
 
 ## 5. How to accept
 

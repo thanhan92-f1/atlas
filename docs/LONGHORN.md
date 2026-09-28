@@ -1,5 +1,5 @@
 <!-- Copyright (c) 2026 ZyvorAI Labs Private Limited. -->
-<!-- SPDX-License-Identifier: LicenseRef-Zyvor-Production-1.0 -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 # Longhorn backend (first integration slice)
 
 Atlas can discover Longhorn v1beta2 `nodes` and `volumes` through the Kubernetes API. Enable it

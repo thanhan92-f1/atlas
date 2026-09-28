@@ -1,5 +1,5 @@
 <!-- Copyright (c) 2026 ZyvorAI Labs Private Limited. -->
-<!-- SPDX-License-Identifier: LicenseRef-Zyvor-Production-1.0 -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 # Changelog
 
 All notable changes to Atlas will be documented in this file.
@@ -10,7 +10,14 @@ before `0.2.0` were not tracked here — see `git log` for that history.
 ## [Unreleased]
 
 ### Changed
-- README restyled as a landing page (blue/white hero with light/dark variants, capability tiles, Day/Night console overview); no wording change to the licensing sections.
+- Relicensed from the Zyvor Production License v1.0 to the **Apache License, Version 2.0**
+  ([LICENSE](LICENSE), SPDX `Apache-2.0`): use, modification and redistribution — including production,
+  SaaS and managed services — are permitted under the license's terms; there is no longer a commercial
+  license requirement. Source headers, Cargo/npm metadata, `NOTICE`, `docs/LICENSING.md`, the README and the
+  website were updated; `LICENSES/Apache-2.0.txt` replaces the old license text. Releases already published
+  under an earlier license keep the terms they were published with (see `docs/LICENSING.md`). The CLA/DCO now
+  refer to Apache-2.0; the CLA's grant wording should be reviewed by counsel.
+- README restyled as a landing page (blue/white hero with light/dark variants, capability tiles, Day/Night console overview).
 
 ## [0.4.0] — 2026-09-21
 

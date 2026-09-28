@@ -1,5 +1,5 @@
 // Copyright (c) 2026 ZyvorAI Labs Private Limited.
-// SPDX-License-Identifier: LicenseRef-Zyvor-Production-1.0
+// SPDX-License-Identifier: Apache-2.0
 
 //! Object-storage migration — the *object* leg of Atlas DataBridge (AWS S3 → RustFS or Ceph RGW).
 //!

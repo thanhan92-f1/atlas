@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Copyright (c) 2026 ZyvorAI Labs Private Limited.
-# SPDX-License-Identifier: LicenseRef-Zyvor-Production-1.0
+# SPDX-License-Identifier: Apache-2.0
 # Deploy a RustFS server (RustFS's official Helm chart, standalone) on a drive prepared from the
 # console's Disks page, next to the lab's existing RustFS. RustFS cannot grow a single-drive
 # deployment in place, so this is a NEW instance on its own ports; move the data with the console's

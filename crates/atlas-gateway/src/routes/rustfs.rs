@@ -1,5 +1,5 @@
 // Copyright (c) 2026 ZyvorAI Labs Private Limited.
-// SPDX-License-Identifier: LicenseRef-Zyvor-Production-1.0
+// SPDX-License-Identifier: Apache-2.0
 //! Admin proxy to the RustFS server: `/rustfs/proxy/admin/...` forwards to RustFS's own native
 //! admin API (`/rustfs/admin/v3/...`, plain JSON) and `/rustfs/proxy/s3/{bucket}?<sub-resource>`
 //! to the S3 bucket configuration calls (versioning, lifecycle, policy, ...). RustFS's JSON/XML is

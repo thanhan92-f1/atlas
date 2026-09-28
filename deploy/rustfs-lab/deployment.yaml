@@ -1,5 +1,5 @@
 # Copyright (c) 2026 ZyvorAI Labs Private Limited.
-# SPDX-License-Identifier: LicenseRef-Zyvor-Production-1.0
+# SPDX-License-Identifier: Apache-2.0
 # RustFS (https://github.com/rustfs/rustfs) — the S3-compatible object store Atlas uses as its
 # primary object backend. Single replica, single volume: a lab target that exercises Atlas's real
 # RustFS write path (bucket create/delete, presigned upload/download), not an HA topology — a

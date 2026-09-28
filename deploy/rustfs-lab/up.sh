@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Copyright (c) 2026 ZyvorAI Labs Private Limited.
-# SPDX-License-Identifier: LicenseRef-Zyvor-Production-1.0
+# SPDX-License-Identifier: Apache-2.0
 # Stand up a RustFS server (Atlas's primary S3-compatible object backend) in the lab k3s cluster.
 # See deployment.yaml and docs/RUSTFS.md. scripts/deploy-remote.sh runs this on every deploy
 # (idempotent), so the gateway's ATLAS_RUSTFS_DRIVER_MODE=real always has a server to talk to.

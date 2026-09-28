@@ -1,5 +1,5 @@
 // Copyright (c) 2026 ZyvorAI Labs Private Limited.
-// SPDX-License-Identifier: LicenseRef-Zyvor-Production-1.0
+// SPDX-License-Identifier: Apache-2.0
 // Per-bucket settings for RustFS buckets: versioning, lifecycle, access policy, quota and object
 // versions. Every call goes through the gateway's allow-listed RustFS proxy
 // (`/rustfs/proxy/s3/{bucket}?<sub-resource>` and `/rustfs/proxy/admin/v3/quota/{bucket}`), which

@@ -1,5 +1,5 @@
 // Copyright (c) 2026 ZyvorAI Labs Private Limited.
-// SPDX-License-Identifier: LicenseRef-Zyvor-Production-1.0
+// SPDX-License-Identifier: Apache-2.0
 import type {ReactNode} from 'react';
 import clsx from 'clsx';
 import Link from '@docusaurus/Link';
@@ -80,12 +80,11 @@ function TrustBand() {
         <Reveal className={styles.trustGrid}>
           <div>
             <Heading as="h3" className={styles.sectionHeading}>
-              Free to evaluate. Licensed for production.
+              Open source. Apache License 2.0.
             </Heading>
             <p className={styles.lede}>
-              The Zyvor Production License covers development, testing, and
-              non-production labs. Production, customer workloads, and
-              revenue-generating services need a paid commercial license.
+              Atlas is Apache-2.0: run it, modify it, and ship it — in
+              production, in managed services, and in your own products.
             </p>
             <Link to="/docs/licensing">Read the licensing guide →</Link>
           </div>
@@ -95,8 +94,8 @@ function TrustBand() {
               alt="CI status"
             />
             <img
-              src="https://img.shields.io/badge/License-Zyvor%20Production%20v1.0-blue.svg"
-              alt="Zyvor Production License v1.0"
+              src="https://img.shields.io/badge/License-Apache%202.0-blue.svg"
+              alt="Apache License 2.0"
             />
           </div>
         </Reveal>
@@ -111,12 +110,11 @@ function EnterpriseCTA() {
       <div className="container text--center">
         <Reveal>
           <Heading as="h2" className={styles.sectionHeading}>
-            Production use needs a commercial license
+            Running Atlas in production?
           </Heading>
           <p className={styles.enterpriseCopy}>
-            Evaluation, development, and laboratory use are free. Production
-            deployments, SaaS, managed services, and OEM use are licensed
-            separately by Zyvor.
+            The software is free under Apache-2.0. Talk to Zyvor about
+            deployment help, support, and integrations.
           </p>
           <Link
             className={clsx('button button--primary button--lg', styles.pill)}

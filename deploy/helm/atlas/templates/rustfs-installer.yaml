@@ -1,5 +1,5 @@
 # Copyright (c) 2026 ZyvorAI Labs Private Limited.
-# SPDX-License-Identifier: LicenseRef-Zyvor-Production-1.0
+# SPDX-License-Identifier: Apache-2.0
 # ServiceAccount + namespaced Role for the throwaway installer Job the console launches to
 # `helm install` RustFS's official chart (crates/atlas-jobs/src/dispatch/rustfs_instance.rs), scoped to
 # what that chart renders — the gateway itself never gets these rights.

@@ -1,5 +1,5 @@
 // Copyright (c) 2026 ZyvorAI Labs Private Limited.
-// SPDX-License-Identifier: LicenseRef-Zyvor-Production-1.0
+// SPDX-License-Identifier: Apache-2.0
 //! A generic SigV4-signed HTTP client for one RustFS server: the native admin API
 //! (`/rustfs/admin/v3/...`, plain JSON) and the S3 bucket sub-resources (versioning, lifecycle,
 //! policy, ...). RustFS's own `rustfs-madmin` client signs the same way (service `s3`, region

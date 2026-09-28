@@ -1,5 +1,5 @@
 // Copyright (c) 2026 ZyvorAI Labs Private Limited.
-// SPDX-License-Identifier: LicenseRef-Zyvor-Production-1.0
+// SPDX-License-Identifier: Apache-2.0
 import {themes as prismThemes} from 'prism-react-renderer';
 import type {Config} from '@docusaurus/types';
 import type * as Preset from '@docusaurus/preset-classic';
@@ -114,11 +114,10 @@ const config: Config = {
           title: 'Zyvor Enterprise',
           items: [
             {label: 'zyvor.dev', href: 'https://zyvor.dev'},
-            {label: 'Commercial license', href: 'https://zyvor.dev'},
           ],
         },
       ],
-      copyright: `Copyright © ${new Date().getFullYear()} ZyvorAI Labs. Zyvor Production License v1.0.`,
+      copyright: `Copyright © ${new Date().getFullYear()} ZyvorAI Labs. Apache License 2.0.`,
     },
     prism: {
       theme: prismThemes.github,

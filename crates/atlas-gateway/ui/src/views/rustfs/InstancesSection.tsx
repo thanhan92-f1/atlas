@@ -1,5 +1,5 @@
 // Copyright (c) 2026 ZyvorAI Labs Private Limited.
-// SPDX-License-Identifier: LicenseRef-Zyvor-Production-1.0
+// SPDX-License-Identifier: Apache-2.0
 // RustFS servers in the gateway's namespace: install one from RustFS's own Helm chart (optionally
 // on a drive prepared from the Disks page), point Atlas at it, or remove it. The heavy lifting is
 // server-side (an installer Job / a patch of the gateway's own Deployment).

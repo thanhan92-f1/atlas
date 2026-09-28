@@ -1,5 +1,5 @@
 <!-- Copyright (c) 2026 ZyvorAI Labs Private Limited. -->
-<!-- SPDX-License-Identifier: LicenseRef-Zyvor-Production-1.0 -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 <div align="center">
 
 <picture>
@@ -15,7 +15,7 @@ The **central storage control plane** for the Zyvor suite.<br>
 Products call stable Atlas APIs; Atlas maps intent to Ceph, NFS, ZFS, Longhorn and RustFS through pluggable drivers.
 
 [![CI](https://img.shields.io/github/actions/workflow/status/zyvorai/atlas/ci.yml?branch=main&style=flat-square&labelColor=1d1d1f&label=CI)](https://github.com/zyvorai/atlas/actions/workflows/ci.yml)
-[![License: Zyvor Production v1.0](https://img.shields.io/badge/license-Zyvor%20Production%20v1.0-0071e3?style=flat-square&labelColor=1d1d1f)](LICENSE)
+[![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-0071e3?style=flat-square&labelColor=1d1d1f)](LICENSE)
 [![Version](https://img.shields.io/badge/version-0.4.0-0071e3?style=flat-square&labelColor=1d1d1f)](CHANGELOG.md)
 [![Docs](https://img.shields.io/badge/docs-zyvorai.github.io%2Fatlas-0071e3?style=flat-square&labelColor=1d1d1f)](https://zyvorai.github.io/atlas/)
 
@@ -60,8 +60,8 @@ Deploy to a remote k3s host:
 
 | Track | Where |
 | --- | --- |
-| **Non-production use** (free under the Zyvor Production License) | This repo |
-| **Production / commercial license** | [https://zyvor.dev](https://zyvor.dev) |
+| **Source, issues, releases** (Apache License 2.0) | This repo |
+| **Project / contact** | [https://zyvor.dev](https://zyvor.dev) |
 | **Docs site** | https://zyvorai.github.io/atlas/ |
 
 More: [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md) · [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) · [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
@@ -155,25 +155,15 @@ Full write-up: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Important boundaries
 
-What's free under the Zyvor Production License vs. what needs a commercial license
-([full guide](docs/LICENSING.md)):
-
-| Use case | Allowed without a paid license? |
-| --- | --- |
-| Development, testing, evaluation, research, education | Yes |
-| Non-production laboratory and proof-of-concept use | Yes |
-| Production environments and customer workloads | No — needs a commercial license |
-| SaaS, managed services, OEM, appliances | No — needs a commercial license |
-| Redistribution or resale | No — needs written permission and a commercial license |
+Atlas is Apache-2.0 software: use, modify and redistribute it, including in production and in commercial
+products, under the terms of the license ([full guide](docs/LICENSING.md)). Boundaries that are about
+maturity, not licensing, live in [docs/STATUS.md](docs/STATUS.md): what is verified on real infrastructure,
+and what is lab-verified only.
 
 ## License
 
-Licensed under the **[Zyvor Production License v1.0](LICENSE)**.
-
-- **Free** for development, testing, evaluation, research, education, and non-production labs
-- **Paid commercial license required** for production, customer workloads, SaaS, managed services, OEM, redistribution, and other revenue-generating use
-
-Commercial terms are issued separately: [https://zyvor.dev](https://zyvor.dev). See [docs/LICENSING.md](docs/LICENSING.md). Contributions: [CLA.md](CLA.md) + [DCO.md](DCO.md) (`git commit -s`),
+Licensed under the **[Apache License, Version 2.0](LICENSE)**. See [docs/LICENSING.md](docs/LICENSING.md)
+and [NOTICE](NOTICE). Contributions: [CLA.md](CLA.md) + [DCO.md](DCO.md) (`git commit -s`),
 governed by our [Code of Conduct](CODE_OF_CONDUCT.md).
 
 <div align="center">

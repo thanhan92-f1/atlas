@@ -1,5 +1,5 @@
 // Copyright (c) 2026 ZyvorAI Labs Private Limited.
-// SPDX-License-Identifier: LicenseRef-Zyvor-Production-1.0
+// SPDX-License-Identifier: Apache-2.0
 //! RustFS storage driver — an S3-compatible object backend behind `StorageDriver`.
 //!
 //! RustFS (https://github.com/rustfs/rustfs) is treated as a one-cluster backend:

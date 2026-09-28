@@ -1,5 +1,5 @@
 // Copyright (c) 2026 ZyvorAI Labs Private Limited.
-// SPDX-License-Identifier: LicenseRef-Zyvor-Production-1.0
+// SPDX-License-Identifier: Apache-2.0
 // RustFS administration: cluster state, drives/pools (with disk formatting), and IAM access — all via
 // RustFS's own admin API, forwarded and signed by the gateway (`/rustfs/proxy/admin/...`).
 import { useState } from "react";

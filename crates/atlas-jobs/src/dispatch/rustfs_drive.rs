@@ -1,5 +1,5 @@
 // Copyright (c) 2026 ZyvorAI Labs Private Limited.
-// SPDX-License-Identifier: LicenseRef-Zyvor-Production-1.0
+// SPDX-License-Identifier: Apache-2.0
 //! Provision a raw local disk as a RustFS drive. RustFS never formats or mounts disks — it uses a
 //! directory Kubernetes gives it (the official chart takes a PVC). So the steps are the Kubernetes
 //! side of that: check the disk is safe to take, format it XFS and mount it on the host, then expose

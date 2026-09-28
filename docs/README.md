@@ -1,5 +1,5 @@
 <!-- Copyright (c) 2026 ZyvorAI Labs Private Limited. -->
-<!-- SPDX-License-Identifier: LicenseRef-Zyvor-Production-1.0 -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 # Atlas Documentation Index
 
 Start at the top-level [README](../README.md) for the overview and quickstart.
@@ -17,7 +17,7 @@ Start at the top-level [README](../README.md) for the overview and quickstart.
 - **[HA.md](HA.md)** — durable job queue, leader lease, Postgres cutover plan.
 - **[DATABRIDGE.md](DATABRIDGE.md)** — cloud-to-edge DB / object migration control plane.
 - **[ROADMAP.md](ROADMAP.md)** — what's shipped and what's deferred. Maturity is [STATUS.md](STATUS.md).
-- **[LICENSING.md](LICENSING.md)** — Zyvor Production License v1.0; SPDX / CLA / DCO.
+- **[LICENSING.md](LICENSING.md)** — Apache License 2.0; SPDX / CLA / DCO.
 - **[../CONTRIBUTING.md](../CONTRIBUTING.md)** — conventions; how to add an endpoint / driver / migration.
 - **[../CLA.md](../CLA.md)** · **[../DCO.md](../DCO.md)** · **[../NOTICE](../NOTICE)** — contribution + attribution.
 

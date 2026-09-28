@@ -1,5 +1,5 @@
 // Copyright (c) 2026 ZyvorAI Labs Private Limited.
-// SPDX-License-Identifier: LicenseRef-Zyvor-Production-1.0
+// SPDX-License-Identifier: Apache-2.0
 //! Install/remove a RustFS server with RustFS's OWN Helm chart (vendored in the gateway image at
 //! `/usr/share/atlas/charts/`). The `helm` run happens in a throwaway Job under the dedicated
 //! `atlas-rustfs-installer` ServiceAccount — a namespaced Role that can manage exactly what the chart

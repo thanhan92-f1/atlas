@@ -1,5 +1,5 @@
 // Copyright (c) 2026 ZyvorAI Labs Private Limited.
-// SPDX-License-Identifier: LicenseRef-Zyvor-Production-1.0
+// SPDX-License-Identifier: Apache-2.0
 //! Read-only Longhorn discovery through its Kubernetes CRDs. Volume mutations remain on the
 //! existing Atlas Kubernetes PVC path; this driver never claims native snapshot/backup support.
 

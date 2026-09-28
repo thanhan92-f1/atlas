@@ -1,5 +1,5 @@
 // Copyright (c) 2026 ZyvorAI Labs Private Limited.
-// SPDX-License-Identifier: LicenseRef-Zyvor-Production-1.0
+// SPDX-License-Identifier: Apache-2.0
 // Calls to RustFS's native admin API through the gateway's allow-listed, server-signed proxy.
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { http, isUnauthorized, toast } from "../../api/client";

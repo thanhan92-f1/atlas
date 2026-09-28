@@ -1,5 +1,5 @@
 // Copyright (c) 2026 ZyvorAI Labs Private Limited.
-// SPDX-License-Identifier: LicenseRef-Zyvor-Production-1.0
+// SPDX-License-Identifier: Apache-2.0
 //! `POST /buckets` backend selection: RustFS is the default when `backend_id` is omitted;
 //! `"backend_id": "bkd_ceph_lab"` keeps the original Rook/RGW path working unchanged. No real k8s
 //! cluster is attached in these tests, so every job below reaches a clean `failed` state (never a

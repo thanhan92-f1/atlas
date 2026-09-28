@@ -1,5 +1,5 @@
 <!-- Copyright (c) 2026 ZyvorAI Labs Private Limited. -->
-<!-- SPDX-License-Identifier: LicenseRef-Zyvor-Production-1.0 -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 # Atlas — Zyvor Storage Control Plane
 
 Atlas is the central storage control plane for the Zyvor product suite. Products (Zeus OS/v9s,
@@ -78,10 +78,9 @@ QoS), DataBridge CDC self-heal, upgrade pre-flight + rollback, k6 load/performan
 (read-path + write-path), and cross-cluster DR **scaffolding** (RBD-mirroring
 peers/mirrors/failover API + jobs).
 
-**Licensed** under the [Zyvor Production License v1.0](LICENSE)
-(`LicenseRef-Zyvor-Production-1.0`): free for non-production use; production, SaaS,
-managed services, OEM, and redistribution need a separate paid commercial license.
-See [`docs/LICENSING.md`](docs/LICENSING.md). Don't weaken or remove license notices,
+**Licensed** under the [Apache License 2.0](LICENSE) (`Apache-2.0`; relicensed from the Zyvor
+Production License v1.0 at the maintainer's explicit request — history in
+[`docs/LICENSING.md`](docs/LICENSING.md)). Don't weaken or remove license notices,
 [`CLA.md`](CLA.md), [`DCO.md`](DCO.md), or [`NOTICE`](NOTICE) without an explicit human
 request. There is **no** runtime license-key or trial/JWT gate.
 
@@ -121,7 +120,7 @@ the `rbd mirror` paths are unverified), per-product integrations beyond the gRPC
 
 ## Conventions
 - Every source file begins with a Zyvor copyright line plus
-  `SPDX-License-Identifier: LicenseRef-Zyvor-Production-1.0`
+  `SPDX-License-Identifier: Apache-2.0`
   (enforced by `make headers` / CI). Don't weaken license notices, [`CLA.md`](CLA.md),
   [`DCO.md`](DCO.md), or [`NOTICE`](NOTICE) without an explicit human request.
 - Match the monorepo Rust stack: axum 0.8, `sqlx::Any` (SQLite/Postgres, `$N` placeholders — no

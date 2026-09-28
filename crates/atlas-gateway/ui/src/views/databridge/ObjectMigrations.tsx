@@ -1,5 +1,5 @@
 // Copyright (c) 2026 ZyvorAI Labs Private Limited.
-// SPDX-License-Identifier: LicenseRef-Zyvor-Production-1.0
+// SPDX-License-Identifier: Apache-2.0
 // Object-storage migration (the DataBridge object leg): copy one S3 bucket into another — RustFS by
 // default. Either side can be an Atlas backend (RustFS), in which case the endpoint and the
 // credentials Secret are filled in server-side and no key is ever typed here.
