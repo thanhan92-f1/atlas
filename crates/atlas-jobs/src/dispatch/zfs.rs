@@ -71,8 +71,30 @@ pub(crate) async fn dispatch_zfs(
         }
         if wipe_existing {
             atlas_driver_zfs::wipe_device(&device_path).await?;
-            let recheck = atlas_driver_zfs::inspect_device(&device_path).await?;
-            if let Some(reason) = recheck.refusal_reason_after_wipe() {
+            // wipefs -a itself is synchronous, but re-probing the device right after can still
+            // see a stale udev-cached pttype/fstype for a short window — the same
+            // udev-database-propagation lag responsible for zpool_create's own reopen race (see
+            // its doc comment). Confirmed live: a recheck here reported a leftover "gpt" pttype
+            // immediately after a wipe that a plain read-only re-probe moments later showed was
+            // already fully clean. Retry the recheck itself before giving up.
+            const MAX_RECHECK_ATTEMPTS: u32 = 5;
+            let mut last_reason = None;
+            for attempt in 1..=MAX_RECHECK_ATTEMPTS {
+                let recheck = atlas_driver_zfs::inspect_device(&device_path).await?;
+                match recheck.refusal_reason_after_wipe() {
+                    None => {
+                        last_reason = None;
+                        break;
+                    }
+                    Some(reason) => {
+                        last_reason = Some(reason);
+                        if attempt < MAX_RECHECK_ATTEMPTS {
+                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        }
+                    }
+                }
+            }
+            if let Some(reason) = last_reason {
                 anyhow::bail!("refusing to format {device_path} even after wipe: {reason}");
             }
         } else if let Some(reason) = check.refusal_reason() {
