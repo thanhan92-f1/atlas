@@ -119,6 +119,7 @@ export default function BucketSettings({ bucket, onClose }: { bucket: StorageBuc
   }, [name]);
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- fetch-on-mount: the loader's state updates are the result of the request, not a render loop
     if (name) loadVersioning();
   }, [name, loadVersioning]);
 
@@ -205,6 +206,7 @@ function LifecycleTab({ bucket }: { bucket: string }) {
     }
   }, [bucket]);
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- fetch-on-mount: the loader's state updates are the result of the request, not a render loop
     load();
   }, [load]);
 
@@ -343,6 +345,7 @@ function AccessTab({ bucket }: { bucket: string }) {
     }
   }, [bucket]);
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- fetch-on-mount: the loader's state updates are the result of the request, not a render loop
     load();
   }, [load]);
 
@@ -442,6 +445,7 @@ function QuotaTab({ bucket }: { bucket: string }) {
     }
   }, [bucket]);
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- fetch-on-mount: the loader's state updates are the result of the request, not a render loop
     load();
   }, [load]);
 
@@ -554,6 +558,7 @@ function VersionsTab({ bucket }: { bucket: string }) {
     }
   }, [bucket]);
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- fetch-on-mount: the loader's state updates are the result of the request, not a render loop
     load();
   }, [load]);
   return (
