@@ -48,7 +48,7 @@ Each crate has its own `README.md`:
 | [`atlas-discovery`](../crates/atlas-discovery/README.md) | discovery worker |
 | `atlas-databridge` | cloud-to-edge DB + object migration control plane |
 | [`atlas-gateway`](../crates/atlas-gateway/README.md) | axum server (bin) |
-| [`atlas-cli`](../crates/atlas-cli/README.md) | `atlasctl` REST client |
+| [`atlasctl`](../crates/atlasctl/README.md) | REST client |
 
 ## Design authority
 `Zyvor_Ceph_Integration_Developer_Implementation_Plan.pdf` — section refs (e.g. "PDF §10.2")

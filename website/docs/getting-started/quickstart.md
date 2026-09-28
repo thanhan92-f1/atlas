@@ -13,7 +13,7 @@ Run Atlas locally with the fake Ceph driver — no cluster required.
 ```bash
 make run
 # Console: http://127.0.0.1:5110
-cargo run -p atlas-cli -- --base-url http://127.0.0.1:5110 health
+cargo run -p atlasctl -- --base-url http://127.0.0.1:5110 health
 ```
 
 Default console login is `admin` with the gateway password for your deployment

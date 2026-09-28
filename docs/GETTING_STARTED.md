@@ -32,16 +32,16 @@ On startup the gateway:
 ## Talk to it with `atlasctl`
 
 ```bash
-cargo run -p atlas-cli -- health
+cargo run -p atlasctl -- health
 # or: make status
 #     make deploy-remote H=<host> U=sus
 #     make deploy-ceph H=<host> U=sus
 #     make help
-cargo run -p atlas-cli -- discover
-cargo run -p atlas-cli -- clusters
-cargo run -p atlas-cli -- pools
-cargo run -p atlas-cli -- volumes
-cargo run -p atlas-cli -- metrics
+cargo run -p atlasctl -- discover
+cargo run -p atlasctl -- clusters
+cargo run -p atlasctl -- pools
+cargo run -p atlasctl -- volumes
+cargo run -p atlasctl -- metrics
 ```
 
 Or with `curl`:
@@ -62,7 +62,7 @@ Set `KUBECONFIG` (or `ATLAS_KUBECONFIG`) and the `/storage-classes`, `/kubernete
 
 ```bash
 KUBECONFIG=~/.kube/config make run
-cargo run -p atlas-cli -- storage-classes
+cargo run -p atlasctl -- storage-classes
 ```
 
 ## Run the tests

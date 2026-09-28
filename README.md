@@ -42,7 +42,7 @@ endpoints · **3** access surfaces (REST · gRPC · SSE)
 ```bash
 make run
 # Console → http://127.0.0.1:5110
-cargo run -p atlas-cli -- --base-url http://127.0.0.1:5110 health
+cargo run -p atlasctl -- --base-url http://127.0.0.1:5110 health
 ```
 
 No Ceph cluster needed to try it — `make run` starts the gateway against a fake driver so

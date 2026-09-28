@@ -23,7 +23,7 @@ COPY --from=ui /ui/dist crates/atlas-gateway/ui/dist
 # Build the real MongoDB (pure Rust) + SQL Server (tiberius) + Oracle connectors and precise CDC lag in.
 # The `oracle` crate vendors ODPI-C (compiles with the toolchain here) and dlopens the Oracle Instant
 # Client at *runtime* — so no OCI libs are needed at build time, only in the runtime stage below.
-RUN cargo build --release -p atlas-gateway -p atlas-cli \
+RUN cargo build --release -p atlas-gateway -p atlasctl \
     --features atlas-databridge/mongodb,atlas-databridge/sqlserver,atlas-databridge/oracle,atlas-databridge/kafka-lag
 
 # ---- runtime ----

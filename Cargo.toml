@@ -19,7 +19,7 @@ members = [
     "crates/atlas-monitor",
     "crates/atlas-jobs",
     "crates/atlas-gateway",
-    "crates/atlas-cli",
+    "crates/atlasctl",
 ]
 resolver = "2"
 

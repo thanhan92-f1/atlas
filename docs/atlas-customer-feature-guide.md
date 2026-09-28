@@ -30,7 +30,7 @@ This is the customer-facing onboarding guide — how to access the product, your
 **How to access it**
 
 - **Web:** "Storage Center" React console served from the gateway binary at `http://127.0.0.1:5110/` (local `make run`), or `http://:30511/` on a Ceph-mode NodePort deploy.
-- **CLI:** `atlasctl` headless REST client — `cargo run -p atlas-cli -- ` (health, ready, discover, pools, volumes, snapshots, backups, buckets, tenants, tokens, ceph-status …); global flags `--base-url` (`ATLAS_BASE_URL`) and `--token` (`ATLAS_TOKEN`).
+- **CLI:** `atlasctl` headless REST client — `cargo run -p atlasctl -- ` (health, ready, discover, pools, volumes, snapshots, backups, buckets, tenants, tokens, ceph-status …); global flags `--base-url` (`ATLAS_BASE_URL`) and `--token` (`ATLAS_TOKEN`).
 - **API:** REST base `/api/atlas/v1/...` (all JSON); a `tonic` gRPC edge (`atlas.v1.AtlasStorage`) on `ATLAS_GRPC_ADDR` (`:5111`, NodePort 30512) with server-streaming `WatchJob`; async writes return `202 + job_id`, streamable over SSE at `/api/atlas/v1/jobs/{id}/watch`.
 - **Login:** Auth is off by default (dev; actor is `anonymous`). Set `ATLAS_AUTH_REQUIRED=1` to require an HS256 JWT (`Authorization: Bearer `); mint one via `POST /api/atlas/v1/auth/tokens`.
 - **Needs:** A Ceph (RBD/CephFS/RGW), NFS, ZFS, Longhorn, or RustFS backend. For evaluation you need no cluster at all — run the fake driver with `ATLAS_CEPH_DRIVER_MODE=fake` (this is what `make run` does).
@@ -276,12 +276,12 @@ _A Zeus OS-style React console embedded in the gateway, wiring every capability 
 - **Themeable Design** — Two Apple shop shells: **Carbon** (black canvas + Apple Blue, dark, default) and **Apple Lite** (#F5F5F7 + Apple Blue, light). Elevated boxes, SF system type, selection tiles, and swipe rails. — _A console that looks like a product shop, in whichever lighting your ops team prefers._
   - **How:** Switch themes (Carbon / Apple Lite) from the top-bar Look & feel icon or **Settings → Appearance**.
 - **atlasctl CLI** — A headless REST client covering health, discovery, volumes, snapshots, backups, buckets, RBD, tenants, tokens, and more. — _Script and automate everything the console can do._
-  - **How:** `cargo run -p atlas-cli -- ` (e.g. `atlasctl health`, `atlasctl volumes`, `atlasctl create-volume ...`); global flags `--base-url` (`ATLAS_BASE_URL`) and `--token` (`ATLAS_TOKEN`).
+  - **How:** `cargo run -p atlasctl -- ` (e.g. `atlasctl health`, `atlasctl volumes`, `atlasctl create-volume ...`); global flags `--base-url` (`ATLAS_BASE_URL`) and `--token` (`ATLAS_TOKEN`).
 
 ## Getting started
 
 1. **Run the gateway (no Ceph, no cluster)** — make run starts the gateway with the fake Ceph driver on 127.0.0.1:5110 — no real storage required.
-2. **Populate inventory** — cargo run -p atlas-cli -- discover pulls a normalized inventory from the driver; then pools, volumes, and health are live.
+2. **Populate inventory** — cargo run -p atlasctl -- discover pulls a normalized inventory from the driver; then pools, volumes, and health are live.
 3. **Open the Storage Center** — Browse to http://127.0.0.1:5110/ for the embedded console — inventory, capacity, jobs, alerts, tenants, and write actions.
 4. **Try DataBridge fake-first** — make run-databridge runs the whole discover-to-cutover pipeline with no cloud or Kubernetes creds needed.
 5. **Go real on k3s + Rook Ceph** — Use deploy/rook-ceph-lab and scripts/deploy-remote.sh to stand up real Ceph and deploy the gateway in Ceph mode.

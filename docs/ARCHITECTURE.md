@@ -47,7 +47,7 @@ atlas-common            atlas-driver-core ──► StorageDriver trait, DriverE
         │            ▲
         │      atlas-discovery (driver → inventory)   atlas-monitor (alert rules + metrics scrape)
         │            ▲
-        └───── atlas-gateway (axum server: state, auth, routes, ai.rs, mcp.rs)  ◄── atlas-cli (atlasctl)
+        └───── atlas-gateway (axum server: state, auth, routes, ai.rs, mcp.rs)  ◄── atlasctl
                      ▲
                atlas-databridge (DB/object migration control plane, layered on the same job engine)
 ```

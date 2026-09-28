@@ -666,7 +666,7 @@ concrete client setup walkthrough (token minting + `~/.hermes/config.yaml`).
 ## `atlasctl` equivalents
 
 Thin REST client (`ATLAS_BASE_URL`, `ATLAS_TOKEN`). Full list: `atlasctl --help` and
-[crates/atlas-cli/README.md](https://github.com/zyvorai/atlas/blob/main/crates/atlas-cli/README.md).
+[crates/atlasctl/README.md](https://github.com/zyvorai/atlas/blob/main/crates/atlasctl/README.md).
 
 ```bash
 # Meta / inventory

@@ -1,15 +1,11 @@
 # Copyright (c) 2026 ZyvorAI Labs Private Limited.
 # SPDX-License-Identifier: LicenseRef-Zyvor-Production-1.0
 [package]
-name = "atlas-cli"
+name = "atlasctl"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
-
-[[bin]]
-name = "atlasctl"
-path = "src/main.rs"
 
 [dependencies]
 clap = { workspace = true }

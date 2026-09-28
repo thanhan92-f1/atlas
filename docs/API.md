@@ -660,7 +660,7 @@ See `docs/HERMES_AGENT.md` for a concrete client setup walkthrough (token mintin
 ## `atlasctl` equivalents
 
 Thin REST client (`ATLAS_BASE_URL`, `ATLAS_TOKEN`). Full list: `atlasctl --help` and
-[crates/atlas-cli/README.md](../crates/atlas-cli/README.md).
+[crates/atlasctl/README.md](../crates/atlasctl/README.md).
 
 ```bash
 # Meta / inventory

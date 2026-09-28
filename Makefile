@@ -69,14 +69,14 @@ ui-dev: ## Vite dev server, proxying /api to a running gateway
 	cd crates/atlas-gateway/ui && npm install && npm run dev
 
 cli: ## Run atlasctl (pass args with ARGS='health')
-	cargo run -p atlas-cli -- $(ARGS)
+	cargo run -p atlasctl -- $(ARGS)
 
 clean: ## Remove build artifacts and the local SQLite files
 	cargo clean
 	rm -f atlas.db atlas.db-wal atlas.db-shm
 
 status: ## atlasctl health (ATLAS_BASE_URL, default http://127.0.0.1:5110)
-	cargo run -q -p atlas-cli -- health
+	cargo run -q -p atlasctl -- health
 
 deploy-remote: ## Deploy the gateway: make deploy-remote H=<host> [U=sus] [ARGS=--with-ceph]
 	@test -n "$(H)" || (echo "Usage: make deploy-remote H=<host> [U=user] [ARGS=--with-ceph]"; exit 1)

@@ -91,7 +91,7 @@ the `rbd mirror` paths are unverified), per-product integrations beyond the gRPC
 - `crates/atlas-discovery` — discovery worker.
 - `crates/atlas-gateway` — axum server (bin `atlas-gateway`); `routes/ai.rs` (Ops Advisor/incidents/
   anomalies/what-if), `mcp.rs` (MCP tool exposure, `mcp` feature).
-- `crates/atlas-cli` — `atlasctl` REST client.
+- `crates/atlasctl` — `atlasctl` REST client.
 - `migrations/` — SQLite schema; `migrations-postgres/` — the Postgres-dialect equivalent (CI fails
   if the two drift to different highest migration numbers).
 - `deploy/rook-ceph-lab/` — lab manifests + `up.sh` (`--single-node`; Rook v1.20.2 + Squid + CSI drivers).
@@ -114,7 +114,7 @@ the `rbd mirror` paths are unverified), per-product integrations beyond the gRPC
 ## Run locally (no Ceph, no cluster needed)
 ```
 make run            # gateway with fake Ceph driver on 127.0.0.1:5110
-cargo run -p atlas-cli -- --base-url http://127.0.0.1:5110 health
+cargo run -p atlasctl -- --base-url http://127.0.0.1:5110 health
 ```
 Live K8s path (needs KUBECONFIG): `atlasctl storage-classes`.
 

@@ -26,7 +26,7 @@ WORKDIR /build
 COPY . .
 # Embed the freshly built UI (rust-embed reads crates/atlas-gateway/ui/dist at compile time).
 COPY --from=ui /ui/dist crates/atlas-gateway/ui/dist
-RUN cargo build --release -p atlas-gateway -p atlas-cli \
+RUN cargo build --release -p atlas-gateway -p atlasctl \
     --features atlas-databridge/mongodb,atlas-databridge/sqlserver,atlas-databridge/oracle,atlas-databridge/kafka-lag
 
 # ---- runtime (debian + ceph squid client) ----
