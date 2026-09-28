@@ -48,13 +48,21 @@ export default function ObjectMigrations() {
     }
     out.push(
       { name: "dest_side", label: "Destination", options: sideOptions },
-      { name: "dest_bucket", label: "Destination bucket", hint: "Must already exist (create it on the Buckets page)." },
+      { name: "dest_bucket", label: "Destination bucket", hint: "Created on the destination if it does not exist." },
     );
     if ((vals.dest_side || sideOptions[0]?.value) === EXTERNAL) {
       out.push(
         { name: "dest_endpoint", label: "Destination endpoint" },
         { name: "dest_secret_ref", label: "Destination credentials Secret" },
       );
+    }
+    if ((vals.source_side || sideOptions[0]?.value) === EXTERNAL || (vals.dest_side || sideOptions[0]?.value) === EXTERNAL) {
+      out.push({
+        name: "secret_namespace",
+        label: "Credentials Secret namespace",
+        value: "zyvor-system",
+        hint: "Namespace holding the Secret(s) named above (keys AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY or RUSTFS_ACCESS_KEY/RUSTFS_SECRET_KEY).",
+      });
     }
     out.push({
       name: "mode",
@@ -154,6 +162,7 @@ export default function ObjectMigrations() {
           } else {
             body.dest_backend_id = v.dest_side || sideOptions[0]?.value;
           }
+          if (v.secret_namespace) body.secret_namespace = v.secret_namespace;
           try {
             await http.post("/databridge/object", body);
             toast(`migration ${v.name} created`, "ok");

@@ -267,6 +267,28 @@ spec:
             {{- if .Values.disks.enabled }}
             - name: ATLAS_HOST_MOUNTINFO_PATH
               value: "/host-mountinfo"
+            - name: ATLAS_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: ATLAS_POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            {{- if .Values.disks.autoRustfsDevice }}
+            - name: ATLAS_RUSTFS_AUTO_DEVICE
+              value: {{ .Values.disks.autoRustfsDevice | quote }}
+            - name: ATLAS_RUSTFS_AUTO_ACTIVATE
+              value: {{ .Values.disks.autoRustfsActivate | ternary "1" "0" | quote }}
+            {{- end }}
+            - name: ATLAS_DEPLOYMENT_NAME
+              value: {{ include "atlas.fullname" . | quote }}
+            - name: ATLAS_CONSOLE_NODE_PORT
+              value: {{ .Values.service.httpNodePort | quote }}
+            - name: ATLAS_SELF_IMAGE
+              value: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+            - name: ATLAS_SELF_IMAGE_PULL_POLICY
+              value: {{ .Values.image.pullPolicy | quote }}
             {{- end }}
             {{- if .Values.rustfs.enabled }}
             - name: ATLAS_RUSTFS_ENABLE

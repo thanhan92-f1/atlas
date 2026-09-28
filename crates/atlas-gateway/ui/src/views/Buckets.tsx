@@ -10,6 +10,7 @@ import { ListPage } from "../ui/templates/ListPage";
 import { navCrumbs } from "../nav/routes";
 import { del } from "../ui/confirm";
 import { Table } from "../ui/Table";
+import BucketSettings from "./BucketSettings";
 import { fmtBytes, num } from "../lib/format";
 
 export default function Buckets() {
@@ -20,6 +21,7 @@ export default function Buckets() {
   const [create, setCreate] = useState(false);
   const [selftest, setSelftest] = useState(false);
   const [objBucket, setObjBucket] = useState<StorageBucket | null>(null);
+  const [settingsBucket, setSettingsBucket] = useState<StorageBucket | null>(null);
   const n = data?.length || 0;
 
   // NB: /backends records are keyed `id` (only /backends/summary uses `backend_id`).
@@ -48,9 +50,27 @@ export default function Buckets() {
       actions={
         <>
           {objectBackends.some((b) => b.backend_type === "rustfs") && (
-            <button type="button" className="at-btn" onClick={() => setSelftest(true)}>
-              RustFS self-test
-            </button>
+            <>
+              <button
+                type="button"
+                className="at-btn"
+                title="Adopt every bucket the RustFS server reports (e.g. buckets copied by an object migration) and re-point known ones at the current server"
+                onClick={async () => {
+                  try {
+                    const { data: r } = await http.post("/rustfs/buckets/import");
+                    toast(`RustFS import: ${r.created} added, ${r.updated} re-pointed`, "ok");
+                    refetch();
+                  } catch (e) {
+                    toast(`RustFS import: ${apiError(e)}`, "err");
+                  }
+                }}
+              >
+                Import from RustFS
+              </button>
+              <button type="button" className="at-btn" onClick={() => setSelftest(true)}>
+                RustFS self-test
+              </button>
+            </>
           )}
           <button type="button" className="at-btn primary" onClick={() => setCreate(true)}>
             <Plus size={14} /> Bucket
@@ -98,6 +118,7 @@ export default function Buckets() {
               }
             }}>Stats</Button>
             <Button size="sm" onClick={() => setObjBucket(b)}>Objects</Button>
+            {bucketBackend(b) === "RustFS" && <Button size="sm" onClick={() => setSettingsBucket(b)}>Settings</Button>}
             <Button size="sm" variant="danger" onClick={() => del(`bucket ${b.bucket_name || b.name || b.id}`, () => submitJob("delete", `/buckets/${b.id}?force=true`, null, "delete bucket", refetch))}>Del</Button>
           </>
         )}
@@ -173,6 +194,7 @@ export default function Buckets() {
         }} />
 
       <ObjectBrowser bucket={objBucket} onClose={() => setObjBucket(null)} />
+      <BucketSettings bucket={settingsBucket} onClose={() => setSettingsBucket(null)} />
     </ListPage>
   );
 }

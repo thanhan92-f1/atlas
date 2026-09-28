@@ -217,6 +217,12 @@ zfs:
 # gateway per node. Needs the default (non-Ceph) gateway image, which bundles zfsutils-linux.
 disks:
   enabled: false
+  # Opt-in install-time automation: name ONE raw disk (e.g. /dev/sdb) and, on first start, Atlas
+  # formats it as a RustFS drive ONLY IF it is completely empty (it never wipes — a disk that holds
+  # anything is reported in the gateway log and left alone), installs RustFS from the official chart
+  # on it, and, with `autoRustfsActivate`, points Atlas at that server. Needs `disks.enabled`.
+  autoRustfsDevice: ""
+  autoRustfsActivate: false
 
 rustfs:
   enabled: false
@@ -233,24 +239,51 @@ rustfs:
   # `server.generateCredentials`, otherwise it must already exist.
   credentialsSecret: rustfs-credentials
 
-  # Optional in-chart RustFS server (mirrors deploy/rustfs-lab/deployment.yaml): a single-replica,
-  # single-volume LAB topology — not HA. A production RustFS wants multiple drives/nodes (erasure
-  # coding); point `rustfs.endpoint` at that instead and leave `server.enabled` false.
+  # Optional RustFS server, deployed with RustFS's OWN official Helm chart (vendored under charts/,
+  # values under `rustfsserver:` below). Standalone = one pod on one volume: a single-drive RustFS has
+  # no erasure coding and cannot be expanded in place or joined as a pool (RustFS docs: migrate to a
+  # new deployment over S3 — Atlas's Object Migrations page does exactly that). For production run a
+  # multi-drive/multi-node RustFS (`rustfsserver.mode.distributed`) or point `rustfs.endpoint` at one.
   server:
     enabled: false
-    image: rustfs/rustfs:1.0.0
-    storage: 20Gi
-    storageClassName: ""
-    # NodePorts: the S3 API must be reachable from browsers (object bytes go browser <-> RustFS).
-    s3NodePort: 30900
-    consoleNodePort: 30901
-    # Console origin allowed by RustFS's CORS (default empty on the server = no CORS headers, which
-    # breaks every browser upload). Empty: http://<node-ip>:<service.httpNodePort>.
-    corsOrigin: ""
-    # Generate `credentialsSecret` once via `lookup` + `randAlphaNum` and keep it on upgrade (never
-    # rotated, never printed). `helm template`/`--dry-run` cannot see the cluster, so they render a
-    # throwaway value — only a real install/upgrade persists one. Set false to supply your own Secret.
+    # Create `rustfs.credentialsSecret` once (`lookup` + `randAlphaNum`, kept on upgrade, never
+    # printed) holding BOTH key sets: AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY (what Atlas reads) and
+    # RUSTFS_ACCESS_KEY/RUSTFS_SECRET_KEY (what the official chart's `secret.existingSecret` reads).
+    # `helm template` cannot `lookup`, so it renders throwaway values. False = supply your own.
     generateCredentials: true
+
+# Values for the vendored official RustFS chart (only used when `rustfs.server.enabled`). Keep
+# `secret.existingSecret` equal to `rustfs.credentialsSecret` (the chart fails otherwise), and the
+# CORS origin equal to the console's origin (`service.httpNodePort`) — RustFS sends no CORS headers by
+# default, which breaks every browser upload. To put the data on a drive prepared from the Disks page,
+# set `mode.standalone.existingClaim.dataClaim` to that drive's PVC (e.g. `rustfs-sdb-data`).
+rustfsserver:
+  image:
+    tag: "1.0.0"
+  mode:
+    standalone:
+      enabled: true
+      existingClaim:
+        dataClaim: ""
+    distributed:
+      enabled: false
+  secret:
+    existingSecret: rustfs-credentials
+  ingress:
+    enabled: false   # the chart renders an nginx Ingress for example.rustfs.com by default
+  service:
+    type: NodePort
+    endpoint:
+      nodePort: 30900
+    console:
+      nodePort: 30901
+  extraEnv:
+    - name: NODE_IP
+      valueFrom:
+        fieldRef:
+          fieldPath: status.hostIP
+    - name: RUSTFS_CORS_ALLOWED_ORIGINS
+      value: "http://$(NODE_IP):30510"
 
 nodeSelector: {}
 tolerations: []

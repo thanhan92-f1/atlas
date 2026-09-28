@@ -5,17 +5,23 @@
 // button on Backends/Cluster, and deliberately kept thin: one form, one recent-jobs table.
 import { useState } from "react";
 import { submitJob } from "../api/client";
-import { useCephNodeDevices, useInvalidate, useJobs, useNodes, usePools, useZfsDevices } from "../api/hooks";
+import { useCephNodeDevices, useInvalidate, useJobs, useNodes, usePools, useRustfsDrives, useZfsDevices } from "../api/hooks";
 import { Badge, FormModal, type FormField } from "../ui/kit";
 import { Table } from "../ui/Table";
 import { ListPage } from "../ui/templates/ListPage";
 import { navCrumbs } from "../nav/routes";
 import { fmtBytes, stateKind, timeAgo } from "../lib/format";
 
-const JOB_TYPES = new Set(["zfs.pool.create_from_device", "zfs.pool.destroy", "ceph.osd.add_device"]);
+const JOB_TYPES = new Set([
+  "rustfs.drive.provision",
+  "zfs.pool.create_from_device",
+  "zfs.pool.destroy",
+  "ceph.osd.add_device",
+]);
 
 const JOB_KIND: Record<string, string> = {
   "ceph.osd.add_device": "Ceph OSD",
+  "rustfs.drive.provision": "RustFS drive",
   "zfs.pool.destroy": "ZFS pool destroy",
 };
 
@@ -33,7 +39,7 @@ function escapeRegExp(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-export default function Disks() {
+export default function Disks({ embedded = false }: { embedded?: boolean }) {
   const [open, setOpen] = useState(false);
   const [destroyPool, setDestroyPool] = useState<string | null>(null);
   const [selectedNode, setSelectedNode] = useState("");
@@ -41,6 +47,7 @@ export default function Disks() {
   const { data: jobs } = useJobs();
   const { data: zfsDevices } = useZfsDevices();
   const { data: pools } = usePools();
+  const { data: rustfsDrives } = useRustfsDrives();
   const zpools = (pools || []).filter((p) => p.kind === "zpool");
   const { data: cephDevices } = useCephNodeDevices(selectedNode);
   const inv = useInvalidate();
@@ -62,12 +69,13 @@ export default function Disks() {
     }));
 
   const fields = (vals: Record<string, string>): FormField[] => {
-    const backend = vals.backend || "zfs";
+    const backend = vals.backend || "rustfs";
     const out: FormField[] = [
       {
         name: "backend",
         label: "Provision as",
         options: [
+          { value: "rustfs", label: "RustFS drive (XFS)" },
           { value: "zfs", label: "ZFS pool" },
           { value: "ceph", label: "Ceph OSD (Rook)" },
         ],
@@ -80,7 +88,7 @@ export default function Disks() {
         options: nodeOptions,
         hint: nodeOptions.length ? undefined : "No nodes discovered yet.",
       });
-    } else {
+    } else if (backend === "zfs") {
       out.push({
         name: "pool_name",
         label: "Pool name",
@@ -89,7 +97,7 @@ export default function Disks() {
         hint: "zpool name — lowercase, no spaces.",
       });
     }
-    if (backend === "zfs") {
+    if (backend === "zfs" || backend === "rustfs") {
       out.push({
         name: "device_path",
         label: "Device (detected on this host)",
@@ -110,7 +118,7 @@ export default function Disks() {
             : "No empty devices discovered on this node yet (needs ROOK_ENABLE_DISCOVERY_DAEMON).",
       });
     }
-    if (backend === "zfs") {
+    if (backend === "zfs" || backend === "rustfs") {
       out.push({
         name: "wipe_existing",
         label: "If the device already has data",
@@ -120,8 +128,8 @@ export default function Disks() {
         ],
         hint:
           "Clears a stale partition table or filesystem signature (e.g. a decommissioned Ceph " +
-          "OSD) before creating the pool. Never overrides the root/boot-disk or mounted-device " +
-          "refusal.",
+          "OSD or an old ZFS pool) before formatting. Never overrides the root/boot-disk, " +
+          "mounted-device or active-pool-member refusal.",
       });
     }
     // Cross-field "type it again to confirm" gate: FormModal's own per-field `pattern` check is
@@ -138,18 +146,28 @@ export default function Disks() {
     return out;
   };
 
-  return (
-    <ListPage
-      crumbs={navCrumbs("disks")}
-      eyebrow="INFRASTRUCTURE · OPS"
-      title="Disks"
-      state="Provision a raw, unformatted disk into a new ZFS pool or Ceph OSD. Irreversible — wipes the target device."
-      actions={
-        <button type="button" className="at-btn danger" onClick={() => setOpen(true)}>
-          Provision device…
-        </button>
-      }
-    >
+  const content = (
+    <>
+      <Table
+        soundings
+        panelTitle="RustFS drives"
+        rows={rustfsDrives || []}
+        rowKey={(d) => d.name}
+        empty="No RustFS drives yet — provision a raw disk as a RustFS drive."
+        cols={[
+          { h: "Drive", f: (d) => d.name, mono: true },
+          { h: "Node", f: (d) => d.node ?? "—" },
+          { h: "Mount path", f: (d) => d.path ?? "—", mono: true },
+          { h: "Size", f: (d) => (d.capacity ? fmtBytes(Number(d.capacity)) : "—") },
+          {
+            h: "Claim",
+            f: (d) => (d.claim ? `${d.claim_namespace ?? ""}/${d.claim}` : "unclaimed"),
+            mono: true,
+          },
+          { h: "State", f: (d) => <Badge kind={stateKind(String(d.phase ?? "").toLowerCase())} dot>{d.phase ?? "?"}</Badge> },
+        ]}
+      />
+
       <Table
         soundings
         panelTitle="ZFS pools on this host"
@@ -196,7 +214,19 @@ export default function Disks() {
         onValuesChange={(v) => setSelectedNode(v.node_name || "")}
         danger
         onSubmit={async (vals) => {
-          if (vals.backend === "ceph") {
+          if (vals.backend === "rustfs" || !vals.backend) {
+            await submitJob(
+              "post",
+              "/rustfs/drives/from-device",
+              {
+                device_path: vals.device_path,
+                confirm: true,
+                wipe_existing: vals.wipe_existing === "wipe",
+              },
+              `format ${vals.device_path} → RustFS drive`,
+              () => inv("rustfs-drives", "jobs"),
+            );
+          } else if (vals.backend === "ceph") {
             await submitJob(
               "post",
               "/ceph/devices",
@@ -248,6 +278,35 @@ export default function Disks() {
           );
         }}
       />
+    </>
+  );
+
+  if (embedded) {
+    return (
+      <div>
+        <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 12 }}>
+          <button type="button" className="at-btn danger" onClick={() => setOpen(true)}>
+          Provision device…
+        </button>
+        </div>
+        {content}
+      </div>
+    );
+  }
+
+  return (
+    <ListPage
+      crumbs={navCrumbs("disks")}
+      eyebrow="INFRASTRUCTURE · OPS"
+      title="Disks"
+      state="Format a raw disk as a RustFS drive (XFS), a ZFS pool or a Ceph OSD. Irreversible — wipes the target device."
+      actions={
+        <button type="button" className="at-btn danger" onClick={() => setOpen(true)}>
+          Provision device…
+        </button>
+      }
+    >
+      {content}
     </ListPage>
   );
 }

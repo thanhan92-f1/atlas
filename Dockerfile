@@ -26,6 +26,15 @@ COPY --from=ui /ui/dist crates/atlas-gateway/ui/dist
 RUN cargo build --release -p atlas-gateway -p atlasctl \
     --features atlas-databridge/mongodb,atlas-databridge/sqlserver,atlas-databridge/oracle,atlas-databridge/kafka-lag
 
+# ---- helm (pinned, checksum-verified) — used only by the console's RustFS installer Job ----
+FROM docker.io/library/debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171 AS helm
+ARG HELM_VERSION=v3.19.0
+ARG HELM_SHA256=a7f81ce08007091b86d8bd696eb4d86b8d0f2e1b9f6c714be62f82f96a594496
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl \
+    && curl -fsSL -o /tmp/helm.tgz "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz" \
+    && echo "${HELM_SHA256}  /tmp/helm.tgz" | sha256sum -c - \
+    && tar -xzf /tmp/helm.tgz -C /tmp linux-amd64/helm && install -m 0755 /tmp/linux-amd64/helm /usr/local/bin/helm
+
 # ---- runtime ----
 FROM docker.io/library/debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171 AS runtime
 # ceph/rbd CLIs are only needed when ATLAS_CEPH_DRIVER_MODE=real against a real cluster.
@@ -51,7 +60,7 @@ FROM docker.io/library/debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a
 ARG ORACLE_IC_URL=https://download.oracle.com/otn_software/linux/instantclient/2113000/instantclient-basiclite-linux.x64-21.13.0.0.0dbru.zip
 RUN echo "deb http://deb.debian.org/debian bookworm contrib" >> /etc/apt/sources.list \
     && apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl unzip libaio1 zfsutils-linux util-linux libcap2-bin \
+    && apt-get install -y --no-install-recommends ca-certificates curl unzip libaio1 zfsutils-linux util-linux xfsprogs libcap2-bin \
     && for bin in /usr/sbin/wipefs /usr/sbin/zpool /usr/sbin/zfs /usr/bin/lsblk /usr/bin/findmnt /usr/sbin/blockdev; do \
          setcap cap_dac_override,cap_sys_admin=ep "$bin"; \
        done \
@@ -66,6 +75,10 @@ ENV LD_LIBRARY_PATH=/opt/oracle/instantclient_21_13
 COPY --from=builder /build/target/release/atlas-gateway /usr/local/bin/atlas-gateway
 COPY --from=builder /build/target/release/atlasctl /usr/local/bin/atlasctl
 COPY --from=builder /build/migrations /usr/local/share/atlas/migrations
+# RustFS's official Helm chart + helm, for the console's "Deploy RustFS" installer Job
+# (crates/atlas-jobs/src/dispatch/rustfs_instance.rs).
+COPY --from=helm /usr/local/bin/helm /usr/local/bin/helm
+COPY deploy/helm/atlas/charts/rustfs-1.0.0.tgz /usr/share/atlas/charts/rustfs-1.0.0.tgz
 USER atlas
 WORKDIR /var/lib/atlas
 ENV ATLAS_BIND_ADDR=0.0.0.0:5110 \

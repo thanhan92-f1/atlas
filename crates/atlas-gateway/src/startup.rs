@@ -482,6 +482,9 @@ pub async fn build_state(config: Config, opts: BuildOptions) -> Result<AppState>
         state.workers.clone(),
     );
 
+    // Opt-in install-time RustFS-on-a-disk automation (ATLAS_RUSTFS_AUTO_DEVICE); no-op when unset.
+    crate::routes::spawn_rustfs_auto(state.clone());
+
     // Audit retention: prune audit rows older than ATLAS_AUDIT_RETENTION_DAYS (0 = keep forever).
     spawn_audit_retention(state.pool.clone());
 

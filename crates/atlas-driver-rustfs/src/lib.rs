@@ -25,6 +25,9 @@ use atlas_api_types::{
 };
 use atlas_driver_core::{DriverError, StorageDriver};
 
+mod client;
+pub use client::{ClientResponse, RustfsClient};
+
 fn sanitize(s: &str) -> String {
     s.trim_matches('/')
         .chars()
@@ -335,7 +338,7 @@ impl RealRustfsDriver {
 
 /// Minimal AWS Signature V4 for the one request this driver needs `rusty-s3` can't build
 /// (service-level `ListBuckets`, `GET /`). Header-based auth with an empty payload.
-mod sigv4 {
+pub(crate) mod sigv4 {
     use ring::{digest, hmac};
 
     /// SHA-256 of the empty string — the payload hash of a bodiless GET.
@@ -350,12 +353,12 @@ mod sigv4 {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
     }
 
-    fn sha256_hex(data: &[u8]) -> String {
+    pub(crate) fn sha256_hex(data: &[u8]) -> String {
         hex(digest::digest(&digest::SHA256, data).as_ref())
     }
 
     /// The hex SigV4 signature over an already-built canonical request.
-    pub(super) fn signature(
+    pub(crate) fn signature(
         secret_key: &str,
         date_stamp: &str,
         amz_date: &str,

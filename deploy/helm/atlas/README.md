@@ -67,6 +67,15 @@ pin the pod with `nodeSelector`, keep `replicaCount: 1` (the template fails othe
 disk-enabled gateway per node. The default image has `zfsutils-linux`; `Dockerfile.ceph` now does too.
 The Ceph-OSD path additionally needs Rook with `ROOK_ENABLE_DISCOVERY_DAEMON`.
 
+### Install-time RustFS-on-a-disk
+
+`--set disks.enabled=true --set disks.autoRustfsDevice=/dev/sdb [--set disks.autoRustfsActivate=true]`
+makes the gateway, on first start, format that one disk as a RustFS drive **only if it is empty** (never a
+wipe), install RustFS from the official chart on it and (optionally) point Atlas at it. The console does
+the same steps on demand: Storage → RustFS → Drives & pools. The chart also renders the
+`atlas-rustfs-installer` ServiceAccount/Role the console's installer Job runs under, and grants the
+gateway read access to Deployments/Services plus `patch` on its **own** Deployment only.
+
 ## Lab side-by-side install
 
 `scripts/helm-lab-remote.sh <host> <user> --set auth.createSecret=true` installs the chart as release

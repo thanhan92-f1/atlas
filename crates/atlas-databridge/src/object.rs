@@ -194,6 +194,10 @@ pub trait ObjectSink: Send + Sync {
     ) -> Result<(u64, String)>;
     /// List destination `(key, size)` for verification.
     async fn list(&self, prefix: Option<&str>) -> Result<Vec<(String, u64)>>;
+    /// Make sure the destination container exists (an S3 bucket is created when missing).
+    async fn ensure_container(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// S3-protocol source (AWS S3, GCS S3-interop, MinIO/RGW/…): wraps an [`S3Target`].
@@ -228,6 +232,15 @@ impl ObjectSink for S3ObjectSink {
     }
     async fn list(&self, prefix: Option<&str>) -> Result<Vec<(String, u64)>> {
         self.0.list_objects(prefix).await
+    }
+    async fn ensure_container(&self) -> Result<()> {
+        if !self.0.bucket_exists().await {
+            self.0
+                .create_bucket()
+                .await
+                .context("create destination bucket")?;
+        }
+        Ok(())
     }
 }
 
@@ -282,6 +295,10 @@ impl ObjectMigrator {
             .list(self.prefix.as_deref())
             .await
             .context("list source objects")?;
+        self.sink
+            .ensure_container()
+            .await
+            .context("prepare destination")?;
         let dst = self
             .sink
             .list(self.prefix.as_deref())

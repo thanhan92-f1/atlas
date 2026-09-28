@@ -455,3 +455,25 @@ export interface ObjectMigration {
   job_id?: string | null;
   created_at?: string | null;
 }
+
+export interface RustfsDrive {
+  name: string;
+  path?: string | null;
+  capacity?: string | null;
+  node?: string | null;
+  storage_class?: string | null;
+  phase?: string | null;
+  claim?: string | null;
+  claim_namespace?: string | null;
+}
+
+export interface RustfsInstance {
+  name: string;
+  managed_by: "helm" | "manifest";
+  ready: boolean;
+  claim?: string | null;
+  s3_node_port?: number | null;
+  console_node_port?: number | null;
+  credentials_secret: string;
+  active: boolean;
+}

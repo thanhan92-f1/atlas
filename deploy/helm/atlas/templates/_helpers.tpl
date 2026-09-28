@@ -50,7 +50,7 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- if .Values.rustfs.endpoint -}}
 {{- .Values.rustfs.endpoint -}}
 {{- else if .Values.rustfs.server.enabled -}}
-{{- printf "http://$(NODE_IP):%d" (int .Values.rustfs.server.s3NodePort) -}}
+{{- printf "http://$(NODE_IP):%d" (int .Values.rustfsserver.service.endpoint.nodePort) -}}
 {{- end -}}
 {{- end -}}
 

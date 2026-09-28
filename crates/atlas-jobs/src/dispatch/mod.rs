@@ -5,6 +5,8 @@ mod helpers;
 mod object;
 mod rbd;
 mod rook;
+mod rustfs_drive;
+mod rustfs_instance;
 mod selftest;
 mod volumes;
 mod zfs;
@@ -63,6 +65,12 @@ pub(crate) async fn dispatch(
         | JobSpec::CephOsdAddDevice { .. } => rook::dispatch_rook(pool, k8s, tenant_id, spec).await,
         JobSpec::ZfsPoolCreateFromDevice { .. } | JobSpec::ZfsPoolDestroy { .. } => {
             zfs::dispatch_zfs(pool, k8s, tenant_id, spec).await
+        }
+        JobSpec::RustfsDriveProvision { .. } => {
+            rustfs_drive::dispatch_rustfs_drive(k8s, spec).await
+        }
+        JobSpec::RustfsInstance { .. } => {
+            rustfs_instance::dispatch_rustfs_instance(k8s, spec).await
         }
         JobSpec::S3BackendSelfTest { .. } => selftest::dispatch_selftest(pool, k8s, spec).await,
         JobSpec::SourceDiscover { .. }

@@ -26,8 +26,20 @@ rustfs:
   driverMode: real
   server:
     enabled: true
-    s3NodePort: 30920
-    consoleNodePort: 30921
+
+rustfsserver:
+  service:
+    endpoint:
+      nodePort: 30920
+    console:
+      nodePort: 30921
+  extraEnv:
+    - name: NODE_IP
+      valueFrom:
+        fieldRef:
+          fieldPath: status.hostIP
+    - name: RUSTFS_CORS_ALLOWED_ORIGINS
+      value: "http://$(NODE_IP):30520"
 
 stateBackup:
   enabled: true

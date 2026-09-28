@@ -19,6 +19,7 @@ mod oidc;
 mod protection;
 mod rbd;
 mod rook;
+mod rustfs;
 mod util;
 mod volumes;
 mod zfs;
@@ -46,6 +47,8 @@ use oidc::*;
 use protection::*;
 use rbd::*;
 use rook::*;
+use rustfs::*;
+pub(crate) use rustfs::spawn_rustfs_auto;
 use volumes::*;
 use zfs::*;
 
@@ -124,6 +127,16 @@ pub fn router(state: AppState) -> Router {
             "/ceph/nodes/{node_name}/devices",
             get(list_ceph_node_devices),
         )
+        .route("/rustfs/proxy/{*rest}", axum::routing::any(rustfs_proxy))
+        .route("/rustfs/drives", get(list_rustfs_drives))
+        .route(
+            "/rustfs/instances",
+            get(list_rustfs_instances).post(install_rustfs_instance),
+        )
+        .route("/rustfs/instances/{name}", delete(delete_rustfs_instance))
+        .route("/rustfs/instances/{name}/activate", post(activate_rustfs_instance))
+        .route("/rustfs/buckets/import", post(import_rustfs_buckets))
+        .route("/rustfs/drives/from-device", post(provision_rustfs_drive))
         .route("/zfs/devices", get(list_zfs_devices))
         .route("/zfs/pools/from-device", post(create_zfs_pool_from_device))
         .route("/zfs/pools/{name}/destroy", post(destroy_zfs_pool))

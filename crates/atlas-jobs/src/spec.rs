@@ -413,6 +413,34 @@ pub enum JobSpec {
         /// Re-stated by the caller; dispatch refuses unless equal to `pool_name` byte-for-byte.
         confirmed_pool_name: String,
     },
+    /// Turn a raw local disk into a RustFS drive: the same hard refusals as the ZFS path, an
+    /// optional wipe, `mkfs.xfs` (never forced) and a host mount + fstab entry done by a throwaway
+    /// privileged node-prep Job, then a `local` PV + bound PVC the RustFS chart consumes as
+    /// `existingClaim`. RustFS itself never formats or mounts disks — Kubernetes hands it a path.
+    #[serde(rename = "rustfs.drive.provision")]
+    RustfsDriveProvision {
+        device_path: String,
+        /// Re-stated by the caller; dispatch refuses unless equal to `device_path`.
+        confirmed_device_path: String,
+        #[serde(default)]
+        wipe_existing: bool,
+    },
+    /// Install or remove a RustFS server using RustFS's own official Helm chart, run by a
+    /// throwaway installer Job (its own least-privilege ServiceAccount) so the gateway never needs
+    /// broad rights. `pvc` (install only) is the data claim — typically a drive prepared by
+    /// `RustfsDriveProvision`; empty = the chart's own PVC.
+    #[serde(rename = "rustfs.instance")]
+    RustfsInstance {
+        /// "install" or "uninstall".
+        action: String,
+        name: String,
+        #[serde(default)]
+        pvc: String,
+        #[serde(default)]
+        s3_node_port: u16,
+        #[serde(default)]
+        console_node_port: u16,
+    },
     /// Conformance self-test of an S3-compatible backend (RustFS): creates a throwaway bucket and
     /// exercises put/get, multipart upload, prefix listing, delete, non-empty-bucket refusal and
     /// bucket delete against the live server, always cleaning up after itself.
@@ -472,6 +500,8 @@ impl JobSpec {
             JobSpec::CephObjectStoreDelete { .. } => "ceph.object_store.delete",
             JobSpec::ZfsPoolCreateFromDevice { .. } => "zfs.pool.create_from_device",
             JobSpec::ZfsPoolDestroy { .. } => "zfs.pool.destroy",
+            JobSpec::RustfsDriveProvision { .. } => "rustfs.drive.provision",
+            JobSpec::RustfsInstance { .. } => "rustfs.instance",
             JobSpec::S3BackendSelfTest { .. } => "s3.backend.selftest",
             JobSpec::CephOsdAddDevice { .. } => "ceph.osd.add_device",
         }

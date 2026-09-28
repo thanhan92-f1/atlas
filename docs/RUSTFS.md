@@ -84,6 +84,60 @@ uses). The gateway's ClusterRole already grants cluster-wide `get/list/watch` on
 never writes secrets itself — `deploy/rustfs-lab/up.sh` creates it for the lab; a real deployment
 provisions it however it provisions every other credential this gateway consumes.
 
+## The console: one RustFS area
+
+Everything RustFS lives under **Storage → RustFS** (plus a per-bucket **Settings** panel on the Buckets
+page), and the raw-disk formatting that used to be its own page is folded into it (Drives & pools →
+"Format a disk for RustFS"; `/disks` still works).
+
+- **Overview / Drives & pools / Access** call RustFS's *own native admin API*
+  (`/rustfs/admin/v3/...`) through an allow-listed, server-signed proxy
+  (`ANY /api/atlas/v1/rustfs/proxy/admin/...`, code in `routes/rustfs.rs`; signing in
+  `atlas-driver-rustfs/src/client.rs`, the same SigV4 scheme RustFS's own `rustfs-madmin` client uses).
+  RustFS's JSON is passed through unchanged. Forwarded: server/storage/data-usage info, pools
+  (list, decommission, cancel), rebalance, heal, users, groups, canned policies, policy attachment,
+  service accounts, bucket quota. NOT forwarded: server update/restart, config, IAM import/export,
+  inspect-data, KMS, lock-breaking. Every write is audited; the credential never leaves the gateway,
+  and each server's `rustfs_env_vars` (which can carry the root key) is scrubbed from `/info`.
+- **Bucket Settings** (RustFS buckets): versioning, lifecycle rules, access policy (private / public
+  read / JSON), quota, and a version browser — via `/rustfs/proxy/s3/{bucket}?<subresource>` (versioning,
+  lifecycle, policy, tagging, cors, object-lock, encryption, versions).
+- **Users**: leave the secret empty to have one generated (shown once).
+
+### Drives: how RustFS uses disks
+
+RustFS never formats or mounts disks; it uses a directory Kubernetes gives it (the official chart takes
+a PVC). So Disks → **RustFS drive (XFS)** does the Kubernetes side: the same hard refusals as the ZFS path
+(root/boot disk, mounted, active pool member — never overridable), an optional wipe, then a throwaway
+root **node-prep Job** (`nsenter` into the host mount namespace) formats `mkfs.xfs` (never forced), mounts
+it at `/mnt/atlas-disks/<disk>`, adds an fstab entry (`nofail`), and Atlas creates a `local` PV (StorageClass
+`atlas-rustfs-local`) plus a PVC `rustfs-<disk>-data` bound to it. Verified live on the lab (`sdb`: XFS,
+mounted, fstab, PV Bound).
+
+### RustFS servers: the official chart, deployed from the console
+
+RustFS runs from **its own Helm chart** (https://charts.rustfs.com, vendored at
+`deploy/helm/atlas/charts/rustfs-1.0.0.tgz`, `helm` pinned and checksum-verified in the gateway image).
+The console's **Deploy RustFS…** starts an installer Job (its own least-privilege ServiceAccount
+`atlas-rustfs-installer`) that runs `helm install` in standalone mode on a chosen drive claim; the root
+credential is generated inside that Job and lands only in the chart's Secret. **Use for Atlas** patches the
+gateway's own Deployment (endpoint, credentials Secret, state backup) and restarts it; **Uninstall**
+removes a chart-managed instance (its data claim is kept). A single-drive RustFS cannot be expanded in
+place or joined as a pool (RustFS's docs) — to move data, use DataBridge → Object Migrations (destination
+buckets are created if missing), then **Import from RustFS** on the Buckets page to re-adopt the buckets.
+
+### Install-time automation (opt-in)
+
+Formatting a disk is deliberately never implicit — Atlas cannot know which disk is safe to take. To get
+RustFS on a disk straight from an install, name that one disk: `ATLAS_RUSTFS_AUTO_DEVICE=/dev/sdb`
+(Helm: `disks.enabled=true`, `disks.autoRustfsDevice=/dev/sdb`, optionally `disks.autoRustfsActivate=true`).
+On start the gateway (`spawn_rustfs_auto`) checks the cluster's current state each step, so a restart
+resumes: it formats the disk **only if it is completely empty — it never wipes**; a disk that holds
+anything (or is the root/boot disk, mounted, a pool member) is reported in the gateway log and left
+alone; then it installs RustFS from the official chart on the resulting drive and, with
+`ATLAS_RUSTFS_AUTO_ACTIVATE=1`, points Atlas at it. Data already in a previous RustFS is not moved
+automatically — use Object Migrations.
+
 ## Self-test (conformance check, console button)
 
 `POST /api/atlas/v1/backends/bkd_rustfs_lab/selftest` (body `{"region": "eu-west-1"}`, optional;
