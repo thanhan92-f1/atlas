@@ -49,8 +49,12 @@ pub struct DeviceCheck {
 impl DeviceCheck {
     /// The refusals that `wipe_existing` can never override, checked first regardless of what
     /// else is true about the device: touching the root/boot disk, a read-only device, something
-    /// that isn't a whole disk at all, or a device that's currently mounted (it may be actively
-    /// serving files right now — unmounting it is a separate, deliberately out-of-scope action).
+    /// that isn't a whole disk at all, a device that's currently mounted (it may be actively
+    /// serving files right now — unmounting it is a separate, deliberately out-of-scope action),
+    /// or a member of a zpool that is *currently imported* (`member_of_zpool` comes from
+    /// `zpool status`, which only lists imported pools — wiping a live pool's disk corrupts a
+    /// running pool; a stale label from an exported/destroyed pool shows up as a `zfs_member`
+    /// filesystem signature instead, which is the overridable, wipeable case).
     pub fn hard_refusal_reason(&self) -> Option<String> {
         if !self.exists {
             return Some("no such block device".into());
@@ -70,13 +74,19 @@ impl DeviceCheck {
         if let Some(target) = &self.mounted_at {
             return Some(format!("device is mounted at {target}"));
         }
+        if let Some(zpool) = &self.member_of_zpool {
+            return Some(format!(
+                "device is a member of the imported zpool {zpool} — export or destroy that pool \
+                 first; wiping a live pool's disk would corrupt it"
+            ));
+        }
         None
     }
 
     /// `None` means the device looks safe to format; `Some(reason)` explains why it doesn't.
     /// Checked in order so the *first* applicable reason is the one surfaced. Everything past
     /// `hard_refusal_reason` here is stale *data* on the disk (a partition table, a filesystem or
-    /// RAID/LVM signature, prior zpool membership) rather than a structural reason the device is
+    /// RAID/LVM signature) rather than a structural reason the device is
     /// unsafe to touch at all — `wipe_existing` (see `wipe_device`) clears these, so callers taking
     /// that path check `hard_refusal_reason` alone instead of this.
     pub fn refusal_reason(&self) -> Option<String> {
@@ -101,9 +111,6 @@ impl DeviceCheck {
                 "residual filesystem/RAID/LVM signature detected: {}",
                 self.wipefs_signatures.join(", ")
             ));
-        }
-        if let Some(zpool) = &self.member_of_zpool {
-            return Some(format!("device is already a member of zpool {zpool}"));
         }
         None
     }
@@ -135,11 +142,6 @@ impl DeviceCheck {
             return Some(format!(
                 "residual filesystem/RAID/LVM signature detected after wipe: {}",
                 self.wipefs_signatures.join(", ")
-            ));
-        }
-        if let Some(zpool) = &self.member_of_zpool {
-            return Some(format!(
-                "device is still a member of zpool {zpool} after wipe"
             ));
         }
         None
@@ -357,11 +359,12 @@ impl BlockDevice {
             "read_only"
         } else if self.mounted_at.is_some() {
             "mounted"
+        } else if self.member_of_zpool.is_some() {
+            "zpool_member"
         } else if self.has_children
             || self.fstype.is_some()
             || self.pttype.is_some()
             || !self.wipefs_signatures.is_empty()
-            || self.member_of_zpool.is_some()
         {
             "has_data"
         } else {
@@ -417,6 +420,10 @@ pub async fn list_whole_disks() -> Result<Vec<BlockDevice>, DriverError> {
         };
         let path = format!("/dev/{name}");
         let size_bytes = dev.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
+        // Unattached stubs (e.g. /dev/nbd0..15 report 0 bytes) can't hold a pool — not a candidate.
+        if size_bytes == 0 {
+            continue;
+        }
         let read_only = match dev.get("ro") {
             Some(serde_json::Value::Bool(b)) => *b,
             Some(serde_json::Value::String(s)) => s == "1",
@@ -639,11 +646,40 @@ mod tests {
             fstype: Some("ceph_bluestore".into()),
             pttype: Some("gpt".into()),
             wipefs_signatures: vec!["gpt".into()],
-            member_of_zpool: Some("tank".into()),
             ..Default::default()
         };
         assert!(check.hard_refusal_reason().is_none());
         assert!(check.refusal_reason().is_some());
+    }
+
+    #[test]
+    fn imported_zpool_membership_is_a_hard_never_overridable_refusal() {
+        // A disk in a *currently imported* pool must be refused even on the wipe_existing path
+        // (which only checks hard_refusal_reason before wiping) — wiping it would corrupt a live pool.
+        let live_member = DeviceCheck {
+            exists: true,
+            is_disk: true,
+            member_of_zpool: Some("tank0".into()),
+            ..Default::default()
+        };
+        assert!(live_member.hard_refusal_reason().unwrap().contains("tank0"));
+        assert!(live_member.refusal_reason().unwrap().contains("tank0"));
+        assert!(live_member
+            .refusal_reason_after_wipe()
+            .unwrap()
+            .contains("tank0"));
+    }
+
+    #[test]
+    fn block_device_status_reports_zpool_member_before_has_data() {
+        let d = BlockDevice {
+            path: "/dev/sdb".into(),
+            size_bytes: 1_000_000,
+            has_children: true,
+            member_of_zpool: Some("tank0".into()),
+            ..Default::default()
+        };
+        assert_eq!(d.status(), "zpool_member");
     }
 
     #[test]

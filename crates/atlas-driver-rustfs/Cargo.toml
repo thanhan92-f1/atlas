@@ -13,3 +13,6 @@ atlas-driver-core = { workspace = true }
 async-trait = { workspace = true }
 reqwest = { workspace = true }
 tokio = { workspace = true }
+# SigV4 request signing for credentialed ListBuckets (HMAC-SHA256 + SHA-256) and its timestamp.
+ring = { workspace = true }
+chrono = { workspace = true }

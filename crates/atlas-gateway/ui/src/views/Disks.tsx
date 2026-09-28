@@ -17,7 +17,7 @@ const JOB_TYPES = new Set(["zfs.pool.create_from_device", "ceph.osd.add_device"]
 // Devices in these states are never a valid target (mirrors the server's own unconditional
 // refusals) — left out of the picker entirely rather than shown disabled, since the plain
 // options-based FormField has no per-option disabled state.
-const ZFS_UNSELECTABLE = new Set(["root_or_boot", "mounted", "read_only"]);
+const ZFS_UNSELECTABLE = new Set(["root_or_boot", "mounted", "zpool_member", "read_only"]);
 
 const ZFS_STATUS_LABEL: Record<string, string> = {
   empty: "empty",
@@ -87,7 +87,7 @@ export default function Disks() {
         label: "Device (detected on this host)",
         options: zfsDeviceOptions,
         hint: zfsDeviceOptions.length
-          ? "Root/boot, mounted, and read-only devices are never shown — see docs/DISKS.md."
+          ? "Root/boot, mounted, read-only, and active-zpool-member devices are never shown — see docs/DISKS.md."
           : "No usable whole disks detected on this host.",
       });
     } else {

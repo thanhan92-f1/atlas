@@ -11,9 +11,12 @@
 //! - [`RealRustfsDriver`] — `GET {endpoint}/health` (or `/minio/health/live`) plus S3
 //!   `ListBuckets` / `ListObjectsV2`. Never fabricates a bucket the server did not return.
 //!
-//! Credentials are optional. RustFS anonymous read works for public buckets; signed
-//! requests are left to a follow-up that reuses `atlas-driver-rgw`'s `rusty-s3` signer.
-//! Secret material is never stored on the driver beyond the process env reference.
+//! Credentials are optional. With an access/secret key pair (`ATLAS_RUSTFS_ACCESS_KEY` /
+//! `ATLAS_RUSTFS_SECRET_KEY`, see [`RealRustfsDriver::with_credentials_from_env`]) `ListBuckets`
+//! is SigV4-signed — required by any RustFS server with authentication on, i.e. every real
+//! deployment. Without them the driver falls back to anonymous requests, which only work against
+//! a server that allows anonymous listing. (`rusty-s3` has no service-level `ListBuckets`
+//! action, so this signs the one request itself — see the `sigv4` module.)
 
 use async_trait::async_trait;
 use atlas_api_types::{
@@ -186,12 +189,21 @@ impl StorageDriver for FakeRustfsDriver {
 // Real
 // ---------------------------------------------------------------------------
 
+/// Service credentials for SigV4-signed requests. Deliberately not `Debug`/`Clone`-derived so the
+/// secret can't leak through a `{:?}` of the driver.
+struct Credentials {
+    access_key: String,
+    secret_key: String,
+    region: String,
+}
+
 pub struct RealRustfsDriver {
     backend_id: String,
     endpoint: String,
     /// Optional allow-list. Empty means "every bucket ListBuckets returns".
     buckets: Vec<String>,
     client: reqwest::Client,
+    credentials: Option<Credentials>,
 }
 
 impl RealRustfsDriver {
@@ -208,6 +220,36 @@ impl RealRustfsDriver {
                 .timeout(std::time::Duration::from_secs(8))
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
+            credentials: None,
+        }
+    }
+
+    /// Sign `ListBuckets` with this service credential (SigV4, S3 service).
+    pub fn with_credentials(
+        mut self,
+        access_key: impl Into<String>,
+        secret_key: impl Into<String>,
+        region: impl Into<String>,
+    ) -> Self {
+        self.credentials = Some(Credentials {
+            access_key: access_key.into(),
+            secret_key: secret_key.into(),
+            region: region.into(),
+        });
+        self
+    }
+
+    /// [`Self::with_credentials`] from `ATLAS_RUSTFS_ACCESS_KEY` + `ATLAS_RUSTFS_SECRET_KEY`
+    /// (region from `ATLAS_RUSTFS_REGION`, default `us-east-1`). A no-op unless *both* keys are
+    /// set and non-empty, so an unconfigured deploy keeps the anonymous behavior.
+    pub fn with_credentials_from_env(self) -> Self {
+        let get = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
+        match (get("ATLAS_RUSTFS_ACCESS_KEY"), get("ATLAS_RUSTFS_SECRET_KEY")) {
+            (Some(access), Some(secret)) => {
+                let region = get("ATLAS_RUSTFS_REGION").unwrap_or_else(|| "us-east-1".into());
+                self.with_credentials(access, secret, region)
+            }
+            _ => self,
         }
     }
 
@@ -237,15 +279,41 @@ impl RealRustfsDriver {
 
     async fn list_buckets_live(&self) -> Result<Vec<String>, DriverError> {
         let url = format!("{}/", self.endpoint);
-        let resp = self
-            .client
-            .get(&url)
+        let mut req = self.client.get(&url);
+        if let Some(c) = &self.credentials {
+            let parsed = reqwest::Url::parse(&url)
+                .map_err(|e| DriverError::Backend(format!("bad rustfs endpoint {url}: {e}")))?;
+            let host = parsed.host_str().ok_or_else(|| {
+                DriverError::Backend(format!("rustfs endpoint {url} has no host"))
+            })?;
+            // `Url::port()` is None for the scheme's default port — exactly the value `Host:`
+            // carries on the wire, which is what the signature must cover.
+            let host = match parsed.port() {
+                Some(p) => format!("{host}:{p}"),
+                None => host.to_string(),
+            };
+            for (name, value) in sigv4::signed_get_root_headers(
+                &host,
+                &c.access_key,
+                &c.secret_key,
+                &c.region,
+                chrono::Utc::now(),
+            ) {
+                req = req.header(name, value);
+            }
+        }
+        let resp = req
             .send()
             .await
             .map_err(|e| DriverError::Unreachable(format!("list buckets: {e}")))?;
         if !resp.status().is_success() {
+            let hint = match (resp.status().as_u16(), self.credentials.is_some()) {
+                (401 | 403, true) => " — credentials rejected",
+                (401 | 403, false) => " — authentication required; set ATLAS_RUSTFS_ACCESS_KEY/SECRET_KEY",
+                _ => "",
+            };
             return Err(DriverError::Backend(format!(
-                "ListBuckets HTTP {}",
+                "ListBuckets HTTP {}{hint}",
                 resp.status()
             )));
         }
@@ -262,6 +330,74 @@ impl RealRustfsDriver {
                 .filter(|n| self.buckets.iter().any(|w| w == n))
                 .collect())
         }
+    }
+}
+
+/// Minimal AWS Signature V4 for the one request this driver needs `rusty-s3` can't build
+/// (service-level `ListBuckets`, `GET /`). Header-based auth with an empty payload.
+mod sigv4 {
+    use ring::{digest, hmac};
+
+    /// SHA-256 of the empty string — the payload hash of a bodiless GET.
+    const EMPTY_PAYLOAD_SHA256: &str =
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+    fn hmac_sha256(key: &[u8], data: &[u8]) -> hmac::Tag {
+        hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, key), data)
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    fn sha256_hex(data: &[u8]) -> String {
+        hex(digest::digest(&digest::SHA256, data).as_ref())
+    }
+
+    /// The hex SigV4 signature over an already-built canonical request.
+    pub(super) fn signature(
+        secret_key: &str,
+        date_stamp: &str,
+        amz_date: &str,
+        region: &str,
+        service: &str,
+        canonical_request: &str,
+    ) -> String {
+        let scope = format!("{date_stamp}/{region}/{service}/aws4_request");
+        let string_to_sign = format!(
+            "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
+            sha256_hex(canonical_request.as_bytes())
+        );
+        let k_date = hmac_sha256(format!("AWS4{secret_key}").as_bytes(), date_stamp.as_bytes());
+        let k_region = hmac_sha256(k_date.as_ref(), region.as_bytes());
+        let k_service = hmac_sha256(k_region.as_ref(), service.as_bytes());
+        let k_signing = hmac_sha256(k_service.as_ref(), b"aws4_request");
+        hex(hmac_sha256(k_signing.as_ref(), string_to_sign.as_bytes()).as_ref())
+    }
+
+    /// The request headers (name, value) that authenticate `GET /` against `host` at `now`.
+    pub(super) fn signed_get_root_headers(
+        host: &str,
+        access_key: &str,
+        secret_key: &str,
+        region: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Vec<(&'static str, String)> {
+        let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
+        let date_stamp = now.format("%Y%m%d").to_string();
+        let signed_headers = "host;x-amz-content-sha256;x-amz-date";
+        let canonical_request = format!(
+            "GET\n/\n\nhost:{host}\nx-amz-content-sha256:{EMPTY_PAYLOAD_SHA256}\nx-amz-date:{amz_date}\n\n{signed_headers}\n{EMPTY_PAYLOAD_SHA256}"
+        );
+        let sig = signature(secret_key, &date_stamp, &amz_date, region, "s3", &canonical_request);
+        let authorization = format!(
+            "AWS4-HMAC-SHA256 Credential={access_key}/{date_stamp}/{region}/s3/aws4_request, SignedHeaders={signed_headers}, Signature={sig}"
+        );
+        vec![
+            ("x-amz-date", amz_date),
+            ("x-amz-content-sha256", EMPTY_PAYLOAD_SHA256.to_string()),
+            ("authorization", authorization),
+        ]
     }
 }
 
@@ -395,7 +531,7 @@ pub fn from_env(backend_id: impl Into<String>) -> Box<dyn StorageDriver> {
         .map(str::to_string)
         .collect::<Vec<_>>();
     if mode.eq_ignore_ascii_case("real") {
-        Box::new(RealRustfsDriver::new(backend_id, endpoint, buckets))
+        Box::new(RealRustfsDriver::new(backend_id, endpoint, buckets).with_credentials_from_env())
     } else {
         let driver = if buckets.is_empty() {
             FakeRustfsDriver::with_defaults(backend_id)
@@ -409,6 +545,43 @@ pub fn from_env(backend_id: impl Into<String>) -> Box<dyn StorageDriver> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The AWS SigV4 test-suite's "get-vanilla" vector (service "service", GET /, no query) — the
+    /// exact signature AWS documents for these inputs, so this pins the signing chain itself
+    /// (key derivation, string-to-sign, canonical-request hashing) rather than merely checking
+    /// that some signature is produced.
+    #[test]
+    fn sigv4_matches_the_aws_get_vanilla_test_vector() {
+        let canonical = "GET\n/\n\nhost:example.amazonaws.com\nx-amz-date:20150830T123600Z\n\nhost;x-amz-date\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let sig = sigv4::signature(
+            "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+            "20150830",
+            "20150830T123600Z",
+            "us-east-1",
+            "service",
+            canonical,
+        );
+        assert_eq!(
+            sig,
+            "5fa00fa31553b73ebf1942676e86291e8372ff2a2260956d9b8aae1d763fbf31"
+        );
+    }
+
+    #[test]
+    fn signed_list_buckets_headers_carry_a_well_formed_authorization() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-09-28T05:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let headers = sigv4::signed_get_root_headers("10.0.0.1:9000", "AKID", "secret", "us-east-1", now);
+        let get = |n: &str| headers.iter().find(|(k, _)| *k == n).map(|(_, v)| v.clone());
+        assert_eq!(get("x-amz-date").unwrap(), "20260928T050000Z");
+        let auth = get("authorization").unwrap();
+        assert!(auth.starts_with(
+            "AWS4-HMAC-SHA256 Credential=AKID/20260928/us-east-1/s3/aws4_request, \
+             SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature="
+        ));
+        assert_eq!(auth.rsplit("Signature=").next().unwrap().len(), 64);
+    }
 
     #[test]
     fn parses_list_buckets_xml() {

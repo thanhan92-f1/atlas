@@ -62,6 +62,8 @@ export interface StorageBucket {
   region?: string | null;
   secret_ref?: string | null;
   namespace?: string | null;
+  /** Which storage backend owns the bucket (e.g. `bkd_rustfs_lab`, `bkd_ceph_lab`). Null on legacy rows — those are Ceph RGW. */
+  backend_id?: string | null;
   state: string;
   created_at?: string | null;
 }
@@ -289,7 +291,7 @@ export interface ZfsBlockDevice {
   wipefs_signatures: string[];
   member_of_zpool?: string | null;
   is_root_or_boot_disk: boolean;
-  status: "empty" | "has_data" | "mounted" | "read_only" | "root_or_boot";
+  status: "empty" | "has_data" | "mounted" | "zpool_member" | "read_only" | "root_or_boot";
 }
 
 // Passed through verbatim from Rook's own `local-device-<node>` discovery ConfigMap schema.

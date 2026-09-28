@@ -261,19 +261,32 @@ pub async fn build_state(config: Config, opts: BuildOptions) -> Result<AppState>
             .rustfs_endpoint
             .clone()
             .unwrap_or_else(|| "http://rustfs01.zyvor.lab:9000".into());
-        let buckets = if config.rustfs_buckets.is_empty() {
-            vec!["vm-images".to_string(), "backups".to_string()]
-        } else {
-            config.rustfs_buckets.clone()
-        };
         let rustfs: Arc<dyn StorageDriver> = match config.rustfs_driver_mode {
-            atlas_common::config::DriverMode::Real => {
-                Arc::new(RealRustfsDriver::new(RUSTFS_BACKEND_ID, endpoint, buckets))
-            }
+            // Real: an empty ATLAS_RUSTFS_BUCKETS means "every bucket the server reports" — the
+            // vm-images/backups names below are fixture data and must never act as an allow-list
+            // that hides real buckets.
+            atlas_common::config::DriverMode::Real => Arc::new(
+                RealRustfsDriver::new(RUSTFS_BACKEND_ID, endpoint, config.rustfs_buckets.clone())
+                    .with_credentials_from_env(),
+            ),
             atlas_common::config::DriverMode::Fake => {
+                let buckets = if config.rustfs_buckets.is_empty() {
+                    vec!["vm-images".to_string(), "backups".to_string()]
+                } else {
+                    config.rustfs_buckets.clone()
+                };
                 Arc::new(FakeRustfsDriver::new(RUSTFS_BACKEND_ID, endpoint, buckets))
             }
         };
+        // The k8s Secret (in ATLAS_RUSTFS_CREDENTIALS_NAMESPACE) holding AWS_ACCESS_KEY_ID /
+        // AWS_SECRET_ACCESS_KEY that the bucket write path resolves at dispatch time. It used to be
+        // registered as None, which made every RustFS bucket create/delete fail with "has no
+        // connection_ref configured".
+        let credentials_secret = std::env::var("ATLAS_RUSTFS_CREDENTIALS_SECRET")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "rustfs-credentials".to_string());
         let rustfs_backend = StorageBackend {
             id: RUSTFS_BACKEND_ID.into(),
             name: "zyvor-rustfs".into(),
@@ -284,7 +297,7 @@ pub async fn build_state(config: Config, opts: BuildOptions) -> Result<AppState>
                 object: true,
                 ..Capabilities::default()
             },
-            connection_ref: None,
+            connection_ref: Some(credentials_secret),
             cordoned: false,
         };
         atlas_inventory::upsert_backend(&pool, &rustfs_backend).await?;

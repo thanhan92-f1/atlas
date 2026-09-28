@@ -20,6 +20,8 @@
 #                    big disk carries the k3s load instead of the small root FS. Off by default.
 #
 # Day-2 upgrade orchestration:
+#   --without-rustfs skip deploy/rustfs-lab/up.sh (RustFS is deployed by default: the gateway's
+#                    primary object backend). Also set ATLAS_RUSTFS_ENABLE=0 in the manifest then.
 #   --rollback       revert the gateway Deployment to its previous ReplicaSet (`kubectl rollout undo`)
 #                    instead of building/deploying — for a bad upgrade. Skips build/import.
 #   --force          proceed even if the upgrade pre-flight (`GET /upgrade/preflight`) reports blockers.
@@ -34,15 +36,17 @@ HOST="${1:-${DEPLOY_HOST:-}}"
 USER="${2:-${DEPLOY_USER:-sus}}"
 WITH_CEPH=0
 WITH_K3S_DISK=0
+WITHOUT_RUSTFS=0
 ROLLBACK=0
 FORCE=0
 for a in "$@"; do
+  [[ "$a" == "--without-rustfs" ]] && WITHOUT_RUSTFS=1
   [[ "$a" == "--with-ceph" ]] && WITH_CEPH=1
   [[ "$a" == "--with-k3s-disk" ]] && WITH_K3S_DISK=1
   [[ "$a" == "--rollback" ]] && ROLLBACK=1
   [[ "$a" == "--force" ]] && FORCE=1
 done
-[[ -z "$HOST" ]] && { echo "usage: $0 <host> <user> [--with-ceph] [--with-k3s-disk] [--rollback] [--force]" >&2; exit 2; }
+[[ -z "$HOST" ]] && { echo "usage: $0 <host> <user> [--with-ceph] [--with-k3s-disk] [--without-rustfs] [--rollback] [--force]" >&2; exit 2; }
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REMOTE_DIR=".deployment/atlas"
@@ -92,6 +96,16 @@ $SSH "cd ~/${REMOTE_DIR} && podman build --ulimit nofile=65536:65536 -t atlas-ga
 log "3/5 import image into k3s containerd"
 # oci-archive avoids containerd docker-archive "doesn't support modifying existing images".
 $SSH "cd ~/${REMOTE_DIR} && podman save --format oci-archive -o /tmp/atlas-gateway.tar atlas-gateway:dev && sudo k3s ctr images import /tmp/atlas-gateway.tar && rm -f /tmp/atlas-gateway.tar"
+
+# RustFS is Atlas's primary object backend and the gateway manifest below runs its driver in real
+# mode — bring the server (and the rustfs-credentials Secret the gateway pod reads at start) up
+# BEFORE the gateway rollout, so the pod's secretKeyRef env vars resolve. Idempotent: an existing
+# server/credential is left alone. Skipped with --without-rustfs (then also set
+# ATLAS_RUSTFS_ENABLE=0 in the gateway manifest for that cluster).
+if [[ "$WITHOUT_RUSTFS" != "1" ]]; then
+  log "3b/5 RustFS object backend (deploy/rustfs-lab/up.sh)"
+  $SSH "${REMOTE_KUBE}; cd ~/${REMOTE_DIR} && bash deploy/rustfs-lab/up.sh"
+fi
 
 log "4/5 ensure auth Secret + apply k8s manifests + roll out the new image"
 # Auth is required in-cluster; create a strong jwt-secret (+ one-shot bootstrap token) if missing.

@@ -3,9 +3,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Download, Plus, Upload } from "lucide-react";
 import { apiError, http, submitJob, toast } from "../api/client";
-import { useBuckets, useInvalidate } from "../api/hooks";
+import { useBackends, useBuckets, useInvalidate } from "../api/hooks";
 import type { StorageBucket } from "../api/types";
-import { Badge, Button, FormModal, SlideOver } from "../ui/kit";
+import { Badge, Button, FormModal, SlideOver, type FormField } from "../ui/kit";
 import { ListPage } from "../ui/templates/ListPage";
 import { navCrumbs } from "../nav/routes";
 import { del } from "../ui/confirm";
@@ -14,11 +14,24 @@ import { fmtBytes, num } from "../lib/format";
 
 export default function Buckets() {
   const { data } = useBuckets();
+  const { data: backends } = useBackends();
   const inv = useInvalidate();
   const refetch = () => inv("buckets", "summary");
   const [create, setCreate] = useState(false);
   const [objBucket, setObjBucket] = useState<StorageBucket | null>(null);
   const n = data?.length || 0;
+
+  // Backends that can host buckets, RustFS first (it's the default object backend for new buckets).
+  const objectBackends = (backends || [])
+    .filter((b) => b.backend_type === "rustfs" || b.backend_type === "ceph")
+    .sort((a, b) => Number(b.backend_type === "rustfs") - Number(a.backend_type === "rustfs"));
+  const backendLabel = (t?: string) => (t === "rustfs" ? "RustFS" : t === "ceph" ? "Ceph RGW" : t || "?");
+  // Legacy bucket rows (created before backend_id was recorded) are Ceph RGW.
+  const bucketBackend = (b: StorageBucket) => {
+    if (!b.backend_id) return "Ceph RGW";
+    const rec = (backends || []).find((x) => x.backend_id === b.backend_id);
+    return backendLabel(rec?.backend_type) === "?" ? b.backend_id : backendLabel(rec?.backend_type);
+  };
 
   return (
     <ListPage
@@ -27,8 +40,8 @@ export default function Buckets() {
       title="Buckets"
       state={
         n
-          ? `${n} RGW bucket${n === 1 ? "" : "s"} — quotas, stats, browse / upload / download.`
-          : "Object gateway unused. Create the first bucket to begin exports and backups."
+          ? `${n} bucket${n === 1 ? "" : "s"} across RustFS and Ceph RGW — stats, browse / upload / download.`
+          : "No buckets yet. Create the first bucket to begin exports and backups."
       }
       actions={
         <button type="button" className="at-btn primary" onClick={() => setCreate(true)}>
@@ -49,6 +62,7 @@ export default function Buckets() {
         }
         cols={[
           { h: "Name", f: (b) => b.bucket_name || b.name || b.id, mono: true },
+          { h: "Backend", f: (b) => <Badge kind="info">{bucketBackend(b)}</Badge> },
           { h: "State", f: (b) => <Badge kind={b.state === "bound" ? "success" : "warning"} dot>{b.state}</Badge> },
           { h: "Namespace", f: (b) => b.namespace },
           { h: "Endpoint", f: (b) => <span className="mono" style={{ color: "var(--at-ink-4)" }}>{b.endpoint || "—"}</span> },
@@ -81,20 +95,41 @@ export default function Buckets() {
       />
 
       <FormModal open={create} onClose={() => setCreate(false)} title="Create bucket" submitLabel="Create"
-        fields={[
-          {
-            name: "name", label: "Name",
-            pattern: /^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/,
-            hint: "3-63 chars: lowercase letters, digits, dots, hyphens (S3/RGW bucket naming rules).",
-          },
-          { name: "namespace", label: "Namespace", value: "rook-ceph" },
-          { name: "max_objects", label: "Max objects (optional)", type: "number", optional: true, min: 0 },
-          { name: "max_size", label: "Max size (e.g. 2G, optional)", optional: true },
-        ]}
+        fields={(vals): FormField[] => {
+          const sel = vals.backend_id || objectBackends[0]?.backend_id;
+          const selType = objectBackends.find((b) => b.backend_id === sel)?.backend_type;
+          const out: FormField[] = [
+            {
+              name: "backend_id", label: "Backend",
+              options: objectBackends.map((b) => ({ value: b.backend_id, label: `${backendLabel(b.backend_type)} (${b.backend_id})` })),
+              hint: "No object backend registered.",
+            },
+            {
+              name: "name", label: "Name",
+              pattern: /^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/,
+              hint: "3-63 chars: lowercase letters, digits, dots, hyphens (S3 bucket naming rules).",
+            },
+          ];
+          // Ceph RGW buckets are provisioned via a Rook ObjectBucketClaim (namespace + optional RGW
+          // quotas); RustFS buckets are a plain S3 CreateBucket — none of those apply.
+          if (selType === "ceph") {
+            out.push(
+              { name: "namespace", label: "Namespace", value: "rook-ceph" },
+              { name: "max_objects", label: "Max objects (optional)", type: "number", optional: true, min: 0 },
+              { name: "max_size", label: "Max size (e.g. 2G, optional)", optional: true },
+            );
+          }
+          return out;
+        }}
         onSubmit={(v) => {
-          const body: Record<string, unknown> = { name: v.name, namespace: v.namespace };
-          if (v.max_objects) body.max_objects = +v.max_objects;
-          if (v.max_size) body.max_size = v.max_size;
+          const backendId = v.backend_id || objectBackends[0]?.backend_id;
+          const isCeph = objectBackends.find((b) => b.backend_id === backendId)?.backend_type === "ceph";
+          const body: Record<string, unknown> = { name: v.name, backend_id: backendId };
+          if (isCeph) {
+            body.namespace = v.namespace;
+            if (v.max_objects) body.max_objects = +v.max_objects;
+            if (v.max_size) body.max_size = v.max_size;
+          }
           return submitJob("post", "/buckets", body, "bucket", refetch);
         }} />
 
@@ -120,7 +155,7 @@ function ObjectBrowser({ bucket, onClose }: { bucket: StorageBucket | null; onCl
   const close = () => { setObjs(null); setListError(false); setPrefix(""); onClose(); };
   if (!bucket) return null;
 
-  // Upload straight to RGW: gateway mints a presigned PUT, the browser PUTs the file to it —
+  // Upload straight to the object store (RustFS/RGW): gateway mints a presigned PUT, the browser PUTs the file to it —
   // the object bytes never pass through atlas-gateway, so large db files scale fine. With keep>0
   // each upload is stored as a timestamped version and old ones are pruned to keep N (db backups).
   const upload = async (files: FileList | null) => {
