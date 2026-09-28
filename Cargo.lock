@@ -379,7 +379,9 @@ dependencies = [
  "async-trait",
  "atlas-api-types",
  "atlas-driver-core",
+ "chrono",
  "reqwest 0.13.5",
+ "ring",
  "tokio",
 ]
 
@@ -484,7 +486,7 @@ dependencies = [
  "hex",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "sqlx",
  "tokio",
  "tracing",
