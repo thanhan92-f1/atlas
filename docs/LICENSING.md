@@ -14,16 +14,11 @@ SPDX identifier used in source headers and Cargo/npm metadata: `Apache-2.0` (see
 
 Contributions require the [CLA](../CLA.md) and [DCO](../DCO.md) (`git commit -s`). Header checks: `make headers`.
 
-## History
+## Older releases
 
-| Release | License |
-|---|---|
-| up to v0.3.0 | AGPL-3.0 + Atlas Commercial License (dual) — text preserved at [`LICENSES/LicenseRef-Atlas-Commercial-v0.3.0.md`](../LICENSES/LicenseRef-Atlas-Commercial-v0.3.0.md) |
-| v0.4.0 (development builds) | Zyvor Production License v1.0 (non-production free, production needs a commercial license) |
-| from the Apache-2.0 relicense onward | Apache License 2.0 |
-
-Releases already published under an earlier license remain available under the terms they were
-published with; see the git tags and the licensing notes at those tags.
+This repository carries a single license: Apache-2.0. Releases that were published earlier under
+different terms keep the terms they were published with — see the licensing notes at the relevant git
+tag and [`CHANGELOG.md`](../CHANGELOG.md).
 
 ## Bundled third-party software
 

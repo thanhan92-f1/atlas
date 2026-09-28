@@ -30,8 +30,7 @@ irrevocable license to:
    publicly perform, sublicense, and distribute your Contribution and such
    derivative works; and
 2. License your Contribution (and derivative works thereof) under the
-   **Apache License, Version 2.0**, and/or under any other license Zyvor
-   offers for Atlas.
+   **Apache License, Version 2.0**.
 
 You also grant Zyvor a perpetual, worldwide, non-exclusive, royalty-free,
 irrevocable patent license to make, have made, use, sell, offer to sell,
