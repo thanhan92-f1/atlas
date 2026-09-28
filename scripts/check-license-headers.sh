@@ -53,6 +53,13 @@ check_file() {
     missing+=("$f")
     return
   fi
+  # SQL migrations are checksummed by sqlx: editing even a header comment of an already-applied
+  # migration makes every existing database refuse to start ("migration N was previously applied but
+  # has been modified"). They keep their original header text and are licensed like everything else
+  # (see LICENSE); only the presence of a copyright header is required of them.
+  case "$f" in
+    ./migrations/*|./migrations-postgres/*) return ;;
+  esac
   if ! grep -qF "SPDX-License-Identifier: $EXPECTED_SPDX" <<<"$head"; then
     bad_spdx+=("$f")
   fi

@@ -14,6 +14,14 @@ SPDX identifier used in source headers and Cargo/npm metadata: `Apache-2.0` (see
 
 Contributions require the [CLA](../CLA.md) and [DCO](../DCO.md) (`git commit -s`). Header checks: `make headers`.
 
+## SQL migrations keep their original headers
+
+The files under `migrations/` and `migrations-postgres/` are licensed under Apache-2.0 like everything
+else in this repository, but their header comments are frozen: the migration runner (sqlx) records a
+checksum of each applied file, so editing even a comment makes existing databases refuse to start. They
+are therefore exempt from the SPDX-identifier check (`scripts/check-license-headers.sh`), and must never be
+edited after release.
+
 ## Older releases
 
 This repository carries a single license: Apache-2.0. Releases that were published earlier under
