@@ -292,6 +292,30 @@ const publicReadPolicy = (bucket: string) =>
     2,
   );
 
+/** True when the policy is the anonymous "allow s3:GetObject" preset (any principal spelling). */
+function isPublicRead(policyText: string): boolean {
+  try {
+    const stmts = (JSON.parse(policyText) as { Statement?: unknown }).Statement;
+    const list = Array.isArray(stmts) ? stmts : [stmts];
+    return (
+      list.length > 0 &&
+      list.every((raw) => {
+        const st = raw as { Effect?: string; Principal?: unknown; Action?: unknown };
+        const actions = ([] as unknown[]).concat(st.Action ?? []);
+        const principal = JSON.stringify(st.Principal ?? null);
+        return (
+          st.Effect === "Allow" &&
+          (st.Principal === "*" || principal.includes('"*"')) &&
+          actions.length > 0 &&
+          actions.every((a) => a === "s3:GetObject")
+        );
+      })
+    );
+  } catch {
+    return false;
+  }
+}
+
 function AccessTab({ bucket }: { bucket: string }) {
   const [text, setText] = useState("");
   const [configured, setConfigured] = useState<boolean | null>(null);
@@ -356,7 +380,7 @@ function AccessTab({ bucket }: { bucket: string }) {
       <p className="mb-3">
         Access:{" "}
         <Badge kind={configured ? "warning" : "success"} dot>
-          {configured === null ? "…" : configured ? "custom policy" : "private"}
+          {configured === null ? "…" : configured ? (isPublicRead(text) ? "public read" : "custom policy") : "private"}
         </Badge>
       </p>
       <div className="flex gap-2 mb-3">

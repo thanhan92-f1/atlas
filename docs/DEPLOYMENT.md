@@ -43,10 +43,12 @@ Override only together: `ROOK_VERSION=… CEPH_IMAGE=… ./up.sh …`.
 # e.g. ./scripts/deploy-remote.sh <ephemeral-ip> operator
 ```
 
-It also stands up a real RustFS object store first ([`deploy/rustfs-lab/up.sh`](../deploy/rustfs-lab/up.sh),
-NodePorts 30900/30901, credentials Secret `rustfs-credentials` generated once) — pass
-`--without-rustfs` (and set `ATLAS_RUSTFS_ENABLE=0`) on a cluster that has none. See
-[`RUSTFS.md`](RUSTFS.md).
+RustFS is **not** started by the script any more: the lab's object store is RustFS's official Helm chart on a
+dedicated disk, created from the console (Storage → RustFS → Deploy RustFS…) or automatically on first start
+with `ATLAS_RUSTFS_AUTO_DEVICE=/dev/sdX` (formats an empty disk only, never wipes) — see
+[`RUSTFS.md`](RUSTFS.md). `--with-legacy-rustfs` still brings up the old manifest-based single-volume server
+([`deploy/rustfs-lab/up.sh`](../deploy/rustfs-lab/up.sh), port 30900). Set `ATLAS_RUSTFS_ENABLE=0` for a
+cluster with no RustFS.
 
 NodePort **30510**. Verifies `/health`, `/version`, and `/storage-classes`. Gates automatically on
 `GET /upgrade/preflight` before rolling out (pass `--force` to override a blocked pre-flight).

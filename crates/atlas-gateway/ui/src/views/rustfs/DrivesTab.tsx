@@ -37,10 +37,18 @@ export default function DrivesTab() {
   const pools = asArr(poolsList.data).map(asRec);
   const poolOptions = pools.map((p) => ({ value: String(asNum(p.id)), label: `Pool ${asNum(p.id)} · ${asStr(p.cmdline)}` }));
 
-  const startHeal = () =>
+  // RustFS's heal handler needs every HealOpts field present (only pool/set are optional).
+  const healBody = (dryRun: boolean) => ({ recursive: true, dryRun, remove: false, recreate: false, scanMode: 1, updateParity: false, nolock: false });
+  const startHeal = (dryRun: boolean) =>
     confirmThen(
-      { title: "Start a heal?", message: "Re-checks and repairs every object's erasure-coded shards. Safe, but I/O-heavy on large stores.", confirmLabel: "Start heal" },
-      () => rfsWrite("start heal", "post", "heal/", { data: { recursive: true, scanMode: 1 } }, refresh),
+      {
+        title: dryRun ? "Start a heal dry run?" : "Start a heal?",
+        message: dryRun
+          ? "Scans every object and reports what would be repaired, without changing anything."
+          : "Re-checks and repairs every object's erasure-coded shards. Safe, but I/O-heavy on large stores.",
+        confirmLabel: dryRun ? "Start dry run" : "Start heal",
+      },
+      () => rfsWrite(dryRun ? "heal dry run" : "start heal", "post", "heal/", { data: healBody(dryRun) }, refresh).catch(() => {}),
     );
   const rebalanceAction = (action: "start" | "stop") =>
     confirmThen(
@@ -124,7 +132,8 @@ export default function DrivesTab() {
           <>
             <Button size="sm" onClick={() => rebalanceAction("start")}>Start rebalance</Button>
             <Button size="sm" onClick={() => rebalanceAction("stop")}>Stop rebalance</Button>
-            <Button size="sm" onClick={startHeal}>Start heal</Button>
+            <Button size="sm" onClick={() => startHeal(true)}>Heal dry run</Button>
+            <Button size="sm" onClick={() => startHeal(false)}>Start heal</Button>
             <Button size="sm" onClick={showHealStatus}>Heal status</Button>
           </>
         }

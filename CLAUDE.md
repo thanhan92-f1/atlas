@@ -19,11 +19,15 @@ Implemented:
   **ZFS** (local `zpool`/`zfs list`), **RustFS** (S3-compatible; the **primary/default object
   backend**, see `docs/RUSTFS.md`) and read-only **Longhorn** — plus a live K8s driver. Real drivers
   never fabricate data; they propagate a real error when the target is unreachable. Discovery worker
-  → inventory. **RustFS is deployed for real** in the lab (`deploy/rustfs-lab/`, run by
-  `scripts/deploy-remote.sh`); bucket create/upload/download, multipart, delete and a console
-  **self-test** (`POST /backends/{id}/selftest`), DataBridge **Object Migrations** page and the Helm
-  chart (`rustfs.server`, `disks.enabled`, `scripts/helm-lab-remote.sh`) verified live; the lab's
-  self-state backup targets it.
+  → inventory. **RustFS runs for real** in the lab from **RustFS's own official Helm chart** on a
+  dedicated XFS drive (release `rustfs-sdb`, vendored chart in `deploy/helm/atlas/charts/`), deployed
+  and switched to from the console (Storage → RustFS); the console also drives RustFS's native admin API
+  (users, policies, pools, heal, quota, service accounts) through an allow-listed, server-signed proxy
+  (`routes/rustfs.rs`) and per-bucket Settings; bucket create/upload/download, multipart, delete, the
+  console **self-test**, DataBridge **Object Migrations** and the Helm chart (`rustfs.server`,
+  `disks.enabled`, `scripts/helm-lab-remote.sh`) are verified live; the lab's self-state backup targets it.
+  Opt-in install-time automation: `ATLAS_RUSTFS_AUTO_DEVICE` (formats only an EMPTY disk, never wipes).
+  CI gates run on the lab host via `scripts/ci-remote.sh` (never locally).
 - **Raw disk provisioning** (`docs/DISKS.md`): Disks console page + `GET /zfs/devices`,
   `GET /ceph/nodes/{node}/devices` pickers, `POST /zfs/pools/from-device` (with explicit
   `wipe_existing`) and `POST /ceph/devices`. **ZFS verified live on a real disk** (wiped a stale Ceph
@@ -96,9 +100,11 @@ the `rbd mirror` paths are unverified), per-product integrations beyond the gRPC
   shares→filesystem volumes).
 - `crates/atlas-driver-zfs` — `FakeZfsDriver`/`RealZfsDriver` (third backend; zpools→pools,
   datasets→filesystem volumes) + raw-disk inspection/wipe/`zpool create` (`cmd.rs`).
-- `crates/atlas-driver-rustfs` — `FakeRustfsDriver`/`RealRustfsDriver` (S3 discovery, SigV4-signed);
-  the bucket/object *write* path is in `atlas-gateway`/`atlas-jobs` over the shared
-  `atlas-driver-rgw` `S3Target`.
+- `crates/atlas-driver-rustfs` — `FakeRustfsDriver`/`RealRustfsDriver` (S3 discovery, SigV4-signed) and
+  `RustfsClient` (generic signed client for the admin API and S3 bucket sub-resources); the
+  bucket/object *write* path is in `atlas-gateway`/`atlas-jobs` over the shared `atlas-driver-rgw`
+  `S3Target`. `atlas-driver-k8s/src/node_disks.rs` holds the PV/Job/Deployment helpers the drive and
+  RustFS-instance jobs use.
 - `crates/atlas-databridge` — DataBridge: source connectors, assessment, CNPG/Percona CR builders,
   pipeline stages, reconciler (cloud-to-edge DB migration; `migrations/0011`, `/api/atlas/v1/databridge/*`).
 - `crates/atlas-driver-k8s` — `kube-rs` read-only StorageClass/PVC/PV listing.

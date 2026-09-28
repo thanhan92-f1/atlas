@@ -47,7 +47,8 @@ async fn connect_and_migrate_against_real_postgres() {
         "rbd_snapshots",
         "console_users",
     ] {
-        let row = sqlx::query(&format!("SELECT COUNT(*) AS c FROM {table}"))
+        // `table` is one of the four fixed literals above — nothing user-controlled.
+        let row = sqlx::query(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) AS c FROM {table}")))
             .fetch_one(&pool)
             .await
             .unwrap_or_else(|e| panic!("table {table} should exist and be queryable: {e}"));
