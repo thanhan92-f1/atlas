@@ -9,6 +9,9 @@ before `0.2.0` were not tracked here — see `git log` for that history.
 
 ## [Unreleased]
 
+### Changed
+- README restyled as a landing page (blue/white hero with light/dark variants, capability tiles, Day/Night console overview); no wording change to the licensing sections.
+
 ## [0.4.0] — 2026-09-21
 
 ### Upgrade and migration notes

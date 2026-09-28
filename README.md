@@ -1,43 +1,46 @@
 <!-- Copyright (c) 2026 ZyvorAI Labs Private Limited. -->
 <!-- SPDX-License-Identifier: LicenseRef-Zyvor-Production-1.0 -->
+<div align="center">
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/social/atlas-share-card-dark.png">
+  <img src="docs/social/atlas-share-card.png" alt="Atlas — Storage, as a product." width="820">
+</picture>
+
 # Atlas
 
-[![CI](https://github.com/zyvorai/atlas/actions/workflows/ci.yml/badge.svg)](https://github.com/zyvorai/atlas/actions/workflows/ci.yml)
-[![License: Zyvor Production v1.0](https://img.shields.io/badge/License-Zyvor%20Production%20v1.0-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.4.0-informational)](CHANGELOG.md)
-[![Docs](https://img.shields.io/badge/docs-zyvorai.github.io%2Fatlas-blue)](https://zyvorai.github.io/atlas/)
+### Storage, as a product.
 
-![Rust](https://img.shields.io/badge/Rust-000000?logo=rust&logoColor=white)
-![React](https://img.shields.io/badge/React-20232A?logo=react&logoColor=61DAFB)
-![TypeScript](https://img.shields.io/badge/TypeScript-3178C6?logo=typescript&logoColor=white)
-![SQLite](https://img.shields.io/badge/SQLite-07405E?logo=sqlite&logoColor=white)
-![gRPC](https://img.shields.io/badge/gRPC-4285F4?logo=grpc&logoColor=white)
-![Ceph](https://img.shields.io/badge/Ceph-EF5C55?logo=ceph&logoColor=white)
+The **central storage control plane** for the Zyvor suite.<br>
+Products call stable Atlas APIs; Atlas maps intent to Ceph, NFS, ZFS, Longhorn and RustFS through pluggable drivers.
 
-![Atlas — Storage, as a product.](docs/social/atlas-share-card.png)
+[![CI](https://img.shields.io/github/actions/workflow/status/zyvorai/atlas/ci.yml?branch=main&style=flat-square&labelColor=1d1d1f&label=CI)](https://github.com/zyvorai/atlas/actions/workflows/ci.yml)
+[![License: Zyvor Production v1.0](https://img.shields.io/badge/license-Zyvor%20Production%20v1.0-0071e3?style=flat-square&labelColor=1d1d1f)](LICENSE)
+[![Version](https://img.shields.io/badge/version-0.4.0-0071e3?style=flat-square&labelColor=1d1d1f)](CHANGELOG.md)
+[![Docs](https://img.shields.io/badge/docs-zyvorai.github.io%2Fatlas-0071e3?style=flat-square&labelColor=1d1d1f)](https://zyvorai.github.io/atlas/)
 
-**Storage, as a product.** Atlas is the **central storage control plane** for the Zyvor
-suite. Products call stable Atlas APIs; Atlas maps intent to Ceph (and NFS/ZFS/Longhorn/RustFS)
-through pluggable drivers — with an Apple Shop console for operators.
+[**Quickstart**](#quickstart) · [**Docs**](https://zyvorai.github.io/atlas/) · [**Gallery**](#dashboard-gallery) · [**Architecture**](#architecture-at-a-glance) · [**License**](#license)
 
-**5** storage backends · **6** database engines migratable via DataBridge · **80+** REST
-endpoints · **3** access surfaces (REST · gRPC · SSE)
+<sub>Rust · React · TypeScript · SQLite · gRPC · Ceph</sub>
 
-📖 **[Read the full docs](https://zyvorai.github.io/atlas/)** — quickstart, architecture, licensing.
+</div>
 
-![Atlas Storage Center — Overview](docs/ux/00-overview.png)
+---
 
-## Contents
+**5** storage backends · **6** database engines migratable via DataBridge · **80+** REST endpoints · **3** access surfaces (REST · gRPC · SSE)
 
-- [Quickstart](#-quickstart)
-- [Dashboard gallery](#-dashboard-gallery)
-- [Architecture at a glance](#-architecture-at-a-glance)
-- [Capabilities](#-capabilities)
-- [Why Atlas](#-why-atlas)
-- [Important boundaries](#-important-boundaries)
-- [License](#-license)
+Atlas is the **central storage control plane** for the Zyvor suite. Products call stable Atlas APIs; Atlas maps intent to Ceph (and NFS/ZFS/Longhorn/RustFS) through pluggable drivers — with an Apple Shop console for operators. Read the [full docs](https://zyvorai.github.io/atlas/): quickstart, architecture, licensing.
 
-## 🚀 Quickstart
+<div align="center">
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/ux/night-00-overview.png">
+  <img src="docs/ux/day-00-overview.png" alt="Atlas Storage Center — Overview" width="820">
+</picture>
+
+</div>
+
+## Quickstart
 
 ```bash
 make run
@@ -63,18 +66,61 @@ Deploy to a remote k3s host:
 
 More: [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md) · [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) · [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
-## 🖥 Dashboard gallery
+## Capabilities
 
-Live console shots (captured against a lab deployment):
+<table>
+<tr>
+<td valign="top" width="33%">
+<b>Intent to storage</b><br>
+Volumes, snapshots, clones, CephFS RWX and S3 buckets via REST + gRPC. RustFS is the default object backend; Ceph RGW is explicitly selectable via <code>backend_id</code>.
+</td>
+<td valign="top" width="33%">
+<b>Pluggable drivers</b><br>
+Real Ceph first; NFS, ZFS, Longhorn and RustFS; a fake driver for the local demo.
+</td>
+<td valign="top" width="33%">
+<b>DataBridge</b><br>
+Cloud-to-edge DB migration (six engines, CDC, cutover) on Ceph.
+</td>
+</tr>
+<tr>
+<td valign="top" width="33%">
+<b>Day-2</b><br>
+Alerts, maintenance, governance, quotas, upgrade preflight, DR scaffolding.
+</td>
+<td valign="top" width="33%">
+<b>Ops Advisor</b><br>
+Explainable AI-assisted risk scoring and prioritized, read-only runbooks.
+</td>
+<td valign="top" width="33%">
+<b>Console</b><br>
+Apple.com-style top-nav shell, SF type, Night/Day themes.
+</td>
+</tr>
+</table>
 
-| | | |
-|---|---|---|
-| ![Overview](docs/ux/00-overview.png) | ![Volumes](docs/ux/01-volumes.png) | ![Observatory](docs/ux/02-observatory.png) |
-| ![Ceph](docs/ux/03-ceph.png) | ![DataBridge](docs/ux/04-databridge.png) | ![Sign in](docs/ux/05-login.png) |
+Customer-facing feature guide: [docs/atlas-customer-feature-guide.md](docs/atlas-customer-feature-guide.md).
+
+## Dashboard gallery
+
+Live console shots (captured against a lab deployment), Day theme shown; the overview above follows your light/dark setting.
+
+<table>
+<tr>
+<td width="33%"><img src="docs/ux/day-01-volumes.png" alt="Volumes"><br><sub>Volumes</sub></td>
+<td width="33%"><img src="docs/ux/day-02-observatory.png" alt="Observatory"><br><sub>Observatory</sub></td>
+<td width="33%"><img src="docs/ux/day-03-ceph.png" alt="Ceph"><br><sub>Ceph</sub></td>
+</tr>
+<tr>
+<td width="33%"><img src="docs/ux/day-04-databridge.png" alt="DataBridge"><br><sub>DataBridge</sub></td>
+<td width="33%"><img src="docs/ux/day-05-alerts.png" alt="Alerts"><br><sub>Alerts</sub></td>
+<td width="33%"><img src="docs/ux/day-06-jobs.png" alt="Jobs"><br><sub>Jobs</sub></td>
+</tr>
+</table>
 
 Full tour: [Gallery](https://zyvorai.github.io/atlas/gallery).
 
-## 🗺 Architecture at a glance
+## Architecture at a glance
 
 ```mermaid
 flowchart LR
@@ -96,19 +142,7 @@ flowchart LR
 
 Full write-up: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
-## 🧰 Capabilities
-
-- **Intent → storage** — volumes, snapshots, clones, CephFS RWX, S3 buckets via REST + gRPC
-  (RustFS is the default object backend; Ceph RGW is explicitly selectable via `backend_id`)
-- **Pluggable drivers** — real Ceph first; NFS + ZFS + Longhorn + RustFS; fake driver for local demo
-- **DataBridge** — cloud-to-edge DB migration (six engines, CDC, cutover) on Ceph
-- **Day-2** — alerts, maintenance, governance, quotas, upgrade preflight, DR scaffolding
-- **Ops Advisor** — explainable AI-assisted risk scoring and prioritized, read-only runbooks
-- **Console** — Apple.com-style top-nav shell, SF type, Night/Day themes
-
-Customer-facing feature guide: [docs/atlas-customer-feature-guide.md](docs/atlas-customer-feature-guide.md).
-
-## ⚖ Why Atlas
+## Why Atlas
 
 | | Atlas | Raw Ceph tooling | Rook alone |
 |---|---|---|---|
@@ -119,7 +153,7 @@ Customer-facing feature guide: [docs/atlas-customer-feature-guide.md](docs/atlas
 | Built-in operator console | Yes | Ceph Dashboard only | No |
 | Kubernetes-native provisioning | Yes (via drivers) | No | Yes |
 
-## 🔍 Important boundaries
+## Important boundaries
 
 What's free under the Zyvor Production License vs. what needs a commercial license
 ([full guide](docs/LICENSING.md)):
@@ -132,11 +166,7 @@ What's free under the Zyvor Production License vs. what needs a commercial licen
 | SaaS, managed services, OEM, appliances | No — needs a commercial license |
 | Redistribution or resale | No — needs written permission and a commercial license |
 
-## 📈 Star History
-
-[![Star History Chart](https://api.star-history.com/svg?repos=zyvorai/atlas&type=Date)](https://star-history.com/#zyvorai/atlas&Date)
-
-## 📄 License
+## License
 
 Licensed under the **[Zyvor Production License v1.0](LICENSE)**.
 
@@ -145,3 +175,11 @@ Licensed under the **[Zyvor Production License v1.0](LICENSE)**.
 
 Commercial terms are issued separately: [https://zyvor.dev](https://zyvor.dev). See [docs/LICENSING.md](docs/LICENSING.md). Contributions: [CLA.md](CLA.md) + [DCO.md](DCO.md) (`git commit -s`),
 governed by our [Code of Conduct](CODE_OF_CONDUCT.md).
+
+<div align="center">
+
+<sub>Star history</sub>
+
+[![Star History Chart](https://api.star-history.com/svg?repos=zyvorai/atlas&type=Date)](https://star-history.com/#zyvorai/atlas&Date)
+
+</div>
