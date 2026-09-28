@@ -67,6 +67,17 @@ spec:
               value: "info"
             - name: RUSTFS_OBS_LOG_DIRECTORY
               value: "/logs"
+            # Browsers PUT/GET objects straight to this S3 port using the presigned URLs Atlas hands
+            # the console, from a *different origin* (the console is served from the gateway's
+            # NodePort 30510) — so without this RustFS answers the CORS preflight with no
+            # Access-Control-Allow-* headers and every browser upload fails ("Failed to fetch").
+            # Default is empty = no CORS headers. Scoped to exactly the console's origin, not "*".
+            - name: NODE_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+            - name: RUSTFS_CORS_ALLOWED_ORIGINS
+              value: "http://$(NODE_IP):30510"
             - name: RUSTFS_ACCESS_KEY
               valueFrom:
                 secretKeyRef:

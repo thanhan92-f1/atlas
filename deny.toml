@@ -31,19 +31,12 @@ ignore = [
     # attacker positioned to observe response-time variance; both call sites here talk to a
     # server-configured IdP/DB endpoint, not an arbitrary untrusted peer.
     "RUSTSEC-2023-0071",
-    # rustls-pemfile is unmaintained (RUSTSEC-2025-0134), not itself vulnerable — via axum-server
-    # (our own HTTPS listener) and kube-client. Both are actively-maintained crates that haven't
-    # migrated to rustls-pki-types' PemObject API yet; nothing we can fix by bumping a version.
-    "RUSTSEC-2025-0134",
-    # derivative (RUSTSEC-2024-0388) and instant (RUSTSEC-2024-0384) are both unmaintained, not
-    # vulnerable, transitive via kube-runtime/backoff (atlas-driver-k8s's Kubernetes client).
-    # `kube` has since jumped from 0.95 to a 4.x major that presumably drops both, but that's a
-    # real migration (breaking API changes across kube-client/kube-runtime) worth its own
-    # dedicated effort, not something to do opportunistically while wiring up this lint gate.
-    "RUSTSEC-2024-0388",
+    # instant (RUSTSEC-2024-0384) is unmaintained, not vulnerable, and still transitive after the
+    # 2026-09-28 dependency upgrade. (The same upgrade dropped derivative/backoff/rustls-pemfile
+    # from Cargo.lock entirely — kube 0.95 -> 4.2 and axum-server 0.7 -> 0.8 — so their ignores
+    # (RUSTSEC-2024-0388, RUSTSEC-2025-0012, RUSTSEC-2025-0134) were removed rather than kept "just
+    # in case": an ignore for a crate that's no longer built only hides a future regression.)
     "RUSTSEC-2024-0384",
-    # backoff (RUSTSEC-2025-0012), same kube-runtime 0.95 transitive family as the two above.
-    "RUSTSEC-2025-0012",
 ]
 
 [licenses]

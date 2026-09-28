@@ -14,11 +14,20 @@ Implemented:
   or Postgres (`ATLAS_DATABASE_URL=postgres://...`, HA/multi-replica) selected by URL scheme at
   startup, same SQL/migrations tree logic against both (`migrations/` SQLite,
   `migrations-postgres/` Postgres dialect) — axum 0.8 REST + `tonic` gRPC; async **job engine**.
-- **Three backends** behind `StorageDriver`, each with a `fake`/`real` `DriverMode` (fixture-only
-  by default, zero external dependency): Ceph (`ceph`/`rbd` CLI), **NFS** (`showmount`/`df`), and
-  **ZFS** (local `zpool`/`zfs list`) — plus a live K8s driver. Real drivers never fabricate data;
-  they propagate a real error when the target is unreachable. Discovery worker → inventory.
-- Write path: volumes (PVC + direct RBD), snapshots/clone/restore, CephFS RWX, RGW buckets + backups
+- **Pluggable backends** behind `StorageDriver`, each with a `fake`/`real` `DriverMode` (fixture-only
+  by default, zero external dependency): Ceph (`ceph`/`rbd` CLI), **NFS** (`showmount`/`df`),
+  **ZFS** (local `zpool`/`zfs list`), **RustFS** (S3-compatible; the **primary/default object
+  backend**, see `docs/RUSTFS.md`) and read-only **Longhorn** — plus a live K8s driver. Real drivers
+  never fabricate data; they propagate a real error when the target is unreachable. Discovery worker
+  → inventory. **RustFS is deployed for real** in the lab (`deploy/rustfs-lab/`, run by
+  `scripts/deploy-remote.sh`); bucket create/upload/download verified live through the console.
+- **Raw disk provisioning** (`docs/DISKS.md`): Disks console page + `GET /zfs/devices`,
+  `GET /ceph/nodes/{node}/devices` pickers, `POST /zfs/pools/from-device` (with explicit
+  `wipe_existing`) and `POST /ceph/devices`. **ZFS verified live on a real disk** (wiped a stale Ceph
+  OSD signature, created a pool). The gateway pod needs `privileged` + hostPath `/dev`, `/run/udev`
+  and `/proc/1/mountinfo` for this (`deploy/k8s/atlas-gateway.yaml`); active-pool members, the
+  root/boot disk and mounted devices are hard refusals that `wipe_existing` can never override.
+- Write path: volumes (PVC + direct RBD), snapshots/clone/restore, CephFS RWX, buckets (RustFS default, RGW) + backups
   (`export-diff`→S3, retention, presigned), scheduled snapshots/backups, per-tenant quotas + policies.
 - Observability: monitor/alerts + webhook, `/metrics` (Prometheus self), `/metrics/{history,forecast,ceph}`,
   Ceph-native `/ceph/{status,osd-tree,osd-df,df}`, unified `/events`, `/readyz`, OpenTelemetry
@@ -82,7 +91,10 @@ the `rbd mirror` paths are unverified), per-product integrations beyond the gRPC
 - `crates/atlas-driver-nfs` — `FakeNfsDriver`/`RealNfsDriver` (second backend; exports→pools,
   shares→filesystem volumes).
 - `crates/atlas-driver-zfs` — `FakeZfsDriver`/`RealZfsDriver` (third backend; zpools→pools,
-  datasets→filesystem volumes).
+  datasets→filesystem volumes) + raw-disk inspection/wipe/`zpool create` (`cmd.rs`).
+- `crates/atlas-driver-rustfs` — `FakeRustfsDriver`/`RealRustfsDriver` (S3 discovery, SigV4-signed);
+  the bucket/object *write* path is in `atlas-gateway`/`atlas-jobs` over the shared
+  `atlas-driver-rgw` `S3Target`.
 - `crates/atlas-databridge` — DataBridge: source connectors, assessment, CNPG/Percona CR builders,
   pipeline stages, reconciler (cloud-to-edge DB migration; `migrations/0011`, `/api/atlas/v1/databridge/*`).
 - `crates/atlas-driver-k8s` — `kube-rs` read-only StorageClass/PVC/PV listing.
@@ -110,6 +122,16 @@ the `rbd mirror` paths are unverified), per-product integrations beyond the gRPC
 - Match the monorepo Rust stack: axum 0.8, `sqlx::Any` (SQLite/Postgres, `$N` placeholders — no
   dialect-specific SQL in app code), `thiserror` 2.0 + `anyhow`, `tracing`.
 - Ceph/rbd command wrappers use **arg-arrays only, never string concatenation**.
+- **sqlx 0.9 only accepts `&'static str` SQL.** A dynamically built query string must be wrapped in
+  `sqlx::AssertSqlSafe(..)` with a one-line comment saying why nothing user-controlled is in it
+  (values always go through `$N` binds; the interpolated part is a const, a column list or a generated
+  `$1,$2,…` placeholder list). Prefer fixing it in the one helper that builds the string.
+- **rustls crypto provider**: `main()` installs `ring` before anything builds a TLS client. reqwest
+  0.13's default rustls backend enables `aws-lc-rs` too; with both features on and no explicit install
+  rustls panics at startup ("Could not automatically determine the process-level CryptoProvider").
+- Workspace dependencies were upgraded to latest majors on 2026-09-28 (kube 4.x, sqlx 0.9,
+  tonic/prost 0.14 — codegen is `tonic-prost-build` now — reqwest 0.13, argon2 0.6, …). Not bumped:
+  `azure_*` (no compatible release yet) and TypeScript 7 (typescript-eslint caps `<6.1.0`).
 
 ## Run locally (no Ceph, no cluster needed)
 ```

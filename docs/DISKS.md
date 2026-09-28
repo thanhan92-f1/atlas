@@ -36,7 +36,7 @@ limitation `RealZfsDriver` itself already has — ZFS has no remote query protoc
 Requires `ATLAS_ZFS_ENABLE=1` at startup. Before running `zpool create`, the job independently
 checks (via `lsblk`, `findmnt`, `wipefs`, `zpool status`) that the device: exists, is a whole disk,
 isn't read-only, has no partitions/filesystem/partition-table signature, isn't mounted, isn't
-already a zpool member, and isn't the host's actual mounted root/boot disk. `zpool create` is
+a member of a *currently imported* zpool, and isn't the host's actual mounted root/boot disk. `zpool create` is
 **never** passed `-f` — that flag exists specifically to override zpool's own built-in in-use
 refusal, which stays as an independent safety net underneath Atlas's own checks.
 
@@ -55,6 +55,17 @@ and resolving root/boot disks from it directly (`major:minor` → `/sys/dev/bloc
 parent whole-disk basename — sysfs block topology isn't mount-namespace-scoped, so this works from
 inside the container). The plain `findmnt` check and the static first-disk-name gate both stay in
 place unconditionally alongside it — this is additive, not a replacement.
+
+**Active pool members are a hard refusal (found live, 2026-09-28)**: a disk that belongs to an
+imported zpool is refused outright — `wipe_existing` cannot override it, and the picker hides it
+(status `zpool_member`) — because wiping a live pool's disk corrupts a running pool. (Stale ZFS
+labels from an exported/destroyed pool are the *wipeable* case: they show as a `zfs_member`
+filesystem signature, not pool membership.) The first version of this check missed real pools: a
+whole-disk pool lists the **partition** as its vdev (`zpool status -P` shows `/dev/sdb1` for a pool
+created on `/dev/sdb`), so an exact whole-disk comparison never matched and the live pool's disk was
+still offered as "wipeable". Matching now recognizes the device, its partitions (`sdb1`,
+`nvme1n1p1` — without confusing `sdbb` or `nvme1n11` for them) and by-id `-partN` aliases.
+Zero-size devices (unattached `/dev/nbd*` stubs) are not offered either.
 
 **Resolved live (2026-09-28)**: `zpool create` (whole-disk mode) writes a new GPT and then
 immediately reopens the partition device it just asked the kernel to create — but that reopen

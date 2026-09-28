@@ -21,6 +21,7 @@ export default function Buckets() {
   const [objBucket, setObjBucket] = useState<StorageBucket | null>(null);
   const n = data?.length || 0;
 
+  // NB: /backends records are keyed `id` (only /backends/summary uses `backend_id`).
   // Backends that can host buckets, RustFS first (it's the default object backend for new buckets).
   const objectBackends = (backends || [])
     .filter((b) => b.backend_type === "rustfs" || b.backend_type === "ceph")
@@ -29,7 +30,7 @@ export default function Buckets() {
   // Legacy bucket rows (created before backend_id was recorded) are Ceph RGW.
   const bucketBackend = (b: StorageBucket) => {
     if (!b.backend_id) return "Ceph RGW";
-    const rec = (backends || []).find((x) => x.backend_id === b.backend_id);
+    const rec = (backends || []).find((x) => x.id === b.backend_id);
     return backendLabel(rec?.backend_type) === "?" ? b.backend_id : backendLabel(rec?.backend_type);
   };
 
@@ -96,12 +97,12 @@ export default function Buckets() {
 
       <FormModal open={create} onClose={() => setCreate(false)} title="Create bucket" submitLabel="Create"
         fields={(vals): FormField[] => {
-          const sel = vals.backend_id || objectBackends[0]?.backend_id;
-          const selType = objectBackends.find((b) => b.backend_id === sel)?.backend_type;
+          const sel = vals.backend_id || objectBackends[0]?.id;
+          const selType = objectBackends.find((b) => b.id === sel)?.backend_type;
           const out: FormField[] = [
             {
               name: "backend_id", label: "Backend",
-              options: objectBackends.map((b) => ({ value: b.backend_id, label: `${backendLabel(b.backend_type)} (${b.backend_id})` })),
+              options: objectBackends.map((b) => ({ value: b.id, label: `${backendLabel(b.backend_type)} (${b.id})` })),
               hint: "No object backend registered.",
             },
             {
@@ -122,8 +123,8 @@ export default function Buckets() {
           return out;
         }}
         onSubmit={(v) => {
-          const backendId = v.backend_id || objectBackends[0]?.backend_id;
-          const isCeph = objectBackends.find((b) => b.backend_id === backendId)?.backend_type === "ceph";
+          const backendId = v.backend_id || objectBackends[0]?.id;
+          const isCeph = objectBackends.find((b) => b.id === backendId)?.backend_type === "ceph";
           const body: Record<string, unknown> = { name: v.name, backend_id: backendId };
           if (isCeph) {
             body.namespace = v.namespace;
@@ -160,9 +161,12 @@ function ObjectBrowser({ bucket, onClose }: { bucket: StorageBucket | null; onCl
   // each upload is stored as a timestamped version and old ones are pruned to keep N (db backups).
   const upload = async (files: FileList | null) => {
     if (!files || !files.length) return;
+    // Snapshot first: `files` is a live FileList that the browser empties when the input's value
+    // is reset, which made the success toast below report "uploaded 0 file(s)".
+    const list = Array.from(files);
     setBusy(true);
     try {
-      for (const file of Array.from(files)) {
+      for (const file of list) {
         const key = (prefix ? prefix.replace(/\/+$/, "") + "/" : "") + file.name;
         const versioned = keep > 0;
         const r = await http.post(`/buckets/${bucket.id}/objects/upload-url`, { key, versioned });
@@ -170,7 +174,7 @@ function ObjectBrowser({ bucket, onClose }: { bucket: StorageBucket | null; onCl
         if (!put.ok) throw new Error(`upload ${file.name}: HTTP ${put.status}`);
         if (versioned) await http.post(`/buckets/${bucket.id}/objects/prune`, { prefix: r.data.base_key + ".", keep });
       }
-      toast(`uploaded ${files.length} file(s)${keep > 0 ? `, keeping ${keep} versions` : ""}`, "ok");
+      toast(`uploaded ${list.length} file(s)${keep > 0 ? `, keeping ${keep} versions` : ""}`, "ok");
       await load(prefix);
     } catch (e) { toast(String(e), "err"); }
     finally { setBusy(false); }

@@ -486,8 +486,34 @@ pub async fn list_whole_disks() -> Result<Vec<BlockDevice>, DriverError> {
     Ok(out)
 }
 
-/// Scan `zpool status -P` output for a pool that lists this device (or a by-id alias resolving to
-/// it) as a vdev. Returns the owning pool's name if found.
+/// Whether `vdev` (a name as printed in `zpool status -P`) is `device` itself or one of its
+/// partitions. ZFS whole-disk pools are labeled with a GPT and list the *partition* as the vdev
+/// (confirmed live: a pool created on /dev/sdb shows `/dev/sdb1`), so an exact-path comparison
+/// alone never recognizes the disk as a pool member.
+///
+/// Partition naming: names ending in a digit (nvme1n1, mmcblk0) separate the number with `p`
+/// (nvme1n1p1); others just append it (sdb1). Requiring that exact shape keeps `/dev/nvme1n11`
+/// (a different namespace) and `/dev/sdbb` (a different disk) from matching `/dev/nvme1n1` / `/dev/sdb`.
+fn is_device_or_partition(vdev: &str, device: &str) -> bool {
+    if vdev == device {
+        return true;
+    }
+    let Some(rest) = vdev.strip_prefix(device) else {
+        return false;
+    };
+    let digits = if device.ends_with(|c: char| c.is_ascii_digit()) {
+        match rest.strip_prefix('p') {
+            Some(d) => d,
+            None => return false,
+        }
+    } else {
+        rest
+    };
+    !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Scan `zpool status -P` output for a pool that lists this device — or one of its partitions, or
+/// a `/dev/disk/by-id` alias of either — as a vdev. Returns the owning pool's name if found.
 fn find_zpool_member(
     status: &str,
     device_path: &str,
@@ -504,8 +530,17 @@ fn find_zpool_member(
         let Some(first_field) = trimmed.split_whitespace().next() else {
             continue;
         };
-        let matches_direct = first_field == device_path || first_field.ends_with(basename);
-        let matches_by_id = by_id_aliases.contains(&first_field);
+        // by-id partitions are `<alias>-part<N>`.
+        let matches_by_id = by_id_aliases.iter().any(|alias| {
+            first_field == *alias
+                || first_field
+                    .strip_prefix(alias)
+                    .and_then(|r| r.strip_prefix("-part"))
+                    .is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
+        });
+        let matches_direct = is_device_or_partition(first_field, device_path)
+            // Bare (non -P) names, for robustness if the caller's status output isn't full-path.
+            || is_device_or_partition(first_field, basename);
         if (matches_direct || matches_by_id) && current_pool.is_some() {
             return current_pool.map(str::to_string);
         }
@@ -757,6 +792,47 @@ mod tests {
     fn pool_and_cluster_ids_match_the_driver_scheme() {
         assert_eq!(pool_id("tank"), "pool_zfs_tank");
         assert_eq!(cluster_id("zfs01.zyvor.lab"), "cls_zfs_zfs01_zyvor_lab");
+    }
+
+    /// The exact `zpool status -P` shape captured live for a whole-disk pool on /dev/sdb.
+    const LIVE_STATUS: &str = "  pool: tank0\n state: ONLINE\nconfig:\n\n\tNAME         STATE     READ WRITE CKSUM\n\ttank0        ONLINE       0     0     0\n\t  /dev/sdb1  ONLINE       0     0     0\n\nerrors: No known data errors\n";
+
+    #[test]
+    fn whole_disk_pool_lists_the_partition_and_still_counts_as_a_member() {
+        // Regression for a bug found live: the vdev is /dev/sdb1, not /dev/sdb.
+        assert_eq!(
+            find_zpool_member(LIVE_STATUS, "/dev/sdb", "sdb", &[]),
+            Some("tank0".into())
+        );
+    }
+
+    #[test]
+    fn zpool_membership_does_not_bleed_onto_other_disks() {
+        assert_eq!(find_zpool_member(LIVE_STATUS, "/dev/sdc", "sdc", &[]), None);
+        // /dev/sdbb is a different disk whose name merely starts with "sdb".
+        assert_eq!(find_zpool_member(LIVE_STATUS, "/dev/sdbb", "sdbb", &[]), None);
+    }
+
+    #[test]
+    fn partition_name_shapes() {
+        assert!(is_device_or_partition("/dev/sdb", "/dev/sdb"));
+        assert!(is_device_or_partition("/dev/sdb1", "/dev/sdb"));
+        assert!(is_device_or_partition("/dev/sdb12", "/dev/sdb"));
+        assert!(!is_device_or_partition("/dev/sdbb", "/dev/sdb"));
+        assert!(!is_device_or_partition("/dev/sdb1x", "/dev/sdb"));
+        // Names ending in a digit use the `p` separator; a bare digit suffix is another device.
+        assert!(is_device_or_partition("/dev/nvme1n1p1", "/dev/nvme1n1"));
+        assert!(!is_device_or_partition("/dev/nvme1n11", "/dev/nvme1n1"));
+        assert!(!is_device_or_partition("/dev/nvme1n1p", "/dev/nvme1n1"));
+    }
+
+    #[test]
+    fn by_id_partition_alias_counts_as_a_member() {
+        let status = "  pool: tank1\nconfig:\n\tNAME STATE\n\t  /dev/disk/by-id/ata-WDC_X-part1  ONLINE\n";
+        assert_eq!(
+            find_zpool_member(status, "/dev/sdd", "sdd", &["/dev/disk/by-id/ata-WDC_X"]),
+            Some("tank1".into())
+        );
     }
 
     #[test]
