@@ -19,6 +19,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history: the migrations-immutability check diffs against the base commit.
+          fetch-depth: 0
       # Pinned to match rust-toolchain.toml's `channel` — dtolnay/rust-toolchain resolves its
       # version from the @rev of the action itself, not from rust-toolchain.toml, so the two
       # must be bumped together or CI silently drifts back to a rolling "stable".
@@ -38,6 +41,8 @@ jobs:
         run: ./scripts/check-license-headers.sh
       - name: Migrations parity (migrations/ vs migrations-postgres/)
         run: ./scripts/check-migrations-parity.sh
+      - name: Migrations are immutable once committed (sqlx checksums)
+        run: ./scripts/check-migrations-immutable.sh "${{ github.event.pull_request.base.sha || github.event.before }}"
       # Non-blocking: the committed style is denser than stable rustfmt's defaults (~280 files of
       # drift). Clippy (-D warnings), tests, and build below are the enforced Rust gates; fmt is
       # surfaced so drift is visible without failing every PR. Prefer `make fmt` on touched files.
