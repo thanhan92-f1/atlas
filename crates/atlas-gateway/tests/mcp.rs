@@ -111,11 +111,11 @@ async fn mcp_client_can_list_clusters_and_run_advisor() {
     let (token, _, _) =
         atlas_gateway::auth::mint_token(secret, "hermes", "operator", "global", 3600).unwrap();
 
-    let http_client = reqwest_mcp_client::Client::builder()
+    let http_client = reqwest::Client::builder()
         .default_headers({
-            let mut headers = reqwest_mcp_client::header::HeaderMap::new();
+            let mut headers = reqwest::header::HeaderMap::new();
             headers.insert(
-                reqwest_mcp_client::header::AUTHORIZATION,
+                reqwest::header::AUTHORIZATION,
                 format!("Bearer {token}").parse().unwrap(),
             );
             headers
@@ -240,11 +240,11 @@ async fn mcp_list_volumes_is_tenant_scoped() {
     let (viewer_a, _, _) =
         atlas_gateway::auth::mint_token(secret, "alice", "viewer", "tenant-a", 3600).unwrap();
 
-    let http_client = reqwest_mcp_client::Client::builder()
+    let http_client = reqwest::Client::builder()
         .default_headers({
-            let mut headers = reqwest_mcp_client::header::HeaderMap::new();
+            let mut headers = reqwest::header::HeaderMap::new();
             headers.insert(
-                reqwest_mcp_client::header::AUTHORIZATION,
+                reqwest::header::AUTHORIZATION,
                 format!("Bearer {viewer_a}").parse().unwrap(),
             );
             headers
