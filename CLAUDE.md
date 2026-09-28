@@ -29,7 +29,7 @@ Implemented:
   and `/proc/1/mountinfo` for this (`deploy/k8s/atlas-gateway.yaml`); active-pool members, the
   root/boot disk and mounted devices are hard refusals that `wipe_existing` can never override.
   `POST /zfs/pools/{name}/destroy` (Disks page **Destroy…**, typed-name confirm) tears a pool down
-  again (fake-mode-tested; not yet run on the lab's real pool).
+  again (verified live: destroyed `tank0`, re-provisioned `sdb` as `tank1`).
 - Write path: volumes (PVC + direct RBD), snapshots/clone/restore, CephFS RWX, buckets (RustFS default, RGW) + backups
   (`export-diff`→S3, retention, presigned), scheduled snapshots/backups, per-tenant quotas + policies.
 - Observability: monitor/alerts + webhook, `/metrics` (Prometheus self), `/metrics/{history,forecast,ceph}`,

@@ -105,8 +105,10 @@ succeeded (or after `zpool list` shows the pool is already gone). The member dis
 labels, so it reappears in the Disks picker as a `zfs_member` device that can be re-provisioned with
 the explicit wipe option — that is the destroy → wipe → re-provision cycle.
 
-Status: unit- and fake-mode-tested (`tests/disks.rs`); **not yet run against a real pool** on the lab
-(the only pool there is `tank0`, and destroying it was left to the operator).
+Status: unit- and fake-mode-tested (`tests/disks.rs`) and **verified live (2026-09-28)** through the
+console on the lab host: destroyed the real pool `tank0` (job succeeded, pool gone from inventory),
+`/dev/sdb` reappeared in the picker as "has data — wipeable", and re-provisioning it with the wipe
+option as `tank1` succeeded (`zpool status`: `tank1` ONLINE on `sdb`, zero errors, 928G).
 
 ## Ceph: `POST /api/atlas/v1/ceph/devices`
 
