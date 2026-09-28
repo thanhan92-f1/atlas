@@ -296,6 +296,16 @@ spec:
             # container's own minimal devtmpfs.
             - name: host-dev
               mountPath: /dev
+            # zpool create's own partition-reopen wait polls udev's device database
+            # (/run/udev/data/b<major>:<minor>) to know the partition it just asked the kernel to
+            # create is ready — found live via strace: without this mount that file can NEVER
+            # appear from inside the container (ENOENT forever, not a timing race), so every
+            # whole-disk zpool create failed identically no matter how many times zpool_create's
+            # own retry (see atlas-driver-zfs) waited. Read-only: this is metadata lookup only,
+            # nothing here ever needs to write into the host's udev database.
+            - name: host-run-udev
+              mountPath: /run/udev
+              readOnly: true
       volumes:
         - name: data
           persistentVolumeClaim:
@@ -303,6 +313,10 @@ spec:
         - name: host-dev
           hostPath:
             path: /dev
+            type: Directory
+        - name: host-run-udev
+          hostPath:
+            path: /run/udev
             type: Directory
 ---
 # Durable SQLite storage. Uses the cluster's DEFAULT StorageClass (omit storageClassName) so this
