@@ -647,7 +647,7 @@ pub(crate) fn spawn_rustfs_auto(s: AppState) {
             }
             let Ok(found) = find_instances(&s).await else { continue };
             match found.iter().find(|i| i.name == instance) {
-                None if installed_at.map_or(true, |t| t.elapsed() > std::time::Duration::from_secs(300)) => {
+                None if installed_at.is_none_or(|t| t.elapsed() > std::time::Duration::from_secs(300)) => {
                     let used: Vec<i64> = found
                         .iter()
                         .flat_map(|i| [i.s3_port, i.console_port])
