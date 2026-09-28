@@ -21,7 +21,9 @@ Implemented:
   never fabricate data; they propagate a real error when the target is unreachable. Discovery worker
   → inventory. **RustFS is deployed for real** in the lab (`deploy/rustfs-lab/`, run by
   `scripts/deploy-remote.sh`); bucket create/upload/download, multipart, delete and a console
-  **self-test** (`POST /backends/{id}/selftest`) verified live; the lab's self-state backup targets it.
+  **self-test** (`POST /backends/{id}/selftest`), DataBridge **Object Migrations** page and the Helm
+  chart (`rustfs.server`, `disks.enabled`, `scripts/helm-lab-remote.sh`) verified live; the lab's
+  self-state backup targets it.
 - **Raw disk provisioning** (`docs/DISKS.md`): Disks console page + `GET /zfs/devices`,
   `GET /ceph/nodes/{node}/devices` pickers, `POST /zfs/pools/from-device` (with explicit
   `wipe_existing`) and `POST /ceph/devices`. **ZFS verified live on a real disk** (wiped a stale Ceph

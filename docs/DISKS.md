@@ -110,6 +110,18 @@ console on the lab host: destroyed the real pool `tank0` (job succeeded, pool go
 `/dev/sdb` reappeared in the picker as "has data — wipeable", and re-provisioning it with the wipe
 option as `tank1` succeeded (`zpool status`: `tank1` ONLINE on `sdb`, zero errors, 928G).
 
+### Helm-deployed gateway (`disks.enabled`) — verified live
+
+Same cycle through the console of a **Helm-installed** gateway (`deploy/helm/atlas`,
+`disks.enabled=true`, release `atlas-helm`), 2026-09-28: while the primary gateway's pool `tank1`
+owned `sdb`, the Helm gateway's picker listed no usable disks (`sdb` is an active pool member — hard
+refusal). After `tank1` was destroyed from the primary console, the Helm console offered `sdb` as
+"has data — wipeable", formatted it with the wipe option as `tankh` (`zpool status`: ONLINE, zero
+errors), and destroyed it again; `tank1` was then re-created from the primary console. Each gateway's
+inventory only knows the pools it created, so one gateway cannot destroy the other's pool. Two
+privileged, disk-enabled gateways on one node see the same physical disks — let only one own a pool at
+a time.
+
 ## Ceph: `POST /api/atlas/v1/ceph/devices`
 
 ```json

@@ -119,11 +119,31 @@ use (`HeadBucket` → `CreateBucket`).
 - **Self-state backup**: two uploads (`atlas-state/atlas-state-*.db`, ~545 KB) into RustFS, the
   second into the already-existing bucket.
 
+### Verified live, second pass (2026-09-28)
+
+- **Console walk (raw-manifest gateway):** object browser; **50 MiB browser upload** and presigned
+  download **byte-identical** (SHA-256 matched); keep-N versioned uploads (3 uploads, keep 2 → 2
+  remain); object delete; bucket delete **refused while non-empty** (`BucketNotEmpty` shown in the
+  UI), then succeeded once emptied; "stats unavailable" copy for RustFS buckets.
+- **DataBridge object migration into RustFS** from the new **Object Migrations** console page
+  (RustFS → RustFS, credentials resolved server-side via `source_backend_id`/`dest_backend_id`):
+  `completed`, verified — on both the raw-manifest gateway (54 B) and the Helm gateway (8 MiB).
+- **Helm deployment** (`deploy/helm/atlas`, `rustfs.server.enabled`, release `atlas-helm`, side by
+  side with the raw-manifest install): the in-chart RustFS server and credentials Secret came up, the
+  gateway registered and discovered it, its state backup uploaded into it, the CORS preflight allowed
+  only the console origin, and through the Helm console the self-test passed, buckets were created in
+  the release namespace, an 8 MiB browser upload worked and a migration completed.
+
+## Helm
+
+See [`deploy/helm/atlas/README.md`](../deploy/helm/atlas/README.md): `rustfs.enabled`,
+`rustfs.server.*` (lab single-volume server, generate-once credentials Secret, CORS origin),
+`stateBackup.useRustfs`, and `disks.enabled` for raw-disk formatting.
+
 ## Still unverified against a real RustFS
 
-- **DataBridge object migration with a RustFS destination** — it uses the same `S3Target`
-  multipart path the self-test just exercised, but a full migration run needs source/destination
-  credentials in the request body and has not been run.
+- **DataBridge object migration from a non-RustFS source** (AWS/GCS/Azure) into RustFS — only the
+  RustFS → RustFS leg was run.
 - **Volume backups to RustFS** (`export-diff` → S3) — needs Ceph RBD, which the lab host has none of.
 - Real S3 object *versioning* (the `?versions` API) — Atlas's "versioned uploads" are a key-suffix
   convention, which the self-test does cover.
