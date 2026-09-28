@@ -59,6 +59,9 @@ uuid = { workspace = true }
 # picking a different provider here would risk two providers fighting over install_default().
 tonic = { version = "0.14", features = ["tls-ring"] }
 tonic-reflection = "0.14"
+# The prost codec (ProstCodec) that tonic-prost-build's generated service code references — split
+# out of tonic itself in 0.14, so it's a separate runtime dependency now.
+tonic-prost = "0.14"
 prost = "0.14"
 async-stream = "0.3"
 tokio-stream = "0.1"

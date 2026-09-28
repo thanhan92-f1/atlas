@@ -274,13 +274,15 @@ pub(crate) fn verify_console_credentials(
 /// for storage in `console_users`. Argon2 is memory-hard, unlike the plain SHA-256 this replaced —
 /// a leaked `console_users` table can no longer be brute-forced offline at GPU/ASIC speed.
 pub(crate) fn hash_password(password: &str) -> String {
-    use argon2::password_hash::{rand_core::OsRng, PasswordHasher, SaltString};
+    use argon2::password_hash::phc::PasswordHash;
+    use argon2::password_hash::PasswordHasher;
     use argon2::Argon2;
-    let salt = SaltString::generate(&mut OsRng);
-    Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
-        .expect("argon2 hashing with a freshly generated salt cannot fail")
-        .to_string()
+    // password-hash 0.6 generates the salt itself from the OS RNG (no more explicit SaltString/OsRng);
+    // the explicit `PasswordHash` annotation pins which `PasswordHasher<H>` impl is meant.
+    let hash: PasswordHash = Argon2::default()
+        .hash_password(password.as_bytes())
+        .expect("argon2 hashing with default params and OS randomness cannot fail");
+    hash.to_string()
 }
 
 /// Verify a password against a stored hash. Accepts the current Argon2id PHC-string format
@@ -288,7 +290,8 @@ pub(crate) fn hash_password(password: &str) -> String {
 /// legacy `sha256$<salt>$<digest>` format — no forced password reset on upgrade.
 pub(crate) fn verify_password_hash(password: &str, stored: &str) -> bool {
     if stored.starts_with('$') {
-        use argon2::password_hash::{PasswordHash, PasswordVerifier};
+        use argon2::password_hash::phc::PasswordHash;
+        use argon2::password_hash::PasswordVerifier;
         use argon2::Argon2;
         let Ok(parsed) = PasswordHash::new(stored) else {
             return false;
