@@ -72,8 +72,10 @@ default = []
 # protocol surface + dependency chain (rmcp-macros/schemars) that not every deployment wants compiled in.
 mcp = ["dep:rmcp", "dep:schemars"]
 
+# tonic-build 0.14 split its prost-specific codegen (configure()/compile_protos()) out into this
+# separate crate — plain tonic-build now only generates service stubs generically.
 [build-dependencies]
-tonic-build = "0.14"
+tonic-prost-build = "0.14"
 
 [dev-dependencies]
 reqwest = { workspace = true }
