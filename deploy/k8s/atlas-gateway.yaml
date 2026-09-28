@@ -235,6 +235,11 @@ spec:
               value: "real"
             - name: ATLAS_ZFS_HOST
               value: "$(NODE_IP)"
+            # Closes the root/boot-disk detection gap: without this, the dynamic check can only
+            # see the container's own mount namespace (via `findmnt`), not the host's — see
+            # docs/DISKS.md and host-mountinfo below.
+            - name: ATLAS_HOST_MOUNTINFO_PATH
+              value: "/host-mountinfo"
             # OIDC/SSO login against the throwaway Dex instance (see deploy/dex-lab/) — a lab-only
             # test IdP, not a real identity provider. Remove these four ATLAS_OIDC_* vars (or leave
             # Dex torn down) to disable the "Sign in with SSO" button; the feature auto-gates off
@@ -306,6 +311,15 @@ spec:
             - name: host-run-udev
               mountPath: /run/udev
               readOnly: true
+            # The host's real root-mount-namespace mount table (PID 1 on the node, i.e. the
+            # node's own init) — read-only, a single virtual file, not the whole host /proc. Lets
+            # the ZFS root/boot-disk check resolve the *host's* actual root/boot device instead of
+            # only ever seeing the container's own mount namespace via `findmnt` (confirmed live:
+            # without this, /dev/sda — this lab host's real root disk — wasn't flagged and showed
+            # up in the Disks UI picker as safely wipeable). See docs/DISKS.md.
+            - name: host-mountinfo
+              mountPath: /host-mountinfo
+              readOnly: true
       volumes:
         - name: data
           persistentVolumeClaim:
@@ -318,6 +332,10 @@ spec:
           hostPath:
             path: /run/udev
             type: Directory
+        - name: host-mountinfo
+          hostPath:
+            path: /proc/1/mountinfo
+            type: File
 ---
 # Durable SQLite storage. Uses the cluster's DEFAULT StorageClass (omit storageClassName) so this
 # deploys on any cluster — including one without Ceph yet (e.g. k3s local-path). The real-mode

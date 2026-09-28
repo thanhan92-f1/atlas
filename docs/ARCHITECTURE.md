@@ -174,6 +174,7 @@ secret-redacting `Debug`:
 | `ATLAS_NFS_DRIVER_MODE` / `ATLAS_ZFS_DRIVER_MODE` / `ATLAS_RUSTFS_DRIVER_MODE` | `fake` | `real` (live `showmount`/`zpool`/`zfs`/RustFS discovery) or `fake` (fixtures) |
 | `ATLAS_RUSTFS_CREDENTIALS_NAMESPACE` | `zyvor-system` | Namespace of the k8s Secret holding the RustFS backend's `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` (referenced by `StorageBackend.connection_ref`) |
 | `ATLAS_LONGHORN_ENABLE` | `0` | Register the read-only Longhorn backend (see `docs/LONGHORN.md`) |
+| `ATLAS_HOST_MOUNTINFO_PATH` | *(unset)* | Path to a hostPath-mounted `/proc/1/mountinfo` (e.g. `/host-mountinfo`) so the ZFS root/boot-disk safety check can see the *host's* real mount table from inside a container, not just its own mount namespace — see `docs/DISKS.md` |
 | `ATLAS_RATE_LIMIT_RPM` | `600` | Per-actor per-minute request budget |
 | `ATLAS_RATE_LIMIT_SYNC_SECS` | `2` | Cross-replica rate-limit counter sync interval (Postgres only) |
 | `ATLAS_STATE_BACKUP_SECS` | *(unset)* | Interval for periodic self-state backup to S3 (RGW today; repointing to RustFS is a config change, not yet done in the lab — see `docs/RUSTFS.md`) |

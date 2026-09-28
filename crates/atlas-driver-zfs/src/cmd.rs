@@ -177,6 +177,35 @@ async fn resolve_mounted_disk_basename(mountpoint: &str) -> Option<String> {
     }
 }
 
+/// Same goal as `resolve_mounted_disk_basename` (find the whole-disk basename backing a
+/// mountpoint), but reads the *host's* real mount table via a hostPath-mounted
+/// `/proc/1/mountinfo` (path given by `ATLAS_HOST_MOUNTINFO_PATH`) instead of `findmnt`, which
+/// only ever sees the calling *container's* own mount namespace. Closes the gap documented on
+/// `inspect_device`'s step 4 below: on a containerized deploy without this env var set, the plain
+/// `findmnt`-based check is blind to the host's actual root/boot disk (confirmed live: `/dev/sda`
+/// wasn't flagged). A no-op (`None`) when the env var is unset — e.g. `make run` local dev, or
+/// the gateway running as a bare process directly on the host, where the plain check already
+/// works and this hostPath mount doesn't exist.
+///
+/// mountinfo's fields are space-separated; field 3 (0-indexed 2) is `major:minor`, field 5
+/// (0-indexed 4) is the mountpoint — see proc(5). `major:minor` is resolved to a device name via
+/// `/sys/dev/block/<maj>:<min>`, a symlink whose target's parent directory name is the whole
+/// disk's basename (e.g. `.../block/sda/sda2` → `sda`) — sysfs block-device topology isn't
+/// mount-namespace-scoped, so this works from inside the container same as it would on the host.
+async fn resolve_host_mounted_disk_basename(mountpoint: &str) -> Option<String> {
+    let path = std::env::var("ATLAS_HOST_MOUNTINFO_PATH").ok()?;
+    let content = tokio::fs::read_to_string(&path).await.ok()?;
+    let maj_min = content.lines().find_map(|line| {
+        let fields: Vec<&str> = line.split(' ').collect();
+        (fields.len() > 4 && fields[4] == mountpoint).then(|| fields[2])
+    })?;
+    let target = tokio::fs::read_link(format!("/sys/dev/block/{maj_min}"))
+        .await
+        .ok()?;
+    let parent_dir = target.parent()?.file_name()?.to_str()?;
+    Some(parent_dir.to_string())
+}
+
 /// Runs every read-only safety probe against `device_path`. Never mutates anything.
 pub async fn inspect_device(device_path: &str) -> Result<DeviceCheck, DriverError> {
     let mut check = DeviceCheck::default();
@@ -252,20 +281,24 @@ pub async fn inspect_device(device_path: &str) -> Result<DeviceCheck, DriverErro
     // 4. Dynamic root/boot-disk refusal: resolve the host's actual mounted root/boot devices to
     // their parent whole-disk basenames and compare against this device's own basename. In
     // principle stronger than any static allow-list heuristic, since the real boot disk isn't
-    // always the first letter/index (cloud images, unusual partitioning) — BUT this is blind when
-    // the gateway runs in a container without visibility into the *host's* mount namespace (e.g.
-    // the k8s lab deploy: `findmnt -n -o SOURCE /` inside the container resolves the container's
-    // own rootfs, not the host's — confirmed live: `/dev/sda`, this host's actual root/boot disk,
-    // was not flagged by this check alone). `is_conventional_first_disk` below is the fallback for
-    // exactly that blind spot; `validate_raw_device_path` (atlas-common) enforces the same rule
-    // independently at the route/dispatch layer regardless of what `DeviceCheck` reports.
+    // always the first letter/index (cloud images, unusual partitioning) — BUT `findmnt` alone is
+    // blind when the gateway runs in a container without visibility into the *host's* mount
+    // namespace (e.g. the k8s lab deploy: `findmnt -n -o SOURCE /` inside the container resolves
+    // the container's own rootfs, not the host's — confirmed live: `/dev/sda`, this host's actual
+    // root/boot disk, was not flagged by `findmnt` alone). `resolve_host_mounted_disk_basename`
+    // closes that gap when `ATLAS_HOST_MOUNTINFO_PATH` is set (a hostPath-mounted
+    // `/proc/1/mountinfo`); `is_conventional_first_disk` below is the last-resort static fallback
+    // when neither dynamic check can see the host's real mounts. `validate_raw_device_path`
+    // (atlas-common) enforces that same static rule independently at the route/dispatch layer
+    // regardless of what `DeviceCheck` reports.
     let target_basename = basename(device_path);
     for mountpoint in ["/", "/boot", "/boot/efi"] {
-        if let Some(disk) = resolve_mounted_disk_basename(mountpoint).await {
-            if disk == target_basename {
-                check.is_root_or_boot_disk = true;
-                break;
-            }
+        let disk = resolve_mounted_disk_basename(mountpoint).await;
+        let host_disk = resolve_host_mounted_disk_basename(mountpoint).await;
+        if disk.as_deref() == Some(target_basename) || host_disk.as_deref() == Some(target_basename)
+        {
+            check.is_root_or_boot_disk = true;
+            break;
         }
     }
     if is_conventional_first_disk(target_basename) {
@@ -358,10 +391,14 @@ pub async fn list_whole_disks() -> Result<Vec<BlockDevice>, DriverError> {
         .unwrap_or_default();
 
     // Root/boot-disk resolution done once, matched by basename against every listed disk — see
-    // `inspect_device`'s step 4 for why this is dynamic rather than a static first-letter guess.
+    // `inspect_device`'s step 4 for why this checks both the container's own `findmnt` view and,
+    // when set, the host's real mount table via `ATLAS_HOST_MOUNTINFO_PATH`.
     let mut root_boot_basenames = std::collections::HashSet::new();
     for mountpoint in ["/", "/boot", "/boot/efi"] {
         if let Some(disk) = resolve_mounted_disk_basename(mountpoint).await {
+            root_boot_basenames.insert(disk);
+        }
+        if let Some(disk) = resolve_host_mounted_disk_basename(mountpoint).await {
             root_boot_basenames.insert(disk);
         }
     }

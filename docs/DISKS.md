@@ -40,22 +40,21 @@ already a zpool member, and isn't the host's actual mounted root/boot disk. `zpo
 **never** passed `-f` — that flag exists specifically to override zpool's own built-in in-use
 refusal, which stays as an independent safety net underneath Atlas's own checks.
 
-**Known gap, found live (2026-09-28), not yet fully closed**: the root/boot-disk check is
-*dynamic* (resolves the host's actual mounted root/boot device via `findmnt`) specifically so it
-isn't fooled by an unconventional layout where the boot disk isn't the first letter/index. That
-dynamic check is blind when the gateway runs in a container without visibility into the *host's*
-mount namespace — as it does in the current `deploy/k8s/atlas-gateway.yaml` lab deploy (privileged
-+ hostPath `/dev`, but no `hostPID`/host mountinfo access). Confirmed live: on that deploy, `/dev/sda`
-(this lab host's actual root/boot disk) was **not** flagged by the dynamic check alone, and showed
-up in the Disks UI's device picker as "has data — wipeable". `atlas_common::device::validate_raw_device_path`'s
-static name-based refusal (`sda`/`vda`/`nvme0n1`) still independently blocks an actual submit
-against it regardless — so no real host has had its root disk formatted by this — but the dynamic
-check's reliability claim above only holds for a deployment where the gateway can actually see the
-host's mount table (e.g. running as a bare process directly on the host, matching `RealZfsDriver`'s
-own original "local-host-only" design assumption). Until this is closed, treat the static
-first-disk-name gate as the primary defense on any containerized deploy, not a redundant cheap
-first filter — an unconventional boot-disk layout on a containerized deploy is not fully protected
-today.
+**Found live, then closed (2026-09-28)**: the root/boot-disk check is *dynamic* (resolves the
+host's actual mounted root/boot device) specifically so it isn't fooled by an unconventional layout
+where the boot disk isn't the first letter/index — but doing that via `findmnt` alone is blind when
+the gateway runs in a container without visibility into the *host's* mount namespace. Confirmed
+live: on the `deploy/k8s/atlas-gateway.yaml` lab deploy (before this fix), `/dev/sda` (this lab
+host's actual root/boot disk) was **not** flagged by `findmnt` alone, and showed up in the Disks
+UI's device picker as "has data — wipeable" — `atlas_common::device::validate_raw_device_path`'s
+static name-based refusal (`sda`/`vda`/`nvme0n1`) still independently blocked an actual submit
+against it regardless, so no real host ever had its root disk formatted by this. Closed by also
+hostPath-mounting the host's real root-mount-namespace mount table as a single read-only file
+(`/proc/1/mountinfo` on the node → `/host-mountinfo` in the container, `ATLAS_HOST_MOUNTINFO_PATH`)
+and resolving root/boot disks from it directly (`major:minor` → `/sys/dev/block/<maj>:<min>` →
+parent whole-disk basename — sysfs block topology isn't mount-namespace-scoped, so this works from
+inside the container). The plain `findmnt` check and the static first-disk-name gate both stay in
+place unconditionally alongside it — this is additive, not a replacement.
 
 **Resolved live (2026-09-28)**: `zpool create` (whole-disk mode) writes a new GPT and then
 immediately reopens the partition device it just asked the kernel to create — but that reopen
