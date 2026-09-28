@@ -1,3 +1,5 @@
+<!-- Copyright (c) 2026 ZyvorAI Labs Private Limited. -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 # Social assets
 
 The README hero and the GitHub social preview. Two variants, one palette.
