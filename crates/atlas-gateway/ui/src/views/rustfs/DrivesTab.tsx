@@ -9,7 +9,26 @@ import Disks from "../Disks";
 import { http } from "../../api/client";
 import { asArr, asNum, asRec, asStr, rfsError, rfsWrite, useRefreshRustfs, useRustfs, type Rec } from "./api";
 import InstancesSection from "./InstancesSection";
-import { LoadError, Muted, RawJson, Section, escapeRegExp } from "./common";
+import { Dynamic, LoadError, Muted, RawJson, Section, escapeRegExp } from "./common";
+
+/** Read-only: tier add/edit/remove need a remote target's credentials, deferred (see docs/RUSTFS.md). */
+function TiersSection() {
+  const tiers = useRustfs("tier");
+  const stats = useRustfs("tier-stats");
+  const rows = asArr(tiers.data);
+  return (
+    <Section title="Tiers">
+      {tiers.error ? (
+        <Muted>{rfsError(tiers.error)}</Muted>
+      ) : rows.length === 0 && tiers.data != null ? (
+        <Muted>No tiers configured.</Muted>
+      ) : (
+        tiers.data != null && <Dynamic title="Tier index" data={tiers.data} />
+      )}
+      {stats.data != null && !stats.error && <RawJson title="Tier stats" value={stats.data} />}
+    </Section>
+  );
+}
 
 const UsageBar = ({ used, total }: { used: number; total: number }) => {
   const pct = total > 0 ? Math.min(100, (used / total) * 100) : 0;
@@ -125,6 +144,8 @@ export default function DrivesTab() {
           />
         )}
       </Section>
+
+      <TiersSection />
 
       <Section
         title="Data maintenance"

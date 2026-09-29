@@ -13,6 +13,8 @@ use atlas_api_types::{
 };
 
 pub mod registry;
+mod tls;
+pub use tls::trusted_http_client;
 pub use registry::DriverRegistry;
 
 #[derive(Debug, thiserror::Error)]

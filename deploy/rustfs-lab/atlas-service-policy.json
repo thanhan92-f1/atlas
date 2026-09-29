@@ -51,7 +51,10 @@
         "admin:ListGroups",
         "admin:GetGroup",
         "admin:ListServiceAccounts",
-        "admin:ListTemporaryAccounts"
+        "admin:ListTemporaryAccounts",
+        "admin:ListTier",
+        "kms:ListKeys",
+        "kms:DescribeKey"
       ],
       "Resource": ["arn:aws:s3:::*"]
     },

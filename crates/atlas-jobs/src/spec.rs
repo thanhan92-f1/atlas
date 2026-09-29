@@ -85,6 +85,10 @@ pub enum JobSpec {
         bucket_name: String,
         region: String,
         credentials_namespace: String,
+        /// S3 Object Lock (WORM retention), set only at creation — see `docs/RUSTFS.md`.
+        /// `#[serde(default)]` so already-persisted/in-flight jobs deserialize as `false`.
+        #[serde(default)]
+        object_lock: bool,
     },
     /// Delete a bucket created via `BucketCreateRustfs` (direct signed S3 `DeleteBucket`).
     #[serde(rename = "bucket.delete.rustfs")]
@@ -440,6 +444,11 @@ pub enum JobSpec {
         s3_node_port: u16,
         #[serde(default)]
         console_node_port: u16,
+        /// Name of an existing `kubernetes.io/tls` Secret (keys tls.crt/tls.key) to mount at
+        /// `/opt/tls` with `RUSTFS_TLS_PATH` set — empty = plain HTTP (the lab default). See
+        /// `scripts/rustfs-tls-selfsigned.sh` and docs/RUSTFS.md's TLS section.
+        #[serde(default)]
+        tls_secret: String,
     },
     /// Conformance self-test of an S3-compatible backend (RustFS): creates a throwaway bucket and
     /// exercises put/get, multipart upload, prefix listing, delete, non-empty-bucket refusal and

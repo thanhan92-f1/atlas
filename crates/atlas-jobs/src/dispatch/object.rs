@@ -394,6 +394,7 @@ pub(crate) async fn dispatch_object(
             bucket_name,
             region,
             credentials_namespace,
+            object_lock,
         } => {
             let k8s = require_k8s(k8s)?;
             let endpoint = rustfs_endpoint();
@@ -422,7 +423,7 @@ pub(crate) async fn dispatch_object(
             )
             .await?;
             if !s3.bucket_exists().await {
-                s3.create_bucket()
+                s3.create_bucket_with_object_lock(object_lock)
                     .await
                     .with_context(|| format!("CreateBucket {bucket_name} on {backend_id}"))?;
             }

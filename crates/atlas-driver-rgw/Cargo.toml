@@ -8,6 +8,7 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+atlas-driver-core = { workspace = true }
 anyhow = { workspace = true }
 reqwest = { workspace = true }
 tracing = { workspace = true }

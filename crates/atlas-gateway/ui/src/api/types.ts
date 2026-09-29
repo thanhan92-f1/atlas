@@ -475,5 +475,6 @@ export interface RustfsInstance {
   s3_node_port?: number | null;
   console_node_port?: number | null;
   credentials_secret: string;
+  tls: boolean;
   active: boolean;
 }

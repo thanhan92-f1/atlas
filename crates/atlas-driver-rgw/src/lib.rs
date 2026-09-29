@@ -55,7 +55,9 @@ impl S3Target {
         Ok(Self {
             bucket,
             creds: Credentials::new(access_key, secret_key),
-            http: reqwest::Client::new(),
+            // No timeout: matches the previous `reqwest::Client::new()` — multipart uploads/downloads of
+            // large objects must not be capped by a fixed per-request deadline.
+            http: atlas_driver_core::trusted_http_client(None)?,
         })
     }
 
@@ -379,10 +381,29 @@ impl S3Target {
     /// AWS S3 rejects a non-default-region create without it. Not idempotent by itself — callers
     /// that want create-if-missing semantics should check `bucket_exists` first.
     pub async fn create_bucket(&self) -> Result<()> {
-        let action = self.bucket.create_bucket(&self.creds);
+        self.create_bucket_with_object_lock(false).await
+    }
+
+    /// Create the bucket with S3 Object Lock (WORM retention) enabled — `x-amz-bucket-object-lock-enabled`,
+    /// an S3-standard header set only at creation; RustFS/S3 both refuse to enable it retroactively on
+    /// an existing bucket. Enabling it also turns bucket versioning on server-side (S3 requires
+    /// versioning for object lock). Like the region body below, this header rides on a presigned PUT
+    /// outside the signed query string — RustFS accepted the analogous unsigned region body live, so
+    /// the same leniency is expected here; verify live rather than trusting this comment.
+    pub async fn create_bucket_with_object_lock(&self, enable_object_lock: bool) -> Result<()> {
+        let mut action = self.bucket.create_bucket(&self.creds);
+        // Any extra header on a presigned request must be part of X-Amz-SignedHeaders or the
+        // server rejects it ("headers present which were not signed") — found live. `headers_mut`
+        // adds it to the signature; the identical header must then be sent on the actual request.
+        if enable_object_lock {
+            action.headers_mut().insert("x-amz-bucket-object-lock-enabled", "true");
+        }
         let mut req = self.http.put(action.sign(SIGN_TTL));
         if let Some(body) = create_bucket_body(self.bucket.region()) {
             req = req.header("content-type", "application/xml").body(body);
+        }
+        if enable_object_lock {
+            req = req.header("x-amz-bucket-object-lock-enabled", "true");
         }
         let resp = req
             .send()
@@ -444,6 +465,26 @@ mod tests {
         assert!(create_bucket_body("").is_none());
         let body = create_bucket_body("eu-west-1").unwrap();
         assert!(body.contains("<LocationConstraint>eu-west-1</LocationConstraint>"));
+    }
+
+    /// Regression: an object-lock CreateBucket sends `x-amz-bucket-object-lock-enabled`. RustFS
+    /// rejects any header that rides along unsigned ("headers present which were not signed",
+    /// found live) — the header must be part of the presigned URL's X-Amz-SignedHeaders.
+    #[test]
+    fn object_lock_header_is_part_of_the_signed_headers() {
+        let creds = rusty_s3::Credentials::new("ak", "sk");
+        let bucket =
+            rusty_s3::Bucket::new(url::Url::parse("http://h:9000").unwrap(), UrlStyle::Path, "b", "us-east-1")
+                .unwrap();
+        let mut action = bucket.create_bucket(&creds);
+        action.headers_mut().insert("x-amz-bucket-object-lock-enabled", "true");
+        let url = action.sign(SIGN_TTL);
+        let signed_headers = url
+            .query_pairs()
+            .find(|(k, _)| k == "X-Amz-SignedHeaders")
+            .map(|(_, v)| v.into_owned())
+            .unwrap_or_default();
+        assert!(signed_headers.contains("x-amz-bucket-object-lock-enabled"));
     }
 
     /// A port nothing is listening on — connection refused immediately, no real network I/O.

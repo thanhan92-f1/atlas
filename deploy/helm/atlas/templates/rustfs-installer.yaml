@@ -19,6 +19,11 @@ rules:
   - apiGroups: ["apps"]
     resources: ["deployments"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # `helm install --wait` inspects the Deployment's ReplicaSets to judge rollout progress — read-only,
+  # same resource family as the deployments access above (found live: "replicasets.apps is forbidden").
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
+    verbs: ["get", "list", "watch"]
   - apiGroups: [""]
     resources: ["secrets", "configmaps", "services", "serviceaccounts", "persistentvolumeclaims", "pods"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]

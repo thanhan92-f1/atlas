@@ -219,9 +219,7 @@ impl RealRustfsDriver {
             backend_id: backend_id.into(),
             endpoint: endpoint.into().trim_end_matches('/').to_string(),
             buckets,
-            client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(8))
-                .build()
+            client: atlas_driver_core::trusted_http_client(Some(std::time::Duration::from_secs(8)))
                 .unwrap_or_else(|_| reqwest::Client::new()),
             credentials: None,
         }

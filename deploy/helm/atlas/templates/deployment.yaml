@@ -324,6 +324,14 @@ spec:
             - name: ATLAS_TLS_KEY
               value: "/etc/atlas-tls/tls.key"
             {{- end }}
+            {{- if .Values.rustfs.caSecretName }}
+            # Trust a RustFS server's TLS certificate that isn't from a CA already in the system
+            # trust store (a private CA, or a self-signed lab cert — see docs/RUSTFS.md's TLS
+            # section and scripts/rustfs-tls-selfsigned.sh). Never disables verification; it only
+            # adds this one CA on top of the default roots.
+            - name: ATLAS_RUSTFS_CA_CERT
+              value: "/etc/atlas-rustfs-ca/tls.crt"
+            {{- end }}
             - name: ATLAS_RATE_LIMIT_RPM
               value: {{ .Values.rateLimitRpm | quote }}
             - name: RUST_LOG
@@ -367,6 +375,11 @@ spec:
               mountPath: /etc/atlas-tls
               readOnly: true
             {{- end }}
+            {{- if .Values.rustfs.caSecretName }}
+            - name: rustfs-ca
+              mountPath: /etc/atlas-rustfs-ca
+              readOnly: true
+            {{- end }}
             {{- if .Values.disks.enabled }}
             - name: host-dev
               mountPath: /dev
@@ -392,6 +405,11 @@ spec:
           secret:
             secretName: atlas-tls
             optional: true
+        {{- end }}
+        {{- if .Values.rustfs.caSecretName }}
+        - name: rustfs-ca
+          secret:
+            secretName: {{ .Values.rustfs.caSecretName }}
         {{- end }}
         {{- if .Values.disks.enabled }}
         - name: host-dev

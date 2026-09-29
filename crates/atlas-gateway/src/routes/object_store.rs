@@ -460,6 +460,10 @@ pub(crate) struct CreateBucketBody {
     max_objects: Option<i64>,
     /// Optional RGW quota: max size (e.g. "2G"). Ignored for RustFS.
     max_size: Option<String>,
+    /// S3 Object Lock (WORM retention). RustFS only, and only at creation — S3 (and RustFS) refuse
+    /// to enable it retroactively on an existing bucket. Ignored for Ceph RGW.
+    #[serde(default)]
+    object_lock: bool,
 }
 
 /// `POST /buckets` — provision a bucket on the requested backend (async job). Defaults to RustFS
@@ -507,6 +511,7 @@ pub(crate) async fn create_bucket(
             bucket_name: body.name.clone(),
             region: "us-east-1".into(),
             credentials_namespace: s.config.rustfs_credentials_namespace.clone(),
+            object_lock: body.object_lock,
         }
     } else if backend_id == CEPH_BACKEND_ID {
         // The OBC (and its Secret/ConfigMap) live where this gateway can read them.

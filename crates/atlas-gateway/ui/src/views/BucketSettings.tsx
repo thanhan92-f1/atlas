@@ -12,7 +12,7 @@ import { Table } from "../ui/Table";
 import { fmtBytes } from "../lib/format";
 
 const S3_NS = "http://s3.amazonaws.com/doc/2006-03-01/";
-const TABS = ["Versioning", "Lifecycle", "Access", "Quota", "Versions"] as const;
+const TABS = ["Versioning", "Object Lock", "Lifecycle", "Access", "Quota", "Versions"] as const;
 type TabName = (typeof TABS)[number];
 
 interface Raw {
@@ -135,6 +135,7 @@ export default function BucketSettings({ bucket, onClose }: { bucket: StorageBuc
     <SlideOver open={!!bucket} onClose={close} title={<span className="mono">{name} · settings</span>} width={620}>
       <Tabs tabs={[...tabs]} value={tabs.includes(tab) ? tab : "Versioning"} onChange={(t) => setTab(t as TabName)} />
       {tab === "Versioning" && <VersioningTab bucket={name} status={versioning} onChanged={loadVersioning} />}
+      {tab === "Object Lock" && <ObjectLockTab bucket={name} />}
       {tab === "Lifecycle" && <LifecycleTab bucket={name} />}
       {tab === "Access" && <AccessTab bucket={name} />}
       {tab === "Quota" && <QuotaTab bucket={name} />}
@@ -180,6 +181,100 @@ function VersioningTab({ bucket, status, onChanged }: { bucket: string; status: 
         <Button loading={busy} disabled={status !== "Enabled"} onClick={() => set("Suspended")}>
           Suspend
         </Button>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------- object lock
+
+function ObjectLockTab({ bucket }: { bucket: string }) {
+  const [enabled, setEnabled] = useState<boolean | null>(null);
+  const [mode, setMode] = useState("GOVERNANCE");
+  const [days, setDays] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    if (!bucket) return;
+    const r = await call("GET", s3Url(bucket, "object-lock"));
+    if (!ok(r)) {
+      setEnabled(false);
+      setError(null);
+      return;
+    }
+    const doc = parseXml(r.text);
+    const isEnabled = firstText(doc, "ObjectLockEnabled") === "Enabled";
+    setEnabled(isEnabled);
+    setMode(firstText(doc, "Mode") || "GOVERNANCE");
+    setDays(firstText(doc, "Days"));
+    setError(null);
+  }, [bucket]);
+
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- fetch-on-mount: the loader's state updates are the result of the request, not a render loop
+    load();
+  }, [bucket, load]);
+
+  const save = async (clearRule: boolean) => {
+    setBusy(true);
+    const rule =
+      !clearRule && days.trim()
+        ? `<Rule><DefaultRetention><Mode>${mode}</Mode><Days>${escapeXml(days.trim())}</Days></DefaultRetention></Rule>`
+        : "";
+    const body = `<ObjectLockConfiguration xmlns="${S3_NS}"><ObjectLockEnabled>Enabled</ObjectLockEnabled>${rule}</ObjectLockConfiguration>`;
+    const r = await call("PUT", s3Url(bucket, "object-lock"), body, "application/xml");
+    setBusy(false);
+    if (ok(r)) {
+      toast(clearRule ? "default retention cleared" : "default retention set", "ok");
+      load();
+    } else {
+      toast(`object lock: ${errText(r)}`, "err");
+    }
+  };
+
+  if (enabled === null) return <div className="at-caption">Loading…</div>;
+  if (!enabled) {
+    return (
+      <div>
+        <p className="mb-3">
+          Object Lock: <Badge kind="neutral" dot>not enabled</Badge>
+        </p>
+        <div className="at-caption">
+          Object Lock (versioned, write-once-read-many retention) can only be turned on when a bucket is
+          created. This bucket was not created with it — create a new bucket with "Object Lock" enabled if
+          you need WORM retention.
+        </div>
+      </div>
+    );
+  }
+  return (
+    <div>
+      <p className="mb-3">
+        Object Lock: <Badge kind="warning" dot>enabled</Badge>
+      </p>
+      {error && <div className="at-caption mb-2">{error}</div>}
+      <div className="at-caption mb-2">Default retention (applied to new objects with no explicit retention)</div>
+      <div className="flex gap-2 mb-3">
+        <select className="field" value={mode} onChange={(e) => setMode(e.target.value)}>
+          <option value="GOVERNANCE">Governance (can be overridden by a permitted user)</option>
+          <option value="COMPLIANCE">Compliance (cannot be shortened or removed by anyone)</option>
+        </select>
+        <input
+          className="field"
+          style={{ width: 100 }}
+          type="number"
+          min={1}
+          placeholder="days"
+          value={days}
+          onChange={(e) => setDays(e.target.value)}
+        />
+      </div>
+      <div className="flex gap-2">
+        <Button variant="primary" loading={busy} disabled={!days.trim()} onClick={() => save(false)}>
+          Set default retention
+        </Button>
+        <Button loading={busy} onClick={() => save(true)}>Clear default retention</Button>
       </div>
     </div>
   );

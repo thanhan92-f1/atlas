@@ -138,6 +138,67 @@ alone; then it installs RustFS from the official chart on the resulting drive an
 `ATLAS_RUSTFS_AUTO_ACTIVATE=1`, points Atlas at it. Data already in a previous RustFS is not moved
 automatically — use Object Migrations.
 
+## TLS (do this before production)
+
+Every setup in this doc runs RustFS over plain HTTP — fine for a lab on a private network, not for
+production, where the root (or scoped) credential and every object would cross the wire unencrypted.
+RustFS terminates TLS itself: point `RUSTFS_TLS_PATH` at a directory holding `tls.crt`/`tls.key` and
+it serves HTTPS on both the S3 and console ports. Two things to get right, both already handled by
+the pieces below and worth knowing if you build this by hand instead:
+
+- RustFS does **not** read `tls.crt`/`tls.key` by name — its default `RUSTFS_TLS_PATH` loader looks
+  for files literally named `rustfs_cert.pem`/`rustfs_key.pem` (`crates/config/src/constants/app.rs`'s
+  `RUSTFS_TLS_CERT`/`RUSTFS_TLS_KEY`). A `kubernetes.io/tls` Secret's keys are `tls.crt`/`tls.key`, so
+  the volume mount must remap them with the Secret volume's `items` field (found live, 2026-09-28: the
+  pod crash-looped with "no server certificates were found" until this was added).
+- The chart's own liveness/readiness probes (`rustfs.probes` in `_helpers.tpl`) are plain HTTP unless
+  its much heavier `mtls.enabled` (cert-manager-issued client+server certs, mutual TLS) is turned on.
+  A `RUSTFS_TLS_PATH`-only server makes port 9000 TLS-only, so the chart's default HTTP probes fail
+  forever and the pod never goes Ready. The install script disables `livenessProbe`/`readinessProbe`
+  when a `tls_secret` is given rather than pull in full mTLS for what is meant to be simple server TLS.
+
+The official chart's `extraVolumes`/`extraVolumeMounts`/`extraEnv` (already used above for CORS) mount
+an existing Secret and set `RUSTFS_TLS_PATH` — no chart fork needed.
+
+**Server side** — pass a `kubernetes.io/tls` Secret name (keys `tls.crt`/`tls.key`) when deploying:
+console's **Deploy RustFS…** → "TLS Secret (optional)", or `JobSpec::RustfsInstance.tls_secret`. For a
+lab/self-signed cert: `scripts/rustfs-tls-selfsigned.sh <host> <user> <secret-name>` (generates the key
+pair and creates the Secret entirely on the remote host — the private key is never printed or leaves
+that host). The generated cert sets `basicConstraints=CA:FALSE`, `extendedKeyUsage=serverAuth` and a
+`subjectAltName` covering the host's IP — a plain `openssl req -x509 -subj` defaults to `CA:TRUE` and
+no SAN, which rustls's verifier rejects outright (`invalid peer certificate:
+Other(OtherError(CaUsedAsEndEntity))`, found live chasing why discovery couldn't reach an otherwise
+healthy HTTPS RustFS). For production, use a cert issued by your own CA or a public one instead.
+
+**Client side (Atlas trusting the cert)** — if the cert's CA is already in the container's system
+trust store (a public CA, or your org's CA baked into the image), nothing else is needed: `RustfsClient`,
+`S3Target`, and the discovery driver's client (`atlas_driver_core::trusted_http_client`, used by all
+three) trust the system roots like any `reqwest::Client`. For a private CA or a self-signed cert
+(the only option for a throwaway lab cert), also set `ATLAS_RUSTFS_CA_CERT` to a mounted copy of that
+same CA/cert — the Helm chart's `rustfs.caSecretName` value does this (mounts the named Secret's
+`tls.crt` into the gateway at a fixed path and sets the env var); it only *adds* that one certificate
+to the trust store, never removes the system roots or skips verification. `POST /rustfs/instances`'s
+`tls_secret` and the gateway's `rustfs.caSecretName` are typically the *same* Secret for a self-signed
+lab cert (it is its own root), and typically *unset* for a real-CA cert (nothing extra to trust). The
+raw `deploy/k8s/atlas-gateway.yaml` manifest does not wire this (it has no per-field templating); mirror
+the Helm chart's `ATLAS_RUSTFS_CA_CERT`/volume block by hand if you need TLS trust without Helm.
+`ATLAS_RUSTFS_ENDPOINT`'s scheme (`http://` vs `https://`) is set automatically by **Use for Atlas**,
+based on whether the instance's Deployment has `RUSTFS_TLS_PATH` set.
+
+If `ATLAS_RUSTFS_AUTO_DEVICE`/`ATLAS_RUSTFS_AUTO_ACTIVATE=1` are set (install-time disk automation),
+they keep polling and will switch Atlas back to that auto-provisioned instance within ~20s of any
+manual **Use for Atlas** to a *different* instance, for up to 30 minutes after gateway startup — set
+`ATLAS_RUSTFS_AUTO_ACTIVATE=0` first if you want a manual switch (e.g. to a TLS instance) to stick.
+
+Status: **verified live end to end**, 2026-09-28, on the lab (`80.79.5.173`): self-signed cert
+generated via `scripts/rustfs-tls-selfsigned.sh`, `rustfs-tls` instance deployed (probes disabled,
+cert filenames remapped as above) and reached `Ready`; confirmed serving HTTPS on both ports and
+rejecting plain HTTP; gateway's own Deployment patched with `ATLAS_RUSTFS_CA_CERT` trusting the
+self-signed cert (mirroring the Helm `rustfs.caSecretName` block by hand, since this lab runs the raw
+manifest); **Use for Atlas** switched the endpoint/credentials to `https://…:30932`, `/readyz` stayed
+healthy, discovery completed cleanly (`cluster=cls_rustfs_https___80_79_5_173_30932`), and a bucket
+create/delete round-tripped over HTTPS. Switched back to the lab's plain-HTTP instance afterward.
+
 ## Least-privilege credential for Atlas (do this before production)
 
 Every setup in this doc so far puts RustFS's **root** access/secret key in `rustfs.credentialsSecret` —
@@ -150,11 +211,13 @@ everything the console's RustFS proxy (`routes/rustfs.rs`) forwards, and nothing
 **The policy** — [`deploy/rustfs-lab/atlas-service-policy.json`](../deploy/rustfs-lab/atlas-service-policy.json) —
 grants exactly the actions the proxy's allow-lists use, cross-checked against RustFS's own handler source
 (`crates/policy/src/policy/action.rs` and each `rustfs/src/admin/handlers/*.rs`'s `authorize_admin_request`
-call): bucket/object CRUD and configuration (versioning, lifecycle, policy, tagging, CORS, quota), and the
+call): bucket/object CRUD and configuration (versioning, lifecycle, policy, tagging, CORS, quota), the
 admin actions behind Overview/Drives & pools/Access (server/storage/usage info, pools, heal, rebalance,
-users, groups, canned policies, service accounts). It does **not** grant KMS, replication, tiering, object
-lock configuration changes, server update/restart/config, or IAM import/export — those stay root-only,
-matching what the console already refuses to forward (see `admin_allowed`/`s3_allowed` in `routes/rustfs.rs`).
+users, groups, canned policies, service accounts), and **read-only** tiering (`admin:ListTier`) and KMS key
+metadata (`kms:ListKeys`, `kms:DescribeKey`) — see the "Tiering and KMS" section below. It does **not**
+grant tier add/edit/remove, KMS key lifecycle or service status/config, replication, object lock
+configuration changes, server update/restart/config, or IAM import/export — those stay root-only, matching
+what the console already refuses to forward (see `admin_allowed`/`s3_allowed` in `routes/rustfs.rs`).
 A handful of read-only admin calls (pool/decommission/rebalance *status*, heal status, quota stats/check)
 have no explicit action check in the RustFS source as of this writing — they are covered by the same
 statements as their sibling write actions; if one ever 403s, add its specific action once identified.
@@ -175,6 +238,28 @@ Status: the policy is verified against RustFS's source, not yet exercised live w
 end (that needs the key itself, which this flow deliberately never lets Atlas or its operator's tooling
 see except once, in the browser) — after switching, watch the Overview/Drives & pools/Access tabs and the
 bucket write path for any 403, and widen the specific missing action rather than reverting to root.
+
+## Tiering and KMS (read-only)
+
+RustFS supports ILM storage tiering (transition cold objects to a remote S3/Azure/GCS target) and
+Vault-backed KMS encryption, but only a **read-only** slice of each is exposed through the console —
+Drives & pools' "Tiers" panel (`GET admin/v3/tier`, `v3/tier-stats`, `v3/tier/{name}`) and Access's "KMS
+keys" panel (`GET admin/v3/kms/list-keys`, `v3/kms/describe-key`). Two things kept the rest out of this
+pass, both found by reading RustFS's own source rather than assumed:
+
+- **Tier add/edit/remove** (`PUT`/`POST`/`DELETE admin/v3/tier...`) need a remote target's endpoint and
+  credentials entered somewhere — a bigger UX/credential-handling decision than a first read-only pass,
+  and deferred with it.
+- **KMS key lifecycle** (rotate/enable/disable/delete) carries real data-loss risk if a key backing live
+  objects is disabled or deleted, and deserves a dedicated typed-name-confirm flow (like pool destroy),
+  not a first pass. `GET admin/v3/kms/status` and `/kms/config` are also left out even though they only
+  *read* — RustFS gates them behind `kms:ServiceControl`/`kms:Configure`, the **same actions** that gate
+  actual KMS service start/stop/reconfigure in `kms_dynamic.rs`, so granting either to Atlas's credential
+  just to show a status page would also hand it those write capabilities. `kms:ListKeys`/`kms:DescribeKey`
+  are separate, narrow, metadata-only actions with no such overlap (verified 2026-09-28).
+- **Replication** isn't exposed at all yet, read-only or otherwise — it needs a second live S3-compatible
+  cluster to test against, which this lab doesn't have (the same reason RBD-mirroring DR is deferred in
+  the top-level `CLAUDE.md`). Revisit once a second RustFS/S3 endpoint exists to verify against.
 
 ## Self-test (conformance check, console button)
 

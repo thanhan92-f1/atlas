@@ -29,11 +29,13 @@ export default function InstancesSection() {
       .map((d) => ({ value: d.claim as string, label: `Drive ${d.name} · ${d.claim}` })),
   ];
   const usedPorts = (instances || []).flatMap((i) => [i.s3_node_port, i.console_node_port]).filter(Boolean) as number[];
-  const nextPort = (from: number) => {
+  const nextPort = (from: number, avoid?: number) => {
     let p = from;
-    while (usedPorts.includes(p)) p += 1;
-    return String(p);
+    while (usedPorts.includes(p) || p === avoid) p += 1;
+    return p;
   };
+  const defaultS3Port = nextPort(30930);
+  const defaultConsolePort = nextPort(30931, defaultS3Port);
 
   const fields = (): FormField[] => [
     { name: "name", label: "Instance name", pattern: /^[a-z][a-z0-9-]{1,30}$/, placeholder: "rustfs-sdb", hint: "Lowercase letters, digits and hyphens." },
@@ -43,8 +45,17 @@ export default function InstancesSection() {
       options: claimOptions,
       hint: "A drive prepared from the Disks page keeps the data on that disk. RustFS runs single-drive (no erasure coding) — it cannot be expanded in place; move data by migration.",
     },
-    { name: "s3_node_port", label: "S3 API node port", type: "number", value: nextPort(30930), min: 30000 },
-    { name: "console_node_port", label: "Web console node port", type: "number", value: nextPort(30931), min: 30000 },
+    { name: "s3_node_port", label: "S3 API node port", type: "number", value: String(defaultS3Port), min: 30000 },
+    { name: "console_node_port", label: "Web console node port", type: "number", value: String(defaultConsolePort), min: 30000 },
+    {
+      name: "tls_secret",
+      label: "TLS Secret (optional)",
+      optional: true,
+      placeholder: "rustfs-sdb-tls",
+      hint:
+        "An existing kubernetes.io/tls Secret (tls.crt/tls.key) to serve HTTPS with. Self-signed for a " +
+        "lab: scripts/rustfs-tls-selfsigned.sh. Leave blank for plain HTTP.",
+    },
   ];
 
   return (
@@ -62,7 +73,11 @@ export default function InstancesSection() {
           { h: "Instance", f: (i) => i.name, mono: true },
           { h: "Installed by", f: (i) => (i.managed_by === "helm" ? "official chart" : "lab manifest") },
           { h: "State", f: (i) => <Badge kind={i.ready ? "success" : "warning"} dot>{i.ready ? "ready" : "starting"}</Badge> },
-          { h: "S3 / console", f: (i) => `${i.s3_node_port ?? "—"} / ${i.console_node_port ?? "—"}`, mono: true },
+          {
+            h: "S3 / console",
+            f: (i) => `${i.tls ? "https" : "http"}:// ${i.s3_node_port ?? "—"} / ${i.console_node_port ?? "—"}`,
+            mono: true,
+          },
           { h: "Data", f: (i) => i.claim ?? "—", mono: true },
           { h: "Atlas", f: (i) => (i.active ? <Badge kind="info" dot>in use</Badge> : "—") },
         ]}
@@ -120,6 +135,7 @@ export default function InstancesSection() {
               pvc: v.pvc ?? "",
               s3_node_port: Number(v.s3_node_port),
               console_node_port: Number(v.console_node_port),
+              tls_secret: v.tls_secret || "",
             },
             `deploy RustFS ${v.name}`,
             refresh,

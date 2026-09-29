@@ -8,7 +8,7 @@ import { toast } from "../../api/client";
 import { asArr, asRec, asStr, rfsWrite, useRefreshRustfs, useRustfs, type Rec } from "./api";
 import { Dynamic, EditModal, LoadError, Muted, RawJson, Section } from "./common";
 
-const SUBTABS = ["Users", "Groups", "Policies", "Service accounts"];
+const SUBTABS = ["Users", "Groups", "Policies", "Service accounts", "KMS keys"];
 const POLICY_TEMPLATE = `{
   "Version": "2012-10-17",
   "Statement": [
@@ -294,6 +294,42 @@ function ServiceAccountsPane({ users }: { users: string[] }) {
   );
 }
 
+/**
+ * Read-only: RustFS gates key rotate/enable/disable/delete behind a real data-loss risk (disabling a
+ * key backing live objects) and status/config behind the same action as KMS service control, so
+ * neither is exposed here yet — see "Tiering and KMS" in docs/RUSTFS.md.
+ */
+function KmsKeysPane() {
+  const keys = useRustfs("kms/list-keys");
+  const [describe, setDescribe] = useState<string | null>(null);
+  const detail = useRustfs("kms/describe-key", { keyId: describe ?? "" }, 15000, describe !== null);
+  const rows = asArr(asRec(keys.data).keys).map(asRec);
+
+  return (
+    <Section title="KMS keys">
+      {keys.error && <LoadError error={keys.error} />}
+      <Table<Rec>
+        soundings
+        panelTitle="Key index"
+        rows={keys.data != null ? rows : undefined}
+        rowKey={(k, n) => asStr(k.key_id) || String(n)}
+        empty="No KMS keys, or KMS is not enabled on this RustFS server."
+        cols={[
+          { h: "Key ID", f: (k) => asStr(k.key_id), mono: true },
+          { h: "Description", f: (k) => asStr(k.description) || "—" },
+          { h: "Algorithm", f: (k) => asStr(k.algorithm) },
+          { h: "Status", f: (k) => <Badge kind={asStr(k.status) === "Active" ? "success" : "neutral"} dot>{asStr(k.status) || "unknown"}</Badge> },
+          { h: "Version", f: (k) => asStr(k.version) },
+        ]}
+        actions={(k) => <Button size="sm" onClick={() => setDescribe(asStr(k.key_id))}>Describe</Button>}
+      />
+      <SlideOver open={describe !== null} onClose={() => setDescribe(null)} title={`KMS KEY · ${describe ?? ""}`}>
+        {detail.error ? <LoadError error={detail.error} /> : detail.data != null && <RawJson title="Key metadata" value={detail.data} />}
+      </SlideOver>
+    </Section>
+  );
+}
+
 export default function AccessTab() {
   const [tab, setTab] = useState(SUBTABS[0]);
   const policies = useRustfs("list-canned-policies");
@@ -305,6 +341,7 @@ export default function AccessTab() {
       {tab === "Groups" && <GroupsPane />}
       {tab === "Policies" && <PoliciesPane data={policies.data} error={policies.error} />}
       {tab === "Service accounts" && <ServiceAccountsPane users={Object.keys(asRec(users.data))} />}
+      {tab === "KMS keys" && <KmsKeysPane />}
     </>
   );
 }

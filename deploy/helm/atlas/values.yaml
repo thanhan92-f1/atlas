@@ -238,6 +238,11 @@ rustfs:
   # signed discovery and for bucket create/delete. Created by the chart when
   # `server.generateCredentials`, otherwise it must already exist.
   credentialsSecret: rustfs-credentials
+  # Name of a `kubernetes.io/tls` Secret whose tls.crt Atlas should additionally trust when talking
+  # to RustFS over HTTPS — a private CA or a self-signed cert (RUSTFS_TLS_PATH), not one already in
+  # the system trust store. Empty = no extra CA trusted (plain HTTP, or HTTPS with a publicly
+  # trusted cert). See docs/RUSTFS.md's TLS section.
+  caSecretName: ""
 
   # Optional RustFS server, deployed with RustFS's OWN official Helm chart (vendored under charts/,
   # values under `rustfsserver:` below). Standalone = one pod on one volume: a single-drive RustFS has

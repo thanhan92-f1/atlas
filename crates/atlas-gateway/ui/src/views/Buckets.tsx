@@ -179,6 +179,17 @@ export default function Buckets() {
               { name: "max_size", label: "Max size (e.g. 2G, optional)", optional: true },
             );
           }
+          if (selType === "rustfs") {
+            out.push({
+              name: "object_lock",
+              label: "Object Lock (WORM)",
+              options: [
+                { value: "off", label: "Off (default)" },
+                { value: "on", label: "Enabled — cannot be turned on later" },
+              ],
+              hint: "Versioned, write-once-read-many retention. Only settable at creation; configure default retention after creating the bucket (Settings → Object Lock).",
+            });
+          }
           return out;
         }}
         onSubmit={(v) => {
@@ -189,6 +200,8 @@ export default function Buckets() {
             body.namespace = v.namespace;
             if (v.max_objects) body.max_objects = +v.max_objects;
             if (v.max_size) body.max_size = v.max_size;
+          } else if (v.object_lock === "on") {
+            body.object_lock = true;
           }
           return submitJob("post", "/buckets", body, "bucket", refetch);
         }} />

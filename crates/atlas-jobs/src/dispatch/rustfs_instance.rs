@@ -41,6 +41,16 @@ install)
     --set "extraEnv[0].name=NODE_IP" --set "extraEnv[0].valueFrom.fieldRef.fieldPath=status.hostIP" \
     --set "extraEnv[1].name=RUSTFS_CORS_ALLOWED_ORIGINS" --set "extraEnv[1].value=http://\$(NODE_IP):$CONSOLE_ORIGIN_PORT"
   if [ -n "$PVC" ]; then set -- "$@" --set "mode.standalone.existingClaim.dataClaim=$PVC"; fi
+  if [ -n "$TLS_SECRET" ]; then
+    # RUSTFS_TLS_PATH makes the S3 port TLS-only; the chart's own liveness/readiness probes are
+    # plain HTTP unless its (much heavier, cert-manager-based) mtls.enabled mode is used, which
+    # this simple file-mount TLS does not — so disable them rather than have them fail forever.
+    set -- "$@" \
+      --set "extraEnv[2].name=RUSTFS_TLS_PATH" --set "extraEnv[2].value=/opt/tls" \
+      --set-json "extraVolumes=[{\"name\":\"tls\",\"secret\":{\"secretName\":\"$TLS_SECRET\",\"items\":[{\"key\":\"tls.crt\",\"path\":\"rustfs_cert.pem\"},{\"key\":\"tls.key\",\"path\":\"rustfs_key.pem\"}]}}]" \
+      --set-json "extraVolumeMounts=[{\"name\":\"tls\",\"mountPath\":\"/opt/tls\",\"readOnly\":true}]" \
+      --set livenessProbe.enabled=false --set readinessProbe.enabled=false
+  fi
   helm install "$NAME" "$CHART" -n "$NS" "$@" --wait --timeout 300s
   echo "[rustfs] installed $NAME: service $NAME-svc, credentials Secret $NAME-secret"
   ;;
@@ -58,6 +68,7 @@ pub(crate) async fn dispatch_rustfs_instance(
         pvc,
         s3_node_port,
         console_node_port,
+        tls_secret,
     } = spec
     else {
         anyhow::bail!("not a rustfs instance spec");
@@ -82,6 +93,15 @@ pub(crate) async fn dispatch_rustfs_instance(
                 && s3_node_port != console_node_port,
             "node ports must be distinct values in 30000-32767"
         );
+        if !tls_secret.is_empty() {
+            anyhow::ensure!(
+                tls_secret.len() <= 253
+                    && tls_secret
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.'),
+                "tls_secret must be a valid Kubernetes Secret name"
+            );
+        }
     }
     let k8s = k8s
         .as_ref()
@@ -123,6 +143,7 @@ pub(crate) async fn dispatch_rustfs_instance(
                         { "name": "CONSOLE_PORT", "value": console_node_port.to_string() },
                         { "name": "CONSOLE_ORIGIN_PORT", "value": console_origin_port },
                         { "name": "CHART", "value": CHART },
+                        { "name": "TLS_SECRET", "value": tls_secret },
                     ],
                 }],
             }},

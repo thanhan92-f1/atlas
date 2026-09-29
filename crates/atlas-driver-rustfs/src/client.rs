@@ -13,6 +13,7 @@ use atlas_driver_core::DriverError;
 use reqwest::Method;
 
 use crate::sigv4;
+use atlas_driver_core::trusted_http_client;
 
 /// Bytes are RFC 3986 unreserved, or `%XX`-encoded. `keep_slash` keeps `/` for URI paths.
 fn uri_encode(input: &str, keep_slash: bool) -> String {
@@ -98,10 +99,7 @@ impl RustfsClient {
         let endpoint = reqwest::Url::parse(endpoint)
             .map_err(|e| DriverError::Backend(format!("invalid RustFS endpoint: {e}")))?;
         let region = region.into();
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()
-            .map_err(|e| DriverError::Backend(format!("http client: {e}")))?;
+        let http = trusted_http_client(Some(Duration::from_secs(30)))?;
         Ok(Self {
             endpoint,
             access_key: access_key.into(),

@@ -28,7 +28,12 @@ use crate::state::AppState;
 
 /// Admin API operations that may be forwarded (`rel` is the path after `/rustfs/admin/`). A
 /// deliberately explicit list: server update/restart, config, file import/export, inspect-data,
-/// KMS and lock-breaking endpoints are not reachable through here.
+/// and lock-breaking endpoints are not reachable through here. Tiering and KMS are read-only here
+/// on purpose — RustFS gates tier add/edit/remove behind `admin:SetTier` (vs. list/verify's
+/// `admin:ListTier`) and gates `GET /kms/status`/`/kms/config` behind the same `kms:ServiceControl`/
+/// `kms:Configure` actions as actual KMS service control, so exposing those would require granting
+/// Atlas's credential more than read access; `kms:ListKeys`/`kms:DescribeKey` are separate, narrow,
+/// metadata-only actions (verified against RustFS's own source, 2026-09-28) with no such overlap.
 fn admin_allowed(method: &Method, rel: &str) -> bool {
     let exact_get = [
         "v3/info",
@@ -47,6 +52,10 @@ fn admin_allowed(method: &Method, rel: &str) -> bool {
         "v3/list-service-accounts",
         "v3/info-service-account",
         "v3/get-bucket-quota",
+        "v3/tier",
+        "v3/tier-stats",
+        "v3/kms/list-keys",
+        "v3/kms/describe-key",
     ];
     let exact_put = [
         "v3/add-user",
@@ -76,6 +85,7 @@ fn admin_allowed(method: &Method, rel: &str) -> bool {
             exact_get.contains(&rel)
                 || rel.starts_with("v3/quota/")
                 || rel.starts_with("v3/quota-stats/")
+                || rel.starts_with("v3/tier/")
         }
         Method::PUT => exact_put.contains(&rel) || rel.starts_with("v3/quota/"),
         Method::POST => {
@@ -380,6 +390,7 @@ struct Instance {
     s3_port: Option<i64>,
     console_port: Option<i64>,
     secret: String,
+    tls: bool,
 }
 
 async fn find_instances(s: &AppState) -> AppResult<Vec<Instance>> {
@@ -418,6 +429,9 @@ async fn find_instances(s: &AppState) -> AppResult<Vec<Instance>> {
             .and_then(|vols| vols.iter().find(|v| v["name"] == "data"))
             .and_then(|v| v["persistentVolumeClaim"]["claimName"].as_str())
             .map(str::to_string);
+        let tls = d["spec"]["template"]["spec"]["containers"][0]["env"]
+            .as_array()
+            .is_some_and(|env| env.iter().any(|e| e["name"] == "RUSTFS_TLS_PATH"));
         out.push(Instance {
             secret: if helm { format!("{name}-secret") } else { "rustfs-credentials".into() },
             ready: d["status"]["readyReplicas"].as_i64().unwrap_or(0),
@@ -426,6 +440,7 @@ async fn find_instances(s: &AppState) -> AppResult<Vec<Instance>> {
             claim,
             helm,
             name,
+            tls,
         });
     }
     Ok(out)
@@ -453,6 +468,7 @@ pub(crate) async fn list_rustfs_instances(State(s): State<AppState>) -> AppResul
                 "s3_node_port": i.s3_port,
                 "console_node_port": i.console_port,
                 "credentials_secret": i.secret,
+                "tls": i.tls,
                 "active": is_active(&s, i),
             })
         })
@@ -468,6 +484,10 @@ pub(crate) struct InstallInstanceBody {
     pvc: String,
     s3_node_port: u16,
     console_node_port: u16,
+    /// Existing `kubernetes.io/tls` Secret (tls.crt/tls.key) to serve HTTPS with; empty = plain
+    /// HTTP. See `scripts/rustfs-tls-selfsigned.sh` (lab) and docs/RUSTFS.md (production).
+    #[serde(default)]
+    tls_secret: String,
 }
 
 /// `POST /rustfs/instances` — install a RustFS server from RustFS's official chart (async job).
@@ -481,12 +501,16 @@ pub(crate) async fn install_rustfs_instance(
     if find_instances(&s).await?.iter().any(|i| i.name == body.name) {
         return Err(AppError::Conflict(format!("RustFS instance {} already exists", body.name)));
     }
+    if !body.tls_secret.is_empty() {
+        super::util::validate_k8s_name(&body.tls_secret)?;
+    }
     let spec = JobSpec::RustfsInstance {
         action: "install".into(),
         name: body.name.clone(),
         pvc: body.pvc.clone(),
         s3_node_port: body.s3_node_port,
         console_node_port: body.console_node_port,
+        tls_secret: body.tls_secret.clone(),
     };
     enqueue_instance_job(&s, &actor, spec, "rustfs.instance.install.requested", &body.name).await
 }
@@ -519,6 +543,7 @@ pub(crate) async fn delete_rustfs_instance(
         pvc: String::new(),
         s3_node_port: 0,
         console_node_port: 0,
+        tls_secret: String::new(),
     };
     enqueue_instance_job(&s, &actor, spec, "rustfs.instance.uninstall.requested", &name).await
 }
@@ -557,7 +582,8 @@ async fn switch_atlas_to(s: &AppState, inst: &Instance) -> AppResult<i64> {
     } else {
         ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY")
     };
-    repoint_credentials(s, Some(port), &inst.secret, ak_key, sk_key).await?;
+    let scheme = if inst.tls { "https" } else { "http" };
+    repoint_credentials(s, Some((scheme, port)), &inst.secret, ak_key, sk_key).await?;
     Ok(port)
 }
 
@@ -567,7 +593,7 @@ async fn switch_atlas_to(s: &AppState, inst: &Instance) -> AppResult<i64> {
 /// least-privilege — credential). The resulting rollout restarts the gateway.
 async fn repoint_credentials(
     s: &AppState,
-    port: Option<i64>,
+    scheme_port: Option<(&str, i64)>,
     secret_name: &str,
     ak_key: &str,
     sk_key: &str,
@@ -584,14 +610,14 @@ async fn repoint_credentials(
         json!({ "name": "ATLAS_RUSTFS_ACCESS_KEY", "valueFrom": secret_ref(ak_key) }),
         json!({ "name": "ATLAS_RUSTFS_SECRET_KEY", "valueFrom": secret_ref(sk_key) }),
     ];
-    if let Some(port) = port {
-        env.push(json!({ "name": "ATLAS_RUSTFS_ENDPOINT", "value": format!("http://$(NODE_IP):{port}") }));
+    if let Some((scheme, port)) = scheme_port {
+        env.push(json!({ "name": "ATLAS_RUSTFS_ENDPOINT", "value": format!("{scheme}://$(NODE_IP):{port}") }));
     }
     if std::env::var("ATLAS_STATE_BACKUP_SECS").is_ok() {
         env.push(json!({ "name": "ATLAS_STATE_BACKUP_ACCESS_KEY", "valueFrom": secret_ref(ak_key) }));
         env.push(json!({ "name": "ATLAS_STATE_BACKUP_SECRET_KEY", "valueFrom": secret_ref(sk_key) }));
-        if let Some(port) = port {
-            env.push(json!({ "name": "ATLAS_STATE_BACKUP_ENDPOINT", "value": format!("http://$(NODE_IP):{port}") }));
+        if let Some((scheme, port)) = scheme_port {
+            env.push(json!({ "name": "ATLAS_STATE_BACKUP_ENDPOINT", "value": format!("{scheme}://$(NODE_IP):{port}") }));
         }
     }
     let deployment =
@@ -738,6 +764,7 @@ pub(crate) fn spawn_rustfs_auto(s: AppState) {
                         pvc: pvc.clone(),
                         s3_node_port: s3,
                         console_node_port: con,
+                        tls_secret: String::new(),
                     };
                     if s.jobs.enqueue(&ids::job_id(), "global", "atlas-auto", spec, None).await.is_ok() {
                         tracing::info!("auto RustFS drive: installing {instance} on {pvc}");
@@ -880,7 +907,21 @@ mod tests {
         assert!(admin_allowed(&Method::PUT, "v3/add-user"));
         assert!(admin_allowed(&Method::DELETE, "v3/group/dev"));
         assert!(admin_allowed(&Method::POST, "v3/heal/mybucket/prefix"));
-        // Not forwarded: server update/restart, config, exports, inspect, KMS, wrong verbs.
+        // Tiering and KMS: read-only surfaces are forwarded...
+        assert!(admin_allowed(&Method::GET, "v3/tier"));
+        assert!(admin_allowed(&Method::GET, "v3/tier-stats"));
+        assert!(admin_allowed(&Method::GET, "v3/tier/HOT"));
+        assert!(admin_allowed(&Method::GET, "v3/kms/list-keys"));
+        assert!(admin_allowed(&Method::GET, "v3/kms/describe-key"));
+        // ...but tier/KMS writes and KMS's ServiceControl-gated status/config are not.
+        assert!(!admin_allowed(&Method::PUT, "v3/tier"));
+        assert!(!admin_allowed(&Method::POST, "v3/tier/HOT"));
+        assert!(!admin_allowed(&Method::DELETE, "v3/tier/HOT"));
+        assert!(!admin_allowed(&Method::GET, "v3/kms/status"));
+        assert!(!admin_allowed(&Method::GET, "v3/kms/config"));
+        assert!(!admin_allowed(&Method::POST, "v3/kms/keys/delete"));
+        assert!(!admin_allowed(&Method::POST, "v3/kms/keys/rotate"));
+        // Not forwarded: server update/restart, config, exports, inspect, wrong verbs.
         assert!(!admin_allowed(&Method::POST, "v3/update"));
         assert!(!admin_allowed(&Method::POST, "v3/service"));
         assert!(!admin_allowed(&Method::GET, "v3/export-iam"));
