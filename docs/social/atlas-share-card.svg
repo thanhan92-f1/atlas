@@ -1,6 +1,6 @@
 <!-- Copyright (c) 2026 ZyvorAI Labs Private Limited. -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
-<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630" role="img" aria-label="Atlas — Storage, as a product. One API in front of Ceph, NFS, ZFS and Longhorn, plus atlas-io: an observe-first eBPF I/O sensor.">
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630" role="img" aria-label="Atlas — The world of storage, under one command. One API in front of Ceph, NFS, ZFS and Longhorn, plus atlas-io: an observe-first eBPF I/O sensor.">
   <defs>
     <linearGradient id="bg" x1="0" y1="0" x2="0" y2="630" gradientUnits="userSpaceOnUse">
       <stop offset="0" stop-color="#ffffff"/>
@@ -47,22 +47,23 @@
 
   <!-- wordmark + tagline -->
   <text x="68" y="262" font-family="'Helvetica Neue',Helvetica,Arial,sans-serif" font-size="132" font-weight="700" letter-spacing="-4" fill="#1d1d1f">Atlas</text>
-  <text x="72" y="326" font-family="'Helvetica Neue',Helvetica,Arial,sans-serif" font-size="42" font-weight="600" letter-spacing="-0.8" fill="url(#blueText)">Storage, as a product.</text>
+  <text x="72" y="316" font-family="'Helvetica Neue',Helvetica,Arial,sans-serif" font-size="42" font-weight="600" letter-spacing="-0.8" fill="url(#blueText)">The world of storage,</text>
+  <text x="72" y="362" font-family="'Helvetica Neue',Helvetica,Arial,sans-serif" font-size="42" font-weight="600" letter-spacing="-0.8" fill="url(#blueText)">under one command.</text>
 
   <!-- new: eBPF I/O sensor badge -->
-  <rect x="72" y="352" width="330" height="34" rx="17" fill="#0071e3" fill-opacity="0.10" stroke="#0071e3" stroke-opacity="0.4"/>
-  <text x="87" y="374" font-family="'Menlo','JetBrains Mono',monospace" font-size="15" font-weight="700" fill="#0071e3">NEW · atlas-io: eBPF I/O sensor</text>
+  <rect x="72" y="398" width="330" height="34" rx="17" fill="#0071e3" fill-opacity="0.10" stroke="#0071e3" stroke-opacity="0.4"/>
+  <text x="87" y="420" font-family="'Menlo','JetBrains Mono',monospace" font-size="15" font-weight="700" fill="#0071e3">NEW · atlas-io: eBPF I/O sensor</text>
 
   <!-- verified stats -->
   <g font-family="'Helvetica Neue',Helvetica,Arial,sans-serif">
-    <text x="72" y="452" font-size="38" font-weight="700" letter-spacing="-1" fill="#1d1d1f">4</text>
-    <text x="72" y="478" font-size="15" fill="#6e6e73">storage backends</text>
-    <text x="234" y="452" font-size="38" font-weight="700" letter-spacing="-1" fill="#1d1d1f">6</text>
-    <text x="234" y="478" font-size="15" fill="#6e6e73">database engines</text>
-    <text x="396" y="452" font-size="38" font-weight="700" letter-spacing="-1" fill="#1d1d1f">80+</text>
-    <text x="396" y="478" font-size="15" fill="#6e6e73">REST endpoints</text>
-    <text x="558" y="452" font-size="38" font-weight="700" letter-spacing="-1" fill="#1d1d1f">3</text>
-    <text x="558" y="478" font-size="15" fill="#6e6e73">access surfaces</text>
+    <text x="72" y="498" font-size="38" font-weight="700" letter-spacing="-1" fill="#1d1d1f">4</text>
+    <text x="72" y="524" font-size="15" fill="#6e6e73">storage backends</text>
+    <text x="234" y="498" font-size="38" font-weight="700" letter-spacing="-1" fill="#1d1d1f">6</text>
+    <text x="234" y="524" font-size="15" fill="#6e6e73">database engines</text>
+    <text x="396" y="498" font-size="38" font-weight="700" letter-spacing="-1" fill="#1d1d1f">80+</text>
+    <text x="396" y="524" font-size="15" fill="#6e6e73">REST endpoints</text>
+    <text x="558" y="498" font-size="38" font-weight="700" letter-spacing="-1" fill="#1d1d1f">3</text>
+    <text x="558" y="524" font-size="15" fill="#6e6e73">access surfaces</text>
   </g>
 
   <!-- one API fans out to five backends -->

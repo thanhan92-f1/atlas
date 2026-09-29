@@ -19,7 +19,7 @@ function HomepageHeader() {
       <div className="container">
         <p className={styles.brandMark}>Atlas</p>
         <Heading as="h1" className="hero__title">
-          Storage, as a product.
+          The world of storage, under one command.
         </Heading>
         <p className="hero__subtitle">
           Zyvor&apos;s control plane maps intent to Ceph, NFS, and ZFS — with an

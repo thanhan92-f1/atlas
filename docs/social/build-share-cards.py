@@ -22,6 +22,8 @@ DARK = dict(
 SANS = "'Helvetica Neue',Helvetica,Arial,sans-serif"
 MONO = "'Menlo','JetBrains Mono',monospace"
 
+TAGLINE = ("The world of storage,", "under one command.")
+
 # (name, detail); Ceph is the primary backend and carries the single orange dot. Object storage
 # defaults to Ceph RGW (no separate first-party object backend since RustFS was removed).
 BACKENDS = [
@@ -58,8 +60,8 @@ def svg(p, label):
     for i, (num, lab) in enumerate(STATS):
         x = 72 + i * 162
         stats.append(
-            f'<text x="{x}" y="452" font-size="38" font-weight="700" letter-spacing="-1" fill="{p["ink"]}">{num}</text>\n'
-            f'    <text x="{x}" y="478" font-size="15" fill="{p["sec"]}">{lab}</text>')
+            f'<text x="{x}" y="498" font-size="38" font-weight="700" letter-spacing="-1" fill="{p["ink"]}">{num}</text>\n'
+            f'    <text x="{x}" y="524" font-size="15" fill="{p["sec"]}">{lab}</text>')
     return f'''<!-- Copyright (c) 2026 ZyvorAI Labs Private Limited. -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 <svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630" role="img" aria-label="{label}">
@@ -109,11 +111,12 @@ def svg(p, label):
 
   <!-- wordmark + tagline -->
   <text x="68" y="262" font-family="{SANS}" font-size="132" font-weight="700" letter-spacing="-4" fill="{p['ink']}">Atlas</text>
-  <text x="72" y="326" font-family="{SANS}" font-size="42" font-weight="600" letter-spacing="-0.8" fill="url(#blueText)">Storage, as a product.</text>
+  <text x="72" y="316" font-family="{SANS}" font-size="42" font-weight="600" letter-spacing="-0.8" fill="url(#blueText)">{TAGLINE[0]}</text>
+  <text x="72" y="362" font-family="{SANS}" font-size="42" font-weight="600" letter-spacing="-0.8" fill="url(#blueText)">{TAGLINE[1]}</text>
 
   <!-- new: eBPF I/O sensor badge -->
-  <rect x="72" y="352" width="330" height="34" rx="17" fill="{p['wash']}" fill-opacity="{p['wash_op']}" stroke="{p['card_hi']}" stroke-opacity="0.4"/>
-  <text x="87" y="374" font-family="{MONO}" font-size="15" font-weight="700" fill="{p['card_hi']}">{NEW_BADGE}</text>
+  <rect x="72" y="398" width="330" height="34" rx="17" fill="{p['wash']}" fill-opacity="{p['wash_op']}" stroke="{p['card_hi']}" stroke-opacity="0.4"/>
+  <text x="87" y="420" font-family="{MONO}" font-size="15" font-weight="700" fill="{p['card_hi']}">{NEW_BADGE}</text>
 
   <!-- verified stats -->
   <g font-family="{SANS}">
@@ -145,7 +148,7 @@ def svg(p, label):
 
 if __name__ == "__main__":
     out = sys.argv[1] if len(sys.argv) > 1 else "docs/social"
-    label = ("Atlas — Storage, as a product. One API in front of Ceph, NFS, ZFS and Longhorn, "
+    label = (f"Atlas — {TAGLINE[0]} {TAGLINE[1]} One API in front of Ceph, NFS, ZFS and Longhorn, "
               "plus atlas-io: an observe-first eBPF I/O sensor.")
     open(f"{out}/atlas-share-card.svg", "w").write(svg(LIGHT, label))
     open(f"{out}/atlas-share-card-dark.svg", "w").write(svg(DARK, label))

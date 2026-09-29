@@ -4,12 +4,12 @@
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/social/atlas-share-card-dark.png">
-  <img src="docs/social/atlas-share-card.png" alt="Atlas — Storage, as a product." width="820">
+  <img src="docs/social/atlas-share-card.png" alt="Atlas — The world of storage, under one command." width="820">
 </picture>
 
 # Atlas
 
-### Storage, as a product.
+### The world of storage, under one command.
 
 The **central storage control plane** for the Zyvor suite.<br>
 Products call stable Atlas APIs; Atlas maps intent to Ceph, NFS, ZFS and Longhorn through pluggable drivers. Object storage defaults to Ceph RGW; any S3-compatible endpoint is usable via the generic RGW client.
