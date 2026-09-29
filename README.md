@@ -27,7 +27,7 @@ Products call stable Atlas APIs; Atlas maps intent to Ceph, NFS, ZFS and Longhor
 
 ---
 
-**4** storage backends · **6** database engines migratable via DataBridge · **80+** REST endpoints · **3** access surfaces (REST · gRPC · SSE)
+**4** storage backends · **6** database engines migratable via DataBridge · **80+** REST endpoints · **3** access surfaces (REST · gRPC · SSE) · **eBPF** observe-first I/O sensor
 
 A gateway with an Apple Shop console for operators. Read the [full docs](https://zyvorai.github.io/atlas/): quickstart, architecture, licensing.
 
@@ -97,6 +97,20 @@ Explainable AI-assisted risk scoring and prioritized, read-only runbooks.
 Apple.com-style top-nav shell, SF type, Night/Day themes.
 </td>
 </tr>
+<tr>
+<td valign="top" width="33%">
+<b>atlas-io (eBPF sensor)</b><br>
+Optional, observe-first I/O agent: device-attributed histograms, workload/RCA, fail-open leases — kept out of the gateway so it never needs <code>CAP_BPF</code>.
+</td>
+<td valign="top" width="33%">
+<b>Observability</b><br>
+Prometheus <code>/metrics</code>, forecast/history, OpenTelemetry tracing, unified <code>/events</code>, deep readyz/livez.
+</td>
+<td valign="top" width="33%">
+<b>Governance & security</b><br>
+Per-tenant quotas, DB-backed rate limiting, OIDC/SSO, Vault-backed secrets, token revocation.
+</td>
+</tr>
 </table>
 
 Customer-facing feature guide: [docs/atlas-customer-feature-guide.md](docs/atlas-customer-feature-guide.md).
@@ -137,6 +151,10 @@ flowchart LR
   Driver --> Longhorn[("Longhorn")]
   Atlas --> DataBridge["DataBridge"]
   DataBridge --> Edge[("Edge DB on Ceph\nPostgres · MySQL · MariaDB\nOracle · SQL Server · MongoDB")]
+  IO["atlas-io agent\n(optional, per-node)"] -. "HTTP: histograms · RCA · leases" .-> Atlas
+  IO --> Ceph
+  IO --> NFS
+  IO --> ZFS
 ```
 
 Full write-up: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
@@ -151,6 +169,7 @@ Full write-up: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 | Per-tenant quotas & governance | Yes | Partial | No |
 | Built-in operator console | Yes | Ceph Dashboard only | No |
 | Kubernetes-native provisioning | Yes (via drivers) | No | Yes |
+| eBPF I/O observability, kept out of the control plane | Yes (`atlas-io`) | No | No |
 
 ## Important boundaries
 

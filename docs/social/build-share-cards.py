@@ -22,21 +22,23 @@ DARK = dict(
 SANS = "'Helvetica Neue',Helvetica,Arial,sans-serif"
 MONO = "'Menlo','JetBrains Mono',monospace"
 
-# (name, detail); Ceph is the primary backend and carries the single orange dot.
+# (name, detail); Ceph is the primary backend and carries the single orange dot. Object storage
+# defaults to Ceph RGW (no separate first-party object backend since RustFS was removed).
 BACKENDS = [
     ("Ceph", "RBD · CephFS · RGW"),
     ("NFS", "file shares"),
     ("ZFS", "pools"),
     ("Longhorn", "Kubernetes volumes"),
-    ("RustFS", "S3 objects (default)"),
 ]
-STATS = [("5", "storage backends"), ("6", "database engines"),
+STATS = [("4", "storage backends"), ("6", "database engines"),
          ("80+", "REST endpoints"), ("3", "access surfaces")]
+NEW_BADGE = "NEW · atlas-io: eBPF I/O sensor"
 
 
 def svg(p, label):
     card_h, gap, x0, w = 56, 14, 936, 192
-    top = 315 - (5 * card_h + 4 * gap) // 2
+    n = len(BACKENDS)
+    top = 315 - (n * card_h + (n - 1) * gap) // 2
     cards, wires, dots = [], [], []
     for i, (name, detail) in enumerate(BACKENDS):
         y = top + i * (card_h + gap)
@@ -109,6 +111,10 @@ def svg(p, label):
   <text x="68" y="262" font-family="{SANS}" font-size="132" font-weight="700" letter-spacing="-4" fill="{p['ink']}">Atlas</text>
   <text x="72" y="326" font-family="{SANS}" font-size="42" font-weight="600" letter-spacing="-0.8" fill="url(#blueText)">Storage, as a product.</text>
 
+  <!-- new: eBPF I/O sensor badge -->
+  <rect x="72" y="352" width="330" height="34" rx="17" fill="{p['wash']}" fill-opacity="{p['wash_op']}" stroke="{p['card_hi']}" stroke-opacity="0.4"/>
+  <text x="87" y="374" font-family="{MONO}" font-size="15" font-weight="700" fill="{p['card_hi']}">{NEW_BADGE}</text>
+
   <!-- verified stats -->
   <g font-family="{SANS}">
     {chr(10).join('    ' + s if i else s for i, s in enumerate(stats))}
@@ -139,6 +145,7 @@ def svg(p, label):
 
 if __name__ == "__main__":
     out = sys.argv[1] if len(sys.argv) > 1 else "docs/social"
-    label = "Atlas — Storage, as a product. One API in front of Ceph, NFS, ZFS, Longhorn and RustFS."
+    label = ("Atlas — Storage, as a product. One API in front of Ceph, NFS, ZFS and Longhorn, "
+              "plus atlas-io: an observe-first eBPF I/O sensor.")
     open(f"{out}/atlas-share-card.svg", "w").write(svg(LIGHT, label))
     open(f"{out}/atlas-share-card-dark.svg", "w").write(svg(DARK, label))
