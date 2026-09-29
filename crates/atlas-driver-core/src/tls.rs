@@ -9,6 +9,8 @@
 //! both RustFS and Ceph RGW buckets) so both speak the same TLS trust policy.
 use std::time::Duration;
 
+use rustls_pki_types::{pem::PemObject, CertificateDer};
+
 use crate::DriverError;
 
 pub fn trusted_http_client(timeout: Option<Duration>) -> Result<reqwest::Client, DriverError> {
@@ -20,6 +22,26 @@ pub fn trusted_http_client(timeout: Option<Duration>) -> Result<reqwest::Client,
         if !path.trim().is_empty() {
             let pem = std::fs::read(&path)
                 .map_err(|e| DriverError::Backend(format!("ATLAS_RUSTFS_CA_CERT {path}: {e}")))?;
+            // reqwest's own `Certificate::from_pem` defers actual PEM parsing to `.build()` time
+            // with the rustls backend (it just wraps the raw bytes), and its parser silently treats
+            // content with no `-----BEGIN CERTIFICATE-----` blocks at all as "zero certificates
+            // found" rather than an error — so a garbage/misconfigured file would otherwise be
+            // ignored with no error at startup. Validate eagerly here instead: reject both a parse
+            // failure of a recognized block and a file with no certificate blocks at all.
+            let mut certs_found = 0usize;
+            for result in CertificateDer::pem_slice_iter(&pem) {
+                result.map_err(|e| {
+                    DriverError::Backend(format!(
+                        "ATLAS_RUSTFS_CA_CERT {path} is not a valid PEM certificate: {e}"
+                    ))
+                })?;
+                certs_found += 1;
+            }
+            if certs_found == 0 {
+                return Err(DriverError::Backend(format!(
+                    "ATLAS_RUSTFS_CA_CERT {path} contains no PEM certificate blocks"
+                )));
+            }
             let cert = reqwest::Certificate::from_pem(&pem).map_err(|e| {
                 DriverError::Backend(format!(
                     "ATLAS_RUSTFS_CA_CERT {path} is not a valid PEM certificate: {e}"
@@ -37,10 +59,13 @@ pub fn trusted_http_client(timeout: Option<Duration>) -> Result<reqwest::Client,
 mod tests {
     use super::*;
 
-    // cargo test runs these in parallel threads of the same process, and all three mutate the
-    // same process-global ATLAS_RUSTFS_CA_CERT — without this lock one test's remove_var can race
-    // another's set_var (found live in CI, 2026-09-28: invalid_pem_errors_not_panics intermittently
-    // saw no env var set and got Ok instead of Err).
+    // cargo test runs these in parallel threads of the same process, and all three mutate the same
+    // process-global ATLAS_RUSTFS_CA_CERT — without this lock one test's remove_var could race
+    // another's set_var. (invalid_pem_errors_not_panics also failed in CI on 2026-09-28, but that
+    // turned out to be a real, fully deterministic bug in trusted_http_client itself — reqwest's
+    // Certificate::from_pem defers parsing to build()-time and silently accepts zero-certificate
+    // input — now fixed above with an eager rustls_pki_types check; this lock guards a separate,
+    // latent hazard, not what caused that failure.)
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]

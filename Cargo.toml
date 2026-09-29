@@ -91,6 +91,10 @@ clap = { version = "4", features = ["derive", "env"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 reqwest = { version = "0.13", features = ["json", "stream"] }
 dotenvy = "0.15"
+# Same version reqwest's rustls backend already resolves to (Cargo.lock); used to eagerly validate a
+# PEM CA cert (reqwest's own Certificate::from_pem defers parsing to build()-time and can silently
+# accept garbage input, see atlas-driver-core/src/tls.rs).
+rustls-pki-types = "1"
 
 [profile.release]
 lto = true

@@ -312,6 +312,8 @@ version = "0.4.0"
 dependencies = [
  "async-trait",
  "atlas-api-types",
+ "reqwest 0.13.5",
+ "rustls-pki-types",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
@@ -361,6 +363,7 @@ name = "atlas-driver-rgw"
 version = "0.4.0"
 dependencies = [
  "anyhow",
+ "atlas-driver-core",
  "futures-util",
  "hex",
  "percent-encoding",
