@@ -19,7 +19,7 @@ Products call stable Atlas APIs; Atlas maps intent to Ceph, NFS, ZFS and Longhor
 [![Version](https://img.shields.io/badge/version-0.4.0-0071e3?style=flat-square&labelColor=1d1d1f)](CHANGELOG.md)
 [![Docs](https://img.shields.io/badge/docs-zyvorai.github.io%2Fatlas-0071e3?style=flat-square&labelColor=1d1d1f)](https://zyvorai.github.io/atlas/)
 
-[**Quickstart**](#quickstart) · [**Docs**](https://zyvorai.github.io/atlas/) · [**Gallery**](#dashboard-gallery) · [**Architecture**](#architecture-at-a-glance) · [**License**](#license)
+[**Quickstart**](#quickstart) · [**Capabilities**](#capabilities) · [**Docs**](#documentation) · [**Gallery**](#dashboard-gallery) · [**Architecture**](#architecture-at-a-glance) · [**Contributing**](#contributing) · [**License**](#license)
 
 <sub>Rust · React · TypeScript · SQLite · gRPC · Ceph</sub>
 
@@ -160,6 +160,15 @@ flowchart LR
 
 Full write-up: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
+## Documentation
+
+| For | Start at |
+|---|---|
+| Engineers evaluating or building on Atlas | **[docs/README.md](docs/README.md)** — architecture, API reference, drivers, day-2 ops, DataBridge, AI Advisor, the `atlas-io` eBPF sensor |
+| Operators running the console day to day | **[docs/customer/README.md](docs/customer/README.md)** — getting started, admin basics, per-page reference |
+| A single narrative read of everything the product does | **[docs/atlas-customer-feature-guide.md](docs/atlas-customer-feature-guide.md)** |
+| Published docs site | [zyvorai.github.io/atlas](https://zyvorai.github.io/atlas/) |
+
 ## Why Atlas
 
 | | Atlas | Raw Ceph tooling | Rook alone |
@@ -179,11 +188,17 @@ products, under the terms of the license ([full guide](docs/LICENSING.md)). Boun
 maturity, not licensing, live in [docs/STATUS.md](docs/STATUS.md): what is verified on real infrastructure,
 and what is lab-verified only.
 
+## Contributing
+
+Read [CONTRIBUTING.md](CONTRIBUTING.md) for conventions and how to add an endpoint, driver, or
+migration. Contributions are made under the [CLA](CLA.md), signed off per the
+[DCO](DCO.md) (`git commit -s`), and governed by our [Code of Conduct](CODE_OF_CONDUCT.md).
+Found a security issue? See [SECURITY.md](SECURITY.md) rather than opening a public issue.
+
 ## License
 
 Licensed under the **[Apache License, Version 2.0](LICENSE)**. See [docs/LICENSING.md](docs/LICENSING.md)
-and [NOTICE](NOTICE). Contributions: [CLA.md](CLA.md) + [DCO.md](DCO.md) (`git commit -s`),
-governed by our [Code of Conduct](CODE_OF_CONDUCT.md).
+and [NOTICE](NOTICE).
 
 <div align="center">
 

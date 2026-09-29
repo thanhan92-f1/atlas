@@ -5,8 +5,9 @@
 
 ## Supported versions
 
-Atlas has not yet cut a tagged release — `main` is the only supported branch. Once tagged
-releases begin, this section will list which lines receive security fixes.
+Atlas is pre-1.0: only the latest tagged release (currently `v0.4.0`) and `main` receive security
+fixes. There is no long-term-support line yet — upgrade to the latest tag to stay covered. See
+[CHANGELOG.md](CHANGELOG.md) for what changed between releases.
 
 ## Reporting a vulnerability
 

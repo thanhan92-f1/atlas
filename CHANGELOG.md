@@ -45,7 +45,7 @@ before `0.2.0` were not tracked here — see `git log` for that history.
 
 ### Changed — Zyvor Production License v1.0
 
-- Replaced the AGPL-3.0 + Atlas Commercial License dual license with the [Zyvor Production License v1.0](LICENSE). Non-production use is free. Production, SaaS, managed services, OEM, and redistribution require a separate paid commercial license. Published SKU prices are withdrawn; commercial terms are issued separately ([https://zyvor.dev](https://zyvor.dev)). Source headers use `LicenseRef-Zyvor-Production-1.0`. There is still no runtime license key. The v0.3.0 AGPL text is [`LICENSES/AGPL-3.0-only-v0.3.0.txt`](LICENSES/AGPL-3.0-only-v0.3.0.txt); the v0.3.0 commercial summary is [`LICENSES/LicenseRef-Atlas-Commercial-v0.3.0.md`](LICENSES/LicenseRef-Atlas-Commercial-v0.3.0.md).
+- Replaced the AGPL-3.0 + Atlas Commercial License dual license with the [Zyvor Production License v1.0](LICENSE). Non-production use is free. Production, SaaS, managed services, OEM, and redistribution require a separate paid commercial license. Published SKU prices are withdrawn; commercial terms are issued separately ([https://zyvor.dev](https://zyvor.dev)). Source headers use `LicenseRef-Zyvor-Production-1.0`. There is still no runtime license key. The v0.3.0 AGPL text is [`LICENSES/AGPL-3.0-only-v0.3.0.txt`](https://github.com/zyvorai/atlas/blob/v0.3.0/LICENSES/AGPL-3.0-only-v0.3.0.txt) (archived license texts were later removed from `main`, see [`docs/LICENSING.md`](docs/LICENSING.md)); the v0.3.0 commercial summary is [`LICENSES/LicenseRef-Atlas-Commercial-v0.3.0.md`](https://github.com/zyvorai/atlas/blob/v0.3.0/LICENSES/LicenseRef-Atlas-Commercial-v0.3.0.md).
 
 ### Added — operator Make targets
 

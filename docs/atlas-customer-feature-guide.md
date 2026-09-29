@@ -14,7 +14,7 @@ This is the customer-facing onboarding guide — how to access the product, your
 
 0. [Getting started — access & first workflows](#getting-started)
 1. [Control Plane & Architecture](#1-control-plane-architecture)
-2. [Block, File & Object Storage](#2-block,-file-object-storage)
+2. [Block, File & Object Storage](#2-block-file-object-storage)
 3. [Data Protection](#3-data-protection)
 4. [Multi-Backend & Ceph Operations](#4-multi-backend-ceph-operations)
 5. [Observability & Metrics](#5-observability-metrics)
@@ -80,7 +80,7 @@ _An intent-driven gateway that decouples every product from the storage undernea
   - **How:** REST `POST /api/atlas/v1/volumes` with a `policy` intent (e.g. `"database"`), which `atlas-policy` resolves to a StorageClass; browse the catalog at `GET /api/atlas/v1/policies`. Console: Storage Center → Volumes → Create.
 - **Pluggable Storage Drivers** — A single StorageDriver trait fronts every backend: real Ceph and a real read-only Kubernetes driver, plus NFS/ZFS drivers proving the architecture scales past Ceph (fixture data, not live yet — see §4), and a fake driver for local runs. — _Add a backend once and every product gets it through the same stable API._
   - **How:** The driver is chosen by `backend_type` at registration — `POST /api/atlas/v1/backends { "backend_type": "ceph|nfs|zfs|kubernetes" }`; run local with `ATLAS_CEPH_DRIVER_MODE=fake`. Console: Storage Center → Backends.
-- **Atlas Gateway** — An axum server that centralizes auth, audit, and the API surface, and embeds the Storage Center console in the binary. — _One deployable front door for storage across all nine Zyvor products._
+- **Atlas Gateway** — An axum server that centralizes auth, audit, and the API surface, and embeds the Storage Center console in the binary. — _One deployable front door for storage across the Zyvor product suite._
   - **How:** Start it with `make run`; it serves the console at `http://127.0.0.1:5110/` and REST at `/api/atlas/v1/*` from one binary. Health: `curl localhost:5110/health`.
 - **REST + gRPC Surfaces** — The same control plane is reachable over REST and a tonic gRPC edge with streaming WatchJob for product integrations. — _Human tools use REST; product runtimes get typed, streaming gRPC._
   - **How:** REST at `/api/atlas/v1/*`; gRPC `atlas.v1.AtlasStorage` on `:5111` — `grpcurl -plaintext :5111 list`, `grpcurl -plaintext :5111 atlas.v1.AtlasStorage/ListPools`.

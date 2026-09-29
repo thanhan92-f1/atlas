@@ -11,12 +11,16 @@ Atlas is the shared storage control plane. Products call **REST** and/or **gRPC*
 
 | Field | Example | Meaning |
 |---|---|---|
-| `product` | `veyron`, `hyper2kvm`, `guestkit`, `packetwolf`, `aether`, `ragnarok`, `machina`, `hypersdk`, `zeus`, `relay`, `kryton` | Product id recorded in `product_bindings` |
+| `product` | `hyper2kvm`, `guestkit`, `aether`, `relay`, `kryton`, `zorvia`, `veyron`, `packetwolf`, `ragnarok`, `machina`, `hypersdk`, `zeus` | Product id recorded in `product_bindings` |
 | `resource_type` | `vm`, `datastore`, `volume`, `fleet`, `database` | Product-side resource class |
 | `resource_id` | product UUID / name | Product-side id |
 | `role` | `owner` (default), `consumer`, `data_disk` | Binding role |
 
 The product named **Transiva** is recorded as owner id `hyper2kvm`. That wire id is unchanged.
+
+`veyron`, `packetwolf`, `ragnarok`, `machina`, `hypersdk`, and `zeus` are reserved owner ids for
+enterprise/future products that aren't public yet (see `docs/ROADMAP.md`'s Slice 3+ section) — no
+integration exists to document below until one of those repos ships.
 
 Enumerate owned volumes with `ListVolumesByOwner(product, resource_id?)`.
 
@@ -66,7 +70,7 @@ Service account: mint JWT subject `product.service.relay` (operator).
 
 ## Kryton (Windows virtualization)
 
-[Kryton](../../tt/kryton) runs Windows guests on KubeVirt. It discovers StorageClasses
+[Kryton](../../kryton) runs Windows guests on KubeVirt. It discovers StorageClasses
 (optionally via Atlas) and stamps `disk.storageClass` on VM DataVolumes.
 
 | Field | Kryton convention |
@@ -81,6 +85,34 @@ Service account: mint JWT subject `product.service.kryton` (operator).
 
 Probe from Kryton: `POST /api/v1/integrations/atlas/test` against Atlas `/readyz` +
 `/api/atlas/v1/storage-classes`.
+
+## Zorvia (KubeVirt VMs)
+
+[Zorvia](../../zorvia) is the KubeVirt VM control plane. Atlas is optional and additive there —
+Zorvia keeps managing Rook-Ceph directly, and Atlas shows up as extra sections on Zorvia's
+existing Storage page (`AtlasSection.tsx` plus sibling `AtlasRbdSection.tsx` /
+`AtlasBucketsSection.tsx` / `AtlasDrSection.tsx` / `AtlasAiSection.tsx` /
+`AtlasObservabilitySection.tsx` / `AtlasGovernanceSection.tsx`) rather than a dedicated top-level
+page. Volumes created through it are tagged:
+
+| Field | Zorvia convention |
+|---|---|
+| `product` | `zorvia` |
+| `resource_type` | `vm` |
+| `resource_id` | Zorvia VM name |
+| `role` | `data_disk` (default) |
+
+Configure on the Zorvia server with `ATLAS_URL` (required to enable the integration),
+`ATLAS_TOKEN` (bearer JWT, `product.service.zorvia`), `ATLAS_TENANT_ID`, `ATLAS_TIMEOUT_SECS`, and
+`ATLAS_TLS_INSECURE` for self-signed labs. See `docs/ATLAS_INTEGRATION.md` in the Zorvia repo.
+
+## Fabric (Linux private cloud)
+
+[Fabric](../../fabric)'s Storage page can manage **Ceph RBD images** for a pool by proxying
+through Atlas (`fabric/docs/user/pages/infrastructure/storage-pools.md`: "proxied through the
+Atlas storage control plane"). This is a thinner integration than Kryton/Zorvia — it proxies RBD
+image list/create/delete for an existing Ceph pool and doesn't go through the `Owner`/
+`product_bindings` mechanism, so there's no `product` id to record for it yet.
 
 ## Follow-ups (product repos)
 
