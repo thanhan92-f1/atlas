@@ -69,4 +69,3 @@ Additionally, every commit must carry a DCO `Signed-off-by` line — see
 ## 6. Contact
 
 Questions about this CLA: [legal@zyvor.dev](mailto:legal@zyvor.dev).
-Commercial licensing: [https://zyvor.dev](https://zyvor.dev).
