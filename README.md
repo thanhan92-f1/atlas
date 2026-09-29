@@ -139,9 +139,10 @@ Full tour: [Gallery](https://zyvorai.github.io/atlas/gallery).
 ```mermaid
 flowchart LR
   subgraph Products["Zyvor products"]
-    P1["Zeus OS / v9s"]
-    P2["Veyron"]
-    P3["HyperSDK · Aether · …"]
+    P1["Aether"]
+    P2["Zorvia"]
+    P3["Kryton"]
+    P4["Fabric · …"]
   end
   Products -- "REST · gRPC" --> Atlas["Atlas Gateway"]
   Atlas --> Driver["StorageDriver trait"]
