@@ -66,6 +66,7 @@ data-node addresses are `host:port` and resolved on every connect, so DNS names 
 | `http_tls` | none | `{"cert", "key", "client_ca"?}`: serve the HTTP API over TLS. With `client_ca`, every `/v1/*` request must also present a client certificate signed by it (401 otherwise; a certificate from another CA fails the handshake), while `/healthz`, `/readyz` and `/metrics` stay open to probes and scrapers. |
 | `tls` | none | Mutual TLS for the Raft and data-node transports (not the HTTP endpoint). Node ids must then be DNS names present as SANs on each node's certificate. |
 | `max_request_bytes` | 64 MiB | Larger HTTP bodies and read lengths get 413. |
+| `metadata.bootstrap` | every `peers` entry | Initial Raft voters, used until the first membership change commits. A node not listed starts as a non-voter (it never campaigns) and waits to be added through `POST /v1/members`. Every id needs a `peers` entry. |
 | `metadata.replicas` | 3 | Between 1 and the number of `data_nodes`. |
 | `metadata.extent_bytes` | 4 MiB | Writes are split into extents of this size. |
 | `metadata.tick_ms` | 50 | Raft tick; elections take 10–20 ticks. |
@@ -80,7 +81,7 @@ data-node addresses are `host:port` and resolved on every connect, so DNS names 
 | Method and path | Auth | Description |
 | --- | --- | --- |
 | `GET /healthz` | no | Process is up. |
-| `GET /readyz` | no | 200 once a metadata leader is known (metadata role) or the data node is serving; 503 otherwise, including after a fatal storage error. |
+| `GET /readyz` | no | 200 once a metadata leader is known (metadata role; a non-voter waiting to be added counts as ready) or the data node is serving; 503 otherwise, including after a fatal storage error. |
 | `GET /metrics` | no | Prometheus text: Raft/transport, engine, data node, and `atlas_native_{repair,gc}_{runs,errors}_total`. |
 | `GET /v1/status` | yes | Raft role/term/leader/indexes, per-data-node health, last repair result, data-node fence. |
 | `GET /v1/volumes` | yes | Volumes in the applied catalog. |
@@ -91,6 +92,8 @@ data-node addresses are `host:port` and resolved on every connect, so DNS names 
 | `POST /v1/volumes/{id}/snapshots` | yes | `{"name": "..."}` → 201 `{"id": "..."}`. |
 | `DELETE /v1/snapshots/{id}` | yes | 204. |
 | `GET /v1/snapshots/{id}/data?offset=N&len=M` | yes | Same as the volume read, against the snapshot. |
+| `GET /v1/members` | yes | `{"membership": {"type": "stable", "voters": [...]}, "addrs": {id: "host:port"}}` (`type` is `joint` with `old`/`new` mid-change); `addrs` are the Raft addresses learned from membership changes. |
+| `POST /v1/members` | yes | `{"voters": {"<id>": "<host:port>", ...}}`: move to exactly this voter set (leader only) and return once the final configuration has committed. 409 while another change is in flight. |
 | `POST /v1/repair`, `POST /v1/gc` | yes | Run one pass now (leader only) and return its stats. |
 
 Errors are JSON `{"error": "...", "leader": ...}`. A mutation sent to a follower returns **421** with
@@ -106,6 +109,10 @@ The HTTP server is deliberately small: one request per connection, `Content-Leng
 - **Maintenance**: the leader runs `repair_once` (scrub every replica, re-replicate missing or
   corrupt ones) and `gc_once` (reclaim unreferenced extents) on their intervals. Each pass is a full
   scan; size the repair interval to the data volume.
+- **Dead connections**: a peer that vanishes without closing its sockets (a deleted pod, a
+  powered-off host) is detected by its Raft senders: a connection is replaced when the peer has
+  answered none of our requests for `max(40 ticks, 1 s)` or has reconnected to us since (it
+  restarted). Counted in `atlas_native_transport_stale_reconnects_total`.
 - **Failure**: a data node that fails I/O is backed off for 5 s and writes move to the next eligible
   node; reads fall back to other replicas. Losing the metadata leader triggers an election
   (typically well under a second with the default tick) and clients retry against the new leader.
@@ -114,6 +121,26 @@ The HTTP server is deliberately small: one request per connection, `Content-Leng
   the process exit non-zero so its supervisor restarts it from disk.
 - **Logging**: startup prints the bound addresses to stderr; everything else is in `/metrics` and
   `/v1/status`.
+
+## Membership changes
+
+The voter set lives in the replicated log. `POST /v1/members` on the leader moves it to a new set by
+joint consensus: the leader appends a `joint` configuration (old + new; every election and commit
+needs a majority of **both**), and once that commits it appends the `stable` new set. Each node
+switches configuration as soon as the entry reaches its log, so there is no window with two
+independent majorities. Only one change runs at a time; the request returns after the final entry
+commits (bounded by `6 × proposal_timeout_ms`).
+
+- **Adding** a node: start it with `metadata.bootstrap` set to the current voters (so it does not
+  count itself in) and `peers` listing them; it waits as a non-voter. Then post the full new voter set
+  including its address. The leader replicates the log (or a snapshot) to it as part of the change.
+- **Removing** a node, including the leader: post the set without it. A leader that removes itself
+  steps down once the final entry commits and the remaining voters elect a new leader. A removed
+  follower may never receive the final entry; it cannot disrupt the new group (its pre-votes need a
+  majority of the new set too) and should simply be shut down.
+- Change one voter at a time where possible and keep the voter count odd. Data placement
+  (`data_nodes`) is separate from Raft membership: removing a data node from the config makes repair
+  re-replicate its extents onto the remaining nodes (`POST /v1/repair` to run it now).
 
 ## Kubernetes
 
@@ -138,6 +165,16 @@ hash. Pods therefore roll only when the image or manifest changed; re-running it
 writes and reads a block through the leader, and with `--verify-failover` deletes the leader pod and
 reads the block back from the newly elected one.
 
+### Helm
+
+`deploy/helm/atlas-native` is the production form of the same layout: configurable voter count,
+replication factor and engine tuning, an API token Secret (generated and kept across upgrades, or
+your own), optional Raft/data mutual TLS (an existing Secret or a cert-manager `Certificate` with
+every pod name as a SAN), optional HTTPS with client-certificate auth, and a `ServiceMonitor`. See
+its [README](../deploy/helm/atlas-native/README.md). `deploy/native/helm-live-check.sh <repo> <tag>`
+installs it with both TLS layers on a throwaway PKI and verifies auth refusals, unaligned I/O,
+leader-pod failover and that an unchanged `helm upgrade` restarts nothing.
+
 ## Smoke test
 
 `deploy/native/smoke.sh [path/to/atlas-native-node]` starts three metadata and three data node
@@ -150,5 +187,4 @@ repair after losing a data node, and config validation.
 
 ## Not implemented yet
 
-- Raft membership changes (the voter set is fixed by config);
-- a Helm chart and gateway integration (the raw manifest above is the only deployment).
+- gateway integration.
