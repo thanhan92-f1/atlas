@@ -25,6 +25,7 @@ use crate::{
     device::BlockStore,
     engine::{EngineConfig, MetaBackend, NativeEngine, NativeError, RepairStats},
     http::{Handler, HttpServer, Request, Response},
+    metadata::MetaError,
     metrics::PromText,
     placement::{FailureDomain, Node, PlacementPolicy},
     raft::{RaftConfig, RaftError, Role},
@@ -259,6 +260,8 @@ struct NodeShared {
     require_client_cert: bool,
     /// Bounds `POST /v1/members` (joint and final entries, including a new voter catching up).
     membership_timeout: Duration,
+    /// `(extent_bytes, replicas)` of the metadata role, reported by `/v1/status`.
+    layout: Option<(usize, usize)>,
     raft: Option<Arc<RaftServer>>,
     engine: Option<NativeEngine>,
     data: Mutex<Option<DataNodeServer>>,
@@ -406,6 +409,7 @@ impl NativeNode {
                 .map(|m| Duration::from_millis(m.proposal_timeout_ms.saturating_mul(6)))
                 .unwrap_or_default(),
             require_client_cert: cfg.http_tls.as_ref().is_some_and(|t| t.client_ca.is_some()),
+            layout: cfg.metadata.as_ref().map(|m| (m.extent_bytes, m.replicas)),
             raft,
             engine,
             data: Mutex::new(data),
@@ -571,7 +575,9 @@ fn token_ok(expected: &str, header: Option<&String>) -> bool {
 
 fn error_response(e: NativeError) -> Response {
     let (status, leader) = match &e {
-        NativeError::NotFound(_) => (404, None),
+        NativeError::NotFound(_)
+        | NativeError::Metadata(MetaError::NotFound(_))
+        | NativeError::Raft(RaftError::Rejected(MetaError::NotFound(_))) => (404, None),
         NativeError::Invalid(_) => (400, None),
         NativeError::Raft(RaftError::NotLeader { leader }) => (421, leader.clone()),
         NativeError::Raft(RaftError::Rejected(_) | RaftError::MembershipBusy)
@@ -636,6 +642,24 @@ fn change_members(sh: &NodeShared, r: &RaftServer, req: &Request) -> Response {
     }
 }
 
+/// The optional client-chosen `"id"` of a create (repeating a create with the same id is a
+/// no-op), else a fresh UUID.
+fn client_id(body: &serde_json::Value) -> Result<String, Response> {
+    match &body["id"] {
+        serde_json::Value::Null => Ok(uuid::Uuid::new_v4().to_string()),
+        serde_json::Value::String(id)
+            if (1..=64).contains(&id.len())
+                && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') =>
+        {
+            Ok(id.clone())
+        }
+        _ => Err(Response::text(
+            400,
+            "\"id\" must be 1-64 characters of [A-Za-z0-9-]",
+        )),
+    }
+}
+
 fn body_json(req: &Request) -> Result<serde_json::Value, Response> {
     serde_json::from_slice(&req.body)
         .map_err(|e| Response::text(400, format!("invalid JSON body: {e}")))
@@ -692,10 +716,25 @@ fn handle(sh: &NodeShared, req: Request) -> Response {
                     "body must be {\"name\": string, \"size_bytes\": integer}",
                 );
             };
-            e.create_volume(name, size)
+            let id = match client_id(&body) {
+                Ok(id) => id,
+                Err(r) => return r,
+            };
+            e.create_volume_as(id, name, size)
                 .map(|id| Response::json(201, &json!({ "id": id })))
         }
         ("DELETE", ["v1", "volumes", id]) => e.delete_volume(id).map(|()| Response::text(204, "")),
+        ("POST", ["v1", "volumes", id, "resize"]) => {
+            let body = match body_json(&req) {
+                Ok(b) => b,
+                Err(r) => return r,
+            };
+            let Some(size) = body["size_bytes"].as_u64() else {
+                return Response::text(400, "body must be {\"size_bytes\": integer}");
+            };
+            e.resize_volume(id, size)
+                .map(|()| Response::json(200, &json!({ "id": id, "size_bytes": size })))
+        }
         ("PUT", ["v1", "volumes", id, "data"]) => {
             let offset = match query_u64(&req, "offset") {
                 Ok(o) => o,
@@ -719,11 +758,35 @@ fn handle(sh: &NodeShared, req: Request) -> Response {
             let Some(name) = body["name"].as_str() else {
                 return Response::text(400, "body must be {\"name\": string}");
             };
-            e.create_snapshot(id, name)
+            let sid = match client_id(&body) {
+                Ok(id) => id,
+                Err(r) => return r,
+            };
+            e.create_snapshot_as(sid, id, name)
                 .map(|sid| Response::json(201, &json!({ "id": sid })))
         }
         ("DELETE", ["v1", "snapshots", id]) => {
             e.delete_snapshot(id).map(|()| Response::text(204, ""))
+        }
+        ("POST", ["v1", "snapshots", id, "clone"]) => {
+            let body = match body_json(&req) {
+                Ok(b) => b,
+                Err(r) => return r,
+            };
+            let size = &body["size_bytes"];
+            let (Some(name), true) = (body["name"].as_str(), size.is_null() || size.is_u64())
+            else {
+                return Response::text(
+                    400,
+                    "body must be {\"name\": string, \"size_bytes\"?: integer}",
+                );
+            };
+            let vid = match client_id(&body) {
+                Ok(id) => id,
+                Err(r) => return r,
+            };
+            e.clone_snapshot_as(vid, id, name, size.as_u64())
+                .map(|vid| Response::json(201, &json!({ "id": vid })))
         }
         ("GET", ["v1", "snapshots", id, "data"]) => {
             let (offset, len) = match read_range(sh, &req) {
@@ -785,6 +848,7 @@ fn status(sh: &NodeShared) -> Response {
         &json!({
             "node_id": sh.id,
             "metadata": raft,
+            "layout": sh.layout.map(|(e, r)| json!({ "extent_bytes": e, "replicas": r })),
             "data_nodes": nodes,
             "last_repair": last_repair,
             "data_node": fence.map(|f| json!({ "fence": f })),

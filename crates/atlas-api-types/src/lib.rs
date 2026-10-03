@@ -24,6 +24,8 @@ pub enum BackendType {
     CloudBlock,
     /// Kubernetes CSI / StorageClass view (not a physical backend of its own).
     Kubernetes,
+    /// An atlas-native-node cluster (`atlas-driver-native`).
+    Native,
 }
 
 /// How a backend is operated (PDF §6).
@@ -325,6 +327,9 @@ pub struct CreateSnapshotResult {
 pub struct CloneSnapshotRequest {
     pub snapshot_id: String,
     pub new_volume_name: String,
+    /// Size of the new volume; the snapshot's size when unset.
+    #[serde(default)]
+    pub size_bytes: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
