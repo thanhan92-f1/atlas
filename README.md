@@ -2,10 +2,7 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 <div align="center">
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/social/atlas-share-card-dark.png">
-  <img src="docs/social/atlas-share-card.png" alt="Atlas — The world of storage, under one command." width="820">
-</picture>
+<img src="docs/social/atlas-hero-dark.jpg" alt="Atlas - Ceph, NFS, ZFS, Longhorn. Under one command." width="100%">
 
 # Atlas
 
@@ -14,10 +11,10 @@
 The **central storage control plane** for the Zyvor suite.<br>
 Products call stable Atlas APIs; Atlas maps intent to Ceph, NFS, ZFS and Longhorn through pluggable drivers. Object storage defaults to Ceph RGW; any S3-compatible endpoint is usable via the generic RGW client.
 
-[![CI](https://img.shields.io/github/actions/workflow/status/zyvorai/atlas/ci.yml?branch=main&style=flat-square&labelColor=1d1d1f&label=CI)](https://github.com/zyvorai/atlas/actions/workflows/ci.yml)
+[![CI](https://img.shields.io/github/actions/workflow/status/zyvorai/zyvor-atlas/ci.yml?branch=main&style=flat-square&labelColor=1d1d1f&label=CI)](https://github.com/zyvorai/zyvor-atlas/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-0071e3?style=flat-square&labelColor=1d1d1f)](LICENSE)
 [![Version](https://img.shields.io/badge/version-0.4.0-0071e3?style=flat-square&labelColor=1d1d1f)](CHANGELOG.md)
-[![Docs](https://img.shields.io/badge/docs-zyvorai.github.io%2Fatlas-0071e3?style=flat-square&labelColor=1d1d1f)](https://zyvorai.github.io/atlas/)
+[![Docs](https://img.shields.io/badge/docs-zyvorai.github.io%2Fzyvor--atlas-0071e3?style=flat-square&labelColor=1d1d1f)](https://zyvorai.github.io/zyvor-atlas/)
 
 [**Quickstart**](#quickstart) · [**Capabilities**](#capabilities) · [**Docs**](#documentation) · [**Gallery**](#dashboard-gallery) · [**Architecture**](#architecture-at-a-glance) · [**Contributing**](#contributing) · [**License**](#license)
 
@@ -29,7 +26,7 @@ Products call stable Atlas APIs; Atlas maps intent to Ceph, NFS, ZFS and Longhor
 
 **4** storage backends · **6** database engines migratable via DataBridge · **80+** REST endpoints · **3** access surfaces (REST · gRPC · SSE) · **eBPF** observe-first I/O sensor
 
-A gateway with an Apple Shop console for operators. Read the [full docs](https://zyvorai.github.io/atlas/): quickstart, architecture, licensing.
+A gateway with an Apple Shop console for operators. Read the [full docs](https://zyvorai.github.io/zyvor-atlas/): quickstart, architecture, licensing.
 
 <div align="center">
 
@@ -62,7 +59,7 @@ Deploy to a remote k3s host:
 | --- | --- |
 | **Source, issues, releases** (Apache License 2.0) | This repo |
 | **Project / contact** | [https://zyvor.dev](https://zyvor.dev) |
-| **Docs site** | https://zyvorai.github.io/atlas/ |
+| **Docs site** | https://zyvorai.github.io/zyvor-atlas/ |
 
 More: [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md) · [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) · [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
@@ -132,7 +129,7 @@ Live console shots (captured against a lab deployment), Day theme shown; the ove
 </tr>
 </table>
 
-Full tour: [Gallery](https://zyvorai.github.io/atlas/gallery).
+Full tour: [Gallery](https://zyvorai.github.io/zyvor-atlas/gallery).
 
 ## Architecture at a glance
 
@@ -167,7 +164,7 @@ Full write-up: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 | Engineers evaluating or building on Atlas | **[docs/README.md](docs/README.md)** — architecture, API reference, drivers, day-2 ops, DataBridge, AI Advisor, the `atlas-io` eBPF sensor |
 | Operators running the console day to day | **[docs/customer/README.md](docs/customer/README.md)** — getting started, admin basics, per-page reference |
 | A single narrative read of everything the product does | **[docs/atlas-customer-feature-guide.md](docs/atlas-customer-feature-guide.md)** |
-| Published docs site | [zyvorai.github.io/atlas](https://zyvorai.github.io/atlas/) |
+| Published docs site | [zyvorai.github.io/zyvor-atlas](https://zyvorai.github.io/zyvor-atlas/) |
 
 ## Why Atlas
 
