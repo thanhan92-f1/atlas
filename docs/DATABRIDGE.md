@@ -441,8 +441,8 @@ stream reports caught-up (0).
 | MySQL | **live** | **live** | **live** | **live** (incl. TIMESTAMP columns via the Debezium JDBC sink, see note) | **live** |
 | MariaDB | **live** | **live** | **live** | **live** | **live** |
 | MongoDB | **live** | **live** | **live** | **live** | **live** |
-| SQL Server | **live** | via Debezium `initial` | advisory | **live** (podman, see note) | pending |
-| Oracle | **live** | via Debezium `initial` | advisory | **live** (26ai, podman, see note) | pending |
+| SQL Server | **live** | via Debezium `initial` | advisory | **live** | **live** |
+| Oracle | **live** | via Debezium `initial` | advisory | **live** (26ai) | **live** |
 
 Fake path covers **all six** engines discover→cutover in CI (`tests/databridge_engines.rs`).
 
@@ -462,8 +462,17 @@ Fake path covers **all six** engines discover→cutover in CI (`tests/databridge
   `tls_mode: disable` sources failed discovery because sqlx 0.9 builds MySQL's RSA password
   exchange only behind `mysql-rsa` (#102), and the generated KafkaConnect had no heap or memory
   limit, so one worker grew to 5.4 GiB and drove the 32 GiB node into OOM (#103).
-- **Follow-ups (verify on live infra)**: SQL Server / Oracle CDC is verified with the generated
-  connectors in podman, not yet through the in-cluster gateway pipeline.
+- **SQL Server 2022 and Oracle 26ai Free → Postgres through cutover, in-cluster — verified live
+  (2026-10-04, same lab stack)**: each source went discover → assess → provision (CloudNativePG
+  edge on `zyvor-rbd-prod`) → full-load (pass-through: the Debezium `initial` snapshot seeds the
+  edge) → `cdc/start` → validate (advisory) → cutover (`cutover_complete`, connectors and the
+  KafkaConnect cluster torn down). The snapshot rows plus an insert, an update and a delete landed
+  on the edge identical to the source. Surfaced and fixed: the Ceph gateway image built the
+  `oracle` feature without Oracle Instant Client, so discovery failed with DPI-1047 (#106), and a
+  provision whose CR apply failed (CNPG webhook down) left the plan stuck in `provisioning` with no
+  way to retry (#107). Note that the sink creates the edge table only when it processes the first
+  snapshot records, which on a loaded host can be a minute after Debezium logs
+  `Snapshot completed`.
 - **Known limitation — writes during the full-load**: homogeneous relational CDC starts after the
   dump→restore, from the source's current WAL/binlog position (`no_data`), so a write made between
   the dump and the moment Debezium records that position reaches the edge only if the row changes
