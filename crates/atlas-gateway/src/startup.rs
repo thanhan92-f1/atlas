@@ -28,9 +28,54 @@ pub const ZFS_BACKEND_ID: &str = "bkd_zfs_lab";
 pub const LONGHORN_BACKEND_ID: &str = "bkd_longhorn";
 /// atlas-native cluster backend id (enabled via `ATLAS_NATIVE_ENABLE`).
 pub const NATIVE_BACKEND_ID: &str = "bkd_native";
+pub const WEKA_BACKEND_ID: &str = "bkd_weka";
 /// Retired RustFS backend id. Kept so persisted inventory / jobs still parse.
 /// New buckets default to [`CEPH_BACKEND_ID`] (RGW).
 pub const RUSTFS_BACKEND_ID: &str = "bkd_rustfs_lab";
+
+/// Builds the read-only WEKA driver when `ATLAS_WEKA_ENABLE=1`: `ATLAS_WEKA_DRIVER_MODE` (`fake`
+/// default, `real`), `ATLAS_WEKA_ENDPOINT` (API base, e.g. `https://weka01:14000/api/v2`),
+/// `ATLAS_WEKA_USERNAME`, `ATLAS_WEKA_PASSWORD_FILE`, `ATLAS_WEKA_ORG`, `ATLAS_WEKA_CA_CERT`,
+/// `ATLAS_WEKA_TIMEOUT_SECS` (10).
+pub fn weka_driver_from_env() -> Result<Option<Arc<dyn StorageDriver>>> {
+    let var = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
+    if !var("ATLAS_WEKA_ENABLE").is_some_and(|v| matches!(v.as_str(), "1" | "true" | "yes")) {
+        return Ok(None);
+    }
+    let mode = var("ATLAS_WEKA_DRIVER_MODE").unwrap_or_default();
+    if atlas_common::config::DriverMode::from_env_str(&mode)
+        == atlas_common::config::DriverMode::Fake
+    {
+        return Ok(Some(Arc::new(atlas_driver_weka::WekaDriver::fake(WEKA_BACKEND_ID))));
+    }
+    let endpoint = var("ATLAS_WEKA_ENDPOINT").context("ATLAS_WEKA_ENDPOINT is required in real mode")?;
+    let username = var("ATLAS_WEKA_USERNAME").context("ATLAS_WEKA_USERNAME is required in real mode")?;
+    let password_file =
+        var("ATLAS_WEKA_PASSWORD_FILE").context("ATLAS_WEKA_PASSWORD_FILE is required in real mode")?;
+    let password = std::fs::read_to_string(&password_file)
+        .with_context(|| format!("ATLAS_WEKA_PASSWORD_FILE={password_file}"))?
+        .trim()
+        .to_string();
+    let ca_pem = var("ATLAS_WEKA_CA_CERT")
+        .map(|p| std::fs::read(&p).with_context(|| format!("ATLAS_WEKA_CA_CERT={p}")))
+        .transpose()?;
+    let timeout = var("ATLAS_WEKA_TIMEOUT_SECS")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10);
+    let driver = atlas_driver_weka::WekaDriver::real(
+        WEKA_BACKEND_ID,
+        atlas_driver_weka::WekaConfig {
+            endpoint,
+            username,
+            password,
+            org: var("ATLAS_WEKA_ORG"),
+            ca_pem,
+            timeout: std::time::Duration::from_secs(timeout),
+        },
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(Some(Arc::new(driver)))
+}
 
 /// Builds the atlas-native driver when `ATLAS_NATIVE_ENABLE=1`:
 /// `ATLAS_NATIVE_DRIVER_MODE` (`fake` default, `real`), `ATLAS_NATIVE_ENDPOINTS` (comma-separated
@@ -416,6 +461,26 @@ pub async fn build_state(config: Config, opts: BuildOptions) -> Result<AppState>
         attach_native_driver(&pool, &registry, native.clone()).await?;
     }
 
+    let weka_driver = weka_driver_from_env()?;
+    if let Some(weka) = &weka_driver {
+        atlas_inventory::upsert_backend(
+            &pool,
+            &StorageBackend {
+                id: WEKA_BACKEND_ID.into(),
+                name: "weka".into(),
+                backend_type: BackendType::Weka,
+                mode: BackendMode::External,
+                status: "active".into(),
+                capabilities: crate::routes::util::ceph_default_caps(BackendType::Weka),
+                connection_ref: None,
+                cordoned: false,
+            },
+        )
+        .await?;
+        registry.register(weka.clone());
+        tracing::info!("weka backend registered ({WEKA_BACKEND_ID})");
+    }
+
     // Start the async job engine (write path) over the same pool + k8s driver.
     // Durable DB poller (ATLAS_JOB_POLL_SECS) keeps queued work alive across channel loss;
     // tests leave poll_secs=0 so only explicit enqueues/recovery drive the worker.
@@ -481,6 +546,12 @@ pub async fn build_state(config: Config, opts: BuildOptions) -> Result<AppState>
             match atlas_discovery::run_discovery(&state.pool, longhorn.clone(), None, None).await {
                 Ok(sum) => tracing::info!(?sum, "initial longhorn discovery complete"),
                 Err(e) => tracing::warn!("initial longhorn discovery failed: {e:#}"),
+            }
+        }
+        if let Some(weka) = &weka_driver {
+            match atlas_discovery::run_discovery(&state.pool, weka.clone(), None, None).await {
+                Ok(sum) => tracing::info!(?sum, "initial weka discovery complete"),
+                Err(e) => tracing::warn!("initial weka discovery failed: {e:#}"),
             }
         }
         if let Some(native) = &native_driver {

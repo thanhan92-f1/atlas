@@ -10,6 +10,7 @@ members = [
     "crates/atlas-driver-native",
     "crates/atlas-driver-zfs",
     "crates/atlas-driver-longhorn",
+    "crates/atlas-driver-weka",
     "crates/atlas-driver-k8s",
     "crates/atlas-driver-rgw",
     "crates/atlas-databridge",
@@ -42,6 +43,7 @@ atlas-driver-nfs = { path = "crates/atlas-driver-nfs" }
 atlas-driver-native = { path = "crates/atlas-driver-native" }
 atlas-driver-zfs = { path = "crates/atlas-driver-zfs" }
 atlas-driver-longhorn = { path = "crates/atlas-driver-longhorn" }
+atlas-driver-weka = { path = "crates/atlas-driver-weka" }
 atlas-driver-k8s = { path = "crates/atlas-driver-k8s" }
 atlas-driver-rgw = { path = "crates/atlas-driver-rgw" }
 atlas-databridge = { path = "crates/atlas-databridge" }
