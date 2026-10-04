@@ -1,8 +1,9 @@
 // Copyright (c) 2026 ZyvorAI Labs Private Limited.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Networked data plane. A [`DataNodeServer`] serves one local [`FileDevice`] over TCP and a
-//! [`RemoteDevice`] is the engine-side client, so replicas land on other hosts' disks.
+//! Networked data plane. A [`DataNodeServer`] serves one or more local devices
+//! ([`crate::device::FileDevice`] or [`crate::raw::RawDevice`]) over TCP and a [`RemoteDevice`]
+//! is the engine-side client for one of them, so replicas land on other hosts' disks.
 //!
 //! Wire format, both directions: a 4-byte big-endian header length, a JSON header, then the raw
 //! payload the header announces (write data in requests, read data in responses). Without TLS
@@ -22,7 +23,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, RwLock,
     },
     thread::{self, JoinHandle},
     time::Duration,
@@ -49,10 +50,36 @@ pub const MAX_PAYLOAD: u64 = 256 << 20;
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 enum Request {
-    Append { fence: u64, len: u64 },
-    WriteAt { fence: u64, offset: u64, len: u64 },
-    Read { offset: u64, len: u64 },
-    Len,
+    Append {
+        fence: u64,
+        len: u64,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        device: usize,
+    },
+    WriteAt {
+        fence: u64,
+        offset: u64,
+        len: u64,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        device: usize,
+    },
+    Read {
+        offset: u64,
+        len: u64,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        device: usize,
+    },
+    Len {
+        #[serde(default, skip_serializing_if = "is_zero")]
+        device: usize,
+    },
+    /// How many devices the node serves. Older nodes don't know this op and drop the connection,
+    /// which is how a client avoids sending a device index they would silently ignore.
+    Devices,
+}
+
+fn is_zero(v: &usize) -> bool {
+    *v == 0
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -62,6 +89,7 @@ enum Response {
     Written,
     Data { len: u64 },
     Len { len: u64 },
+    Devices { count: usize },
     Fenced { current: u64 },
     Error { message: String },
 }
@@ -79,8 +107,8 @@ struct Stats {
 }
 
 struct Shared {
-    device: FileDevice,
-    fence: Mutex<u64>,
+    devices: Vec<Arc<dyn BlockStore>>,
+    fence: RwLock<u64>,
     fence_path: PathBuf,
     tls: Option<Arc<ServerConfig>>,
     stop: AtomicBool,
@@ -91,36 +119,58 @@ struct Shared {
 }
 
 impl Shared {
-    /// Runs `write` only if `fence` is not below the highest accepted fence. Holding the fence
-    /// lock across the write keeps a concurrent higher fence from slipping in between.
+    /// Runs `write` only if `fence` is not below the highest accepted fence. Writes at the
+    /// current fence hold the fence lock shared, so they run concurrently; raising the fence
+    /// takes it exclusively, so it waits for writes in flight and none can slip in between.
     fn fenced(
         &self,
         fence: u64,
         write: impl FnOnce() -> Result<Response, NativeError>,
     ) -> Response {
-        let Ok(mut current) = self.fence.lock() else {
-            return Response::Error {
-                message: "fence lock poisoned".into(),
-            };
+        let poisoned = || Response::Error {
+            message: "fence lock poisoned".into(),
         };
-        if fence < *current {
-            self.stats.fenced.fetch_add(1, Ordering::Relaxed);
-            return Response::Fenced { current: *current };
-        }
-        if fence > *current {
-            if let Err(e) = durable::write_atomic(&self.fence_path, fence.to_string().as_bytes()) {
-                self.stats.errors.fetch_add(1, Ordering::Relaxed);
-                return Response::Error {
-                    message: format!("persist fence: {e}"),
+        loop {
+            {
+                let Ok(current) = self.fence.read() else {
+                    return poisoned();
                 };
+                if fence < *current {
+                    self.stats.fenced.fetch_add(1, Ordering::Relaxed);
+                    return Response::Fenced { current: *current };
+                }
+                if fence == *current {
+                    return write().unwrap_or_else(|e| {
+                        self.stats.errors.fetch_add(1, Ordering::Relaxed);
+                        Response::Error {
+                            message: e.to_string(),
+                        }
+                    });
+                }
             }
-            *current = fence;
+            let Ok(mut current) = self.fence.write() else {
+                return poisoned();
+            };
+            if fence > *current {
+                if let Err(e) =
+                    durable::write_atomic(&self.fence_path, fence.to_string().as_bytes())
+                {
+                    self.stats.errors.fetch_add(1, Ordering::Relaxed);
+                    return Response::Error {
+                        message: format!("persist fence: {e}"),
+                    };
+                }
+                *current = fence;
+            }
         }
-        write().unwrap_or_else(|e| {
-            self.stats.errors.fetch_add(1, Ordering::Relaxed);
-            Response::Error {
-                message: e.to_string(),
-            }
+    }
+
+    fn device(&self, index: usize) -> Result<&Arc<dyn BlockStore>, NativeError> {
+        self.devices.get(index).ok_or_else(|| {
+            NativeError::Invalid(format!(
+                "device {index} out of range: this node serves {}",
+                self.devices.len()
+            ))
         })
     }
 }
@@ -150,10 +200,27 @@ impl DataNodeServer {
         listener: TcpListener,
         tls: Option<TlsIdentity>,
     ) -> Result<Self, NativeError> {
+        let root = root.as_ref();
+        let device: Arc<dyn BlockStore> = Arc::new(FileDevice::open(root.join("nvme0.data"))?);
+        Self::start_devices(id, root, vec![device], listener, tls)
+    }
+
+    /// Serves `devices` (index = position; at least one); `root` holds the fence file.
+    pub fn start_devices(
+        id: impl Into<String>,
+        root: impl AsRef<Path>,
+        devices: Vec<Arc<dyn BlockStore>>,
+        listener: TcpListener,
+        tls: Option<TlsIdentity>,
+    ) -> Result<Self, NativeError> {
+        if devices.is_empty() {
+            return Err(NativeError::Invalid(
+                "a data node needs at least one device".into(),
+            ));
+        }
         let tls = tls.map(|t| t.server_config()).transpose()?;
         let root = root.as_ref();
         fs::create_dir_all(root)?;
-        let device = FileDevice::open(root.join("nvme0.data"))?;
         let fence_path = root.join("fence");
         let fence = match fs::read_to_string(&fence_path) {
             Ok(s) => s
@@ -166,8 +233,8 @@ impl DataNodeServer {
         let addr = listener.local_addr()?;
         listener.set_nonblocking(true)?;
         let shared = Arc::new(Shared {
-            device,
-            fence: Mutex::new(fence),
+            devices,
+            fence: RwLock::new(fence),
             fence_path,
             tls,
             stop: AtomicBool::new(false),
@@ -194,7 +261,7 @@ impl DataNodeServer {
 
     /// Highest fence accepted so far.
     pub fn fence(&self) -> u64 {
-        self.shared.fence.lock().map(|f| *f).unwrap_or(0)
+        self.shared.fence.read().map(|f| *f).unwrap_or(0)
     }
 
     /// Prometheus text exposition for this node's request counters and device size.
@@ -257,13 +324,16 @@ impl DataNodeServer {
         p.family(
             "atlas_native_data_device_bytes",
             "gauge",
-            "Size of the served device file.",
-        )
-        .sample(
-            "atlas_native_data_device_bytes",
-            &node,
-            self.shared.device.len()?,
+            "Bytes of each served device in use.",
         );
+        for (i, d) in self.shared.devices.iter().enumerate() {
+            let index = i.to_string();
+            p.sample(
+                "atlas_native_data_device_bytes",
+                &[("node", self.id.as_str()), ("device", index.as_str())],
+                d.len()?,
+            );
+        }
         Ok(p.finish())
     }
 
@@ -342,33 +412,43 @@ fn accept_loop(listener: TcpListener, shared: &Arc<Shared>) {
 fn serve(mut stream: Conn, sh: &Shared) {
     while let Ok(req) = read_header::<Request>(&mut stream) {
         let result = match req {
-            Request::Append { fence, len } => read_payload(&mut stream, len).and_then(|data| {
-                let resp = sh.fenced(fence, || {
-                    let offset = sh.device.append(&data)?;
-                    sh.stats.appends.fetch_add(1, Ordering::Relaxed);
-                    sh.stats.bytes_written.fetch_add(len, Ordering::Relaxed);
-                    Ok(Response::Appended { offset })
-                });
-                write_message(&mut stream, &resp, &[])
-            }),
-            Request::WriteAt { fence, offset, len } => {
+            Request::Append { fence, len, device } => {
                 read_payload(&mut stream, len).and_then(|data| {
                     let resp = sh.fenced(fence, || {
-                        sh.device.write_at(offset, &data)?;
-                        sh.stats.writes.fetch_add(1, Ordering::Relaxed);
+                        let offset = sh.device(device)?.append(fence, &data)?;
+                        sh.stats.appends.fetch_add(1, Ordering::Relaxed);
                         sh.stats.bytes_written.fetch_add(len, Ordering::Relaxed);
-                        Ok(Response::Written)
+                        Ok(Response::Appended { offset })
                     });
                     write_message(&mut stream, &resp, &[])
                 })
             }
-            Request::Read { offset, len } => {
+            Request::WriteAt {
+                fence,
+                offset,
+                len,
+                device,
+            } => read_payload(&mut stream, len).and_then(|data| {
+                let resp = sh.fenced(fence, || {
+                    sh.device(device)?.write_at(fence, offset, &data)?;
+                    sh.stats.writes.fetch_add(1, Ordering::Relaxed);
+                    sh.stats.bytes_written.fetch_add(len, Ordering::Relaxed);
+                    Ok(Response::Written)
+                });
+                write_message(&mut stream, &resp, &[])
+            }),
+            Request::Read {
+                offset,
+                len,
+                device,
+            } => {
                 let read = if len > MAX_PAYLOAD {
                     Err(NativeError::Invalid(format!(
                         "read of {len} bytes too large"
                     )))
                 } else {
-                    sh.device.read_exact_at(offset, len as usize)
+                    sh.device(device)
+                        .and_then(|d| d.read_exact_at(offset, len as usize))
                 };
                 match read {
                     Ok(buf) => {
@@ -385,8 +465,8 @@ fn serve(mut stream: Conn, sh: &Shared) {
                     }
                 }
             }
-            Request::Len => {
-                let resp = match sh.device.len() {
+            Request::Len { device } => {
+                let resp = match sh.device(device).and_then(|d| d.len()) {
                     Ok(len) => Response::Len { len },
                     Err(e) => Response::Error {
                         message: e.to_string(),
@@ -394,6 +474,13 @@ fn serve(mut stream: Conn, sh: &Shared) {
                 };
                 write_message(&mut stream, &resp, &[])
             }
+            Request::Devices => write_message(
+                &mut stream,
+                &Response::Devices {
+                    count: sh.devices.len(),
+                },
+                &[],
+            ),
         };
         if result.is_err() {
             return;
@@ -411,12 +498,17 @@ pub struct RemoteDevice {
     timeout: Duration,
     tls: Option<(Arc<ClientConfig>, ServerName<'static>)>,
     idle: Mutex<Vec<Conn>>,
+    /// Which of the node's devices this client addresses.
+    device: usize,
+    /// For `device > 0`: the node has confirmed it serves that many devices.
+    device_checked: AtomicBool,
 }
 
 impl std::fmt::Debug for RemoteDevice {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RemoteDevice")
             .field("target", &self.target)
+            .field("device", &self.device)
             .field("tls", &self.tls.as_ref().map(|(_, n)| n))
             .finish()
     }
@@ -431,6 +523,8 @@ impl RemoteDevice {
             timeout,
             tls: None,
             idle: Mutex::new(Vec::new()),
+            device: 0,
+            device_checked: AtomicBool::new(false),
         }
     }
 
@@ -446,7 +540,38 @@ impl RemoteDevice {
             timeout,
             tls: Some((identity.client_config()?, tls::server_name(node_id)?)),
             idle: Mutex::new(Vec::new()),
+            device: 0,
+            device_checked: AtomicBool::new(false),
         })
+    }
+
+    /// Addresses the node's device `index` instead of device 0.
+    pub fn on_device(mut self, index: usize) -> Self {
+        self.device = index;
+        self
+    }
+
+    /// Before the first request to a device other than 0, confirms the node serves it: a node
+    /// that predates multiple devices would otherwise ignore the index and use device 0.
+    fn check_device(&self) -> Result<(), NativeError> {
+        if self.device == 0 || self.device_checked.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        match self.exchange_pooled(&Request::Devices, &[]) {
+            Ok((Response::Devices { count }, _)) if count > self.device => {
+                self.device_checked.store(true, Ordering::Release);
+                Ok(())
+            }
+            Ok((Response::Devices { count }, _)) => Err(NativeError::Invalid(format!(
+                "data node {} serves {count} devices; device {} is not one of them",
+                self.target, self.device
+            ))),
+            Ok((other, _)) => Err(unexpected(other)),
+            Err(e) => Err(NativeError::Remote(format!(
+                "data node {} did not report its devices (older version?): {e}",
+                self.target
+            ))),
+        }
     }
 
     pub fn target(&self) -> &str {
@@ -474,6 +599,20 @@ impl RemoteDevice {
     /// Sends one request. A failure on a reused connection (e.g. the node restarted) is retried
     /// once on a fresh one; a retried append can therefore leave an unreferenced copy behind.
     fn call(&self, req: &Request, payload: &[u8]) -> Result<(Response, Vec<u8>), NativeError> {
+        self.check_device()?;
+        let out = self.exchange_pooled(req, payload)?;
+        match out.0 {
+            Response::Fenced { current } => Err(NativeError::Fenced { current }),
+            Response::Error { message } => Err(NativeError::Remote(message)),
+            _ => Ok(out),
+        }
+    }
+
+    fn exchange_pooled(
+        &self,
+        req: &Request,
+        payload: &[u8],
+    ) -> Result<(Response, Vec<u8>), NativeError> {
         let pooled = self
             .idle
             .lock()
@@ -496,11 +635,7 @@ impl RemoteDevice {
                 idle.push(stream);
             }
         }
-        match out.0 {
-            Response::Fenced { current } => Err(NativeError::Fenced { current }),
-            Response::Error { message } => Err(NativeError::Remote(message)),
-            _ => Ok(out),
-        }
+        Ok(out)
     }
 }
 
@@ -513,6 +648,7 @@ impl BlockStore for RemoteDevice {
         let req = Request::Append {
             fence,
             len: data.len() as u64,
+            device: self.device,
         };
         match self.call(&req, data)?.0 {
             Response::Appended { offset } => Ok(offset),
@@ -525,6 +661,7 @@ impl BlockStore for RemoteDevice {
             fence,
             offset,
             len: data.len() as u64,
+            device: self.device,
         };
         match self.call(&req, data)?.0 {
             Response::Written => Ok(()),
@@ -536,6 +673,7 @@ impl BlockStore for RemoteDevice {
         let req = Request::Read {
             offset,
             len: len as u64,
+            device: self.device,
         };
         match self.call(&req, &[])? {
             (Response::Data { .. }, data) => Ok(data),
@@ -544,7 +682,15 @@ impl BlockStore for RemoteDevice {
     }
 
     fn len(&self) -> Result<u64, NativeError> {
-        match self.call(&Request::Len, &[])?.0 {
+        match self
+            .call(
+                &Request::Len {
+                    device: self.device,
+                },
+                &[],
+            )?
+            .0
+        {
             Response::Len { len } => Ok(len),
             other => Err(unexpected(other)),
         }
@@ -615,6 +761,7 @@ mod tests {
         write_message(
             &mut buf,
             &Request::WriteAt {
+                device: 2,
                 fence: 7,
                 offset: 9,
                 len: 3,
@@ -624,12 +771,21 @@ mod tests {
         .unwrap();
         let mut r = buf.as_slice();
         match read_header::<Request>(&mut r).unwrap() {
-            Request::WriteAt { fence, offset, len } => {
-                assert_eq!((fence, offset, len), (7, 9, 3));
+            Request::WriteAt {
+                device,
+                fence,
+                offset,
+                len,
+            } => {
+                assert_eq!((device, fence, offset, len), (2, 7, 9, 3));
                 assert_eq!(read_payload(&mut r, len).unwrap(), b"abc");
             }
             other => panic!("unexpected {other:?}"),
         }
+
+        // Device 0 stays off the wire, so older data nodes parse requests unchanged.
+        let legacy = serde_json::to_string(&Request::Len { device: 0 }).unwrap();
+        assert!(!legacy.contains("device"), "{legacy}");
 
         let mut huge = ((MAX_HEADER + 1) as u32).to_be_bytes().to_vec();
         huge.extend_from_slice(b"{}");

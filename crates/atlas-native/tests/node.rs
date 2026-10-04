@@ -11,8 +11,9 @@ use std::{
 };
 
 use atlas_native::node::{
-    DataNodeRole, DataNodeSpec, Listeners, MetadataRole, NativeNode, NodeConfig,
+    DataNodeRole, DataNodeSpec, DeviceConfig, Listeners, MetadataRole, NativeNode, NodeConfig,
 };
+use atlas_native::DeviceBackend;
 
 const WAIT: Duration = Duration::from_secs(20);
 const TOKEN: &str = "s3cret-token";
@@ -79,6 +80,7 @@ impl Cluster {
                 rack: None,
                 host: None,
                 free_bytes: 1 << 30,
+                devices: 2,
             })
             .collect();
         let raft_addrs: BTreeMap<String, String> = meta_l
@@ -101,6 +103,16 @@ impl Cluster {
             let mut cfg = base(&id, td.path());
             cfg.data_node = Some(DataNodeRole {
                 listen: l.local_addr().unwrap(),
+                devices: vec![
+                    DeviceConfig {
+                        path: td.path().join(&id).join("disk0"),
+                        backend: DeviceBackend::File,
+                    },
+                    DeviceConfig {
+                        path: td.path().join(&id).join("disk1"),
+                        backend: DeviceBackend::Aligned,
+                    },
+                ],
             });
             let n = NativeNode::start_with(
                 cfg,

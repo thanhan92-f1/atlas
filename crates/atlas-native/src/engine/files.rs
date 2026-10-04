@@ -59,6 +59,9 @@ pub struct LayoutReplica {
     pub node_id: String,
     /// The data node's address, absent for a local device or an unhealthy node.
     pub endpoint: Option<String>,
+    /// Which of the data node's devices holds the replica.
+    #[serde(default)]
+    pub device_index: usize,
     pub offset: u64,
 }
 
@@ -530,6 +533,7 @@ impl NativeEngine {
                             .find(|n| n.spec.id == r.node_id && n.spec.healthy)
                             .and_then(|n| n.devices.get(r.device_index))
                             .and_then(|d| d.endpoint().map(str::to_string)),
+                        device_index: r.device_index,
                         offset: r.offset,
                     })
                     .collect();

@@ -88,8 +88,8 @@ pub struct Ops {
     /// Files unlinked while open here: renamed to a hidden name in their directory and removed
     /// on last close, so open handles keep working (as libfuse does without `hard_remove`).
     hidden: Mutex<HashMap<u64, (u64, String)>>,
-    /// Data-node clients for direct reads, by `(node id, endpoint)`.
-    data_nodes: Mutex<HashMap<(String, String), Arc<RemoteDevice>>>,
+    /// Data-node clients for direct reads, by `(node id, endpoint, device)`.
+    data_nodes: Mutex<HashMap<(String, String, usize), Arc<RemoteDevice>>>,
     direct_fallbacks: std::sync::atomic::AtomicU64,
 }
 
@@ -632,7 +632,7 @@ impl Ops {
             let Some(endpoint) = &r.endpoint else {
                 continue;
             };
-            let dev = self.data_node(d, &r.node_id, endpoint)?;
+            let dev = self.data_node(d, &r.node_id, endpoint, r.device_index)?;
             match dev.read_exact_at(r.offset, ext.len) {
                 Ok(buf) if hex(&checksum::sha256(&buf)) == ext.checksum => return Ok(buf),
                 Ok(_) => last = format!("checksum mismatch on {}", r.node_id),
@@ -647,20 +647,24 @@ impl Ops {
         d: &DirectReads,
         node_id: &str,
         endpoint: &str,
+        device: usize,
     ) -> Result<Arc<RemoteDevice>, String> {
         let mut nodes = self
             .data_nodes
             .lock()
             .map_err(|_| "data-node cache poisoned")?;
-        let key = (node_id.to_string(), endpoint.to_string());
+        let key = (node_id.to_string(), endpoint.to_string(), device);
         if let Some(dev) = nodes.get(&key) {
             return Ok(dev.clone());
         }
-        let dev = Arc::new(match &d.identity {
-            Some(id) => RemoteDevice::with_tls(endpoint, node_id, id, d.timeout)
-                .map_err(|e| format!("{node_id}: {e}"))?,
-            None => RemoteDevice::new(endpoint, d.timeout),
-        });
+        let dev = Arc::new(
+            match &d.identity {
+                Some(id) => RemoteDevice::with_tls(endpoint, node_id, id, d.timeout)
+                    .map_err(|e| format!("{node_id}: {e}"))?,
+                None => RemoteDevice::new(endpoint, d.timeout),
+            }
+            .on_device(device),
+        );
         nodes.insert(key, dev.clone());
         Ok(dev)
     }

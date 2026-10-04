@@ -3,7 +3,7 @@
 # atlas-native-node
 
 `atlas-native-node --config <file.json>` runs one native storage node (`crates/atlas-native`,
-`node` module). A node runs a **data node** (serves one local device file to the cluster), a
+`node` module). A node runs a **data node** (serves one or more local devices to the cluster), a
 **metadata replica** (Raft + `NativeEngine`), or both, and always serves an HTTP endpoint for
 health, metrics, status, block volumes and POSIX filesystems. See `docs/NATIVE_METADATA.md` for the
 storage design behind it, `docs/NATIVE_FS.md` for filesystems and the `atlas-native-mount` FUSE
@@ -11,8 +11,9 @@ client, and "Atlas gateway" below for how the gateway drives it.
 
 ## Roles and topology
 
-- **Data nodes** each serve `data_dir/data/nvme0.data`. Their `node_id` is the id the metadata
-  replicas use for them (and their TLS server name).
+- **Data nodes** serve `data_dir/data/nvme0.data` by default, or the devices listed in
+  `data_node.devices` (see "Devices" below). Their `node_id` is the id the metadata replicas use
+  for them (and their TLS server name).
 - **Metadata replicas** form one Raft group (3 or 5 voters) and all list the same `data_nodes`.
   Only the leader accepts mutations; any replica serves reads from its applied state.
 
@@ -73,6 +74,43 @@ data-node addresses are `host:port` and resolved on every connect, so DNS names 
 | `metadata.gc_interval_secs` | 60 | Leader-only GC loop; 0 disables. |
 | `data_nodes[].host` / `rack` / `zone` | `id` / `id` / empty | Failure domains for placement; replicas always land on distinct hosts. |
 | `data_nodes[].free_bytes` | 1 TiB | Placement capacity hint. |
+| `data_nodes[].devices` | 1 | How many devices that data node serves; new replicas are striped across them round-robin. |
+| `data_node.devices` | `[]` | `[{"path", "backend"?}]`, served in index order. Empty: one `file` device at `data_dir/data/nvme0.data`. |
+
+### Devices
+
+A data node can serve several devices, for example one per NVMe drive:
+
+```json
+"data_node": {
+  "listen": "10.0.0.1:7481",
+  "devices": [
+    { "path": "/dev/nvme0n1", "backend": "io_uring" },
+    { "path": "/dev/nvme1n1", "backend": "io_uring" }
+  ]
+}
+```
+
+The metadata replicas must then list `"devices": 2` for that data node. A replica records which
+device it is on, so device order must not change once data is written.
+
+| `backend` | Access | Notes |
+| --- | --- | --- |
+| `file` (default) | Buffered I/O on a regular file, `fsync` per write | What every data node used before devices were configurable. |
+| `aligned` | `pread`/`pwrite` with `O_DSYNC` on 4 KiB-aligned buffers | Regular file or block device. Appends start on a 4 KiB boundary; unaligned overwrites read-modify-write the edge blocks. |
+| `io_uring` | `O_DIRECT` + `O_DSYNC` through `io_uring`, bypassing the page cache | Linux only, and only in builds with the `atlas-native/io-uring` feature (otherwise the node refuses to start). Same layout as `aligned`. |
+
+A block device has no file length to say how much of it is in use, so `aligned` and `io_uring`
+persist a high-water mark in `data_dir/data/dev<index>/<name>.hwm`, raised 256 MiB at a time
+before space past it is handed out. Losing that file on a block device loses track of the data on
+it; on a regular file the file length is used when the mark is missing. Switching an existing
+`file` device to `aligned` or `io_uring` keeps its data: its extents need not be aligned, and new
+appends start at the next 4 KiB boundary.
+
+Upgrade order: upgrade the data nodes first, then raise `data_nodes[].devices` on the metadata
+replicas. A client asking for device 1 or above first asks the data node how many devices it
+serves; an older data node doesn't understand the question, so the request fails instead of
+silently landing on device 0. Requests for device 0 are unchanged on the wire.
 
 ## HTTP API
 

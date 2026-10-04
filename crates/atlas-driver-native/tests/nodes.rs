@@ -57,6 +57,7 @@ impl Cluster {
                 rack: None,
                 host: None,
                 free_bytes: 1 << 30,
+                devices: 1,
             })
             .collect();
         let peers: BTreeMap<String, String> = meta_l
@@ -69,6 +70,7 @@ impl Cluster {
                 let mut cfg = base(&id);
                 cfg.data_node = Some(DataNodeRole {
                     listen: l.local_addr().unwrap(),
+                    devices: Vec::new(),
                 });
                 let listeners = Listeners {
                     http: Some(bind()),
