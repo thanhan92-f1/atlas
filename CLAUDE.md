@@ -92,7 +92,7 @@ pid/cgroup attribution; if attach fails, live mode reports the programs missing 
 fabricating data. NFS/ZFS/io_uring programs are still contracts only.
 
 **atlas-native filesystems** (`docs/NATIVE_FS.md`): POSIX files and directories in the native
-cluster's replicated catalog (inodes, hard links, rename, setattr/truncate, symlinks, special files),
+cluster's replicated catalog (inodes, hard links, rename, setattr/truncate, symlinks, special files, extended attributes; per-filesystem extent grid),
 file data on the same copy-on-write extents as block volumes, metadata-only snapshots (read-only,
 `<fs>@<snap>`) and clones. `atlas-native-mount` (`crates/atlas-native-fuse`, `fuse` feature, Linux)
 mounts them through FUSE with leader failover, TTL attribute/name caching, write-back and
@@ -100,8 +100,8 @@ read-ahead; close-to-open consistency across mounts. The gateway serves them as 
 volumes `vol_native_fs_<id>` (create/snapshot/clone/restore/delete via `atlasctl create-volume
 --backend bkd_native --kind filesystem`). pjdfstest (12 suites, 8565 tests), git clone + fsck and
 snapshot/clone isolation verified over FUSE on the lab. Scaling limit: one Raft group and a
-whole-catalog clone per proposal, so creates slow as the inode count grows (measured: 200/s at
-10k inodes, 36/s at 60k; ~50k per cluster is the practical limit — see the doc).
+in-memory catalog (commands apply in place; creates hold ~270/s locally from 10k to 100k inodes,
+memory ~6 KiB/inode on the leader — see the doc).
 
 **Licensed** under the [Apache License 2.0](LICENSE) (`Apache-2.0`; relicensed from the Zyvor
 Production License v1.0 at the maintainer's explicit request — history in
