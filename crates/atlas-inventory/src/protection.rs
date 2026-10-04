@@ -68,8 +68,9 @@ async fn policy_targets_by_volume(
         .into_iter()
         .map(|r| {
             let protection: Option<String> = r.get("protection");
-            let parsed: Option<serde_json::Value> =
-                protection.as_deref().and_then(|s| serde_json::from_str(s).ok());
+            let parsed: Option<serde_json::Value> = protection
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok());
             let rpo = parsed
                 .as_ref()
                 .and_then(|v| v.get("rpo_target_seconds"))
@@ -244,7 +245,11 @@ fn compute(v: &atlas_api_types::StorageVolume, ctx: &Context) -> VolumeProtectio
         ClusterHealthState::AtRisk
     } else if matches!(
         dr_state.as_deref(),
-        Some("enabling") | Some("disabling") | Some("promoting") | Some("demoting")
+        Some("enabling")
+            | Some("disabling")
+            | Some("promoting")
+            | Some("demoting")
+            | Some("resyncing")
     ) {
         reasons.push(format!(
             "DR mirror transition in progress ({})",

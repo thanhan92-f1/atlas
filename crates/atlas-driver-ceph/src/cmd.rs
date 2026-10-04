@@ -55,7 +55,7 @@ pub async fn rbd_snap_create(pool: &str, image: &str, snap: &str) -> Result<(), 
 }
 
 /// Day-2 cross-cluster DR: per-image RBD mirroring op — `rbd mirror image enable <pool>/<image>
-/// <mode>` / `disable` / `promote` [`--force`] / `demote`. Real ops need a live second Ceph cluster
+/// <mode>` / `disable` / `promote` [`--force`] / `demote` / `resync`. Real ops need a live second Ceph cluster
 /// (see `docs/DR.md`). `force` only applies to `promote` (split-brain / non-clean failover).
 pub async fn rbd_mirror_op(
     op: &str,
@@ -96,6 +96,12 @@ pub async fn rbd_mirror_op(
             "mirror".into(),
             "image".into(),
             "demote".into(),
+            spec.clone(),
+        ],
+        "resync" => vec![
+            "mirror".into(),
+            "image".into(),
+            "resync".into(),
             spec.clone(),
         ],
         other => return Err(DriverError::Backend(format!("unknown mirror op: {other}"))),
@@ -407,6 +413,17 @@ pub async fn rbd_info_size(pool: &str, image: &str) -> Result<i64, DriverError> 
     v.get("size")
         .and_then(|s| s.as_i64())
         .ok_or_else(|| DriverError::Parse(format!("rbd info {spec}: no size")))
+}
+
+/// Mirroring role of an RBD image from `rbd info pool/image --format json`: `Some(true)` primary,
+/// `Some(false)` non-primary, `None` when mirroring is not enabled on the image.
+pub async fn rbd_mirror_primary(pool: &str, image: &str) -> Result<Option<bool>, DriverError> {
+    let spec = format!("{pool}/{image}");
+    let v = rbd_cmd(&["info", &spec]).await?;
+    Ok(v.get("mirroring")
+        .filter(|m| m.get("state").and_then(|s| s.as_str()) == Some("enabled"))
+        .and_then(|m| m.get("primary"))
+        .and_then(|p| p.as_bool()))
 }
 
 /// Actual used (allocated) bytes of every image in a pool (`rbd du pool --format json`), as

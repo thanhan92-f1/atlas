@@ -289,4 +289,91 @@ async fn dr_peer_mirror_and_failover() {
         .unwrap();
     assert_eq!(pre2["dataplane_verified"], false);
     assert!(!pre2["warnings"].as_array().unwrap().is_empty());
+
+    // Peer site: register the replicated copy as secondary, then promote it.
+    sqlx::query(
+        "INSERT INTO storage_volumes (id, tenant_id, backend_id, name, kind, size_bytes, state, backend_native_id)
+         VALUES ('v2', 't', 'bkd_ceph_lab', 'db2', 'block', 1073741824, 'bound', 'rbd:nvme/img2')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        c.post(format!("{base}/volumes/v2/mirror?role=replica"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        400
+    );
+    let sec = c
+        .post(format!(
+            "{base}/volumes/v2/mirror?mode=snapshot&peer={peer_id}&role=secondary"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(sec.status(), 201);
+    let sec_body: Value = sec.json().await.unwrap();
+    assert_eq!(sec_body["role"], "secondary");
+    let sec_id = sec_body["mirror_id"].as_str().unwrap().to_string();
+    assert_eq!(
+        c.post(format!("{base}/dr/mirrors/{sec_id}/demote"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        409
+    );
+    assert_eq!(
+        c.post(format!("{base}/dr/failover"))
+            .json(&json!({ "mirror_id": sec_id, "confirm": true }))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        202
+    );
+
+    // Resync discards the local copy, so it is only allowed on a secondary.
+    let resync = |c: &reqwest::Client| {
+        let url = format!("{base}/dr/mirrors/{sec_id}/resync");
+        let c = c.clone();
+        async move { c.post(url).send().await.unwrap().status() }
+    };
+    assert_eq!(resync(&c).await, 409);
+    assert_eq!(
+        c.post(format!("{base}/dr/mirrors/{sec_id}/demote"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        202
+    );
+    assert_eq!(resync(&c).await, 202);
+    assert_eq!(
+        mirror_role(&c, &base, &sec_id).await,
+        ("secondary".into(), "enabled".into())
+    );
+}
+
+async fn mirror_role(c: &reqwest::Client, base: &str, id: &str) -> (String, String) {
+    let list: Value = c
+        .get(format!("{base}/dr/mirrors"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let m = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == json!(id))
+        .unwrap();
+    (
+        m["role"].as_str().unwrap().into(),
+        m["state"].as_str().unwrap().into(),
+    )
 }

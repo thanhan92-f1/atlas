@@ -77,8 +77,9 @@ on Postgres, still per-pod on SQLite, `docs/HA.md` — optional OIDC/SSO login a
 username/password, verified live against a throwaway Dex instance, `deploy/dex-lab/`; optional
 Vault-backed secrets resolution at startup, `docs/SECRETS.md`), volume lifecycle (orphan GC,
 QoS), DataBridge CDC self-heal, upgrade pre-flight + rollback, k6 load/performance testing
-(read-path + write-path), and cross-cluster DR **scaffolding** (RBD-mirroring
-peers/mirrors/failover API + jobs).
+(read-path + write-path), and cross-cluster DR (RBD-mirroring peers/mirrors/failover/resync API +
+jobs, **verified live between two Rook clusters** on 2026-10-04: one-way snapshot mirroring,
+planned failover, split-brain recovery — `docs/DR.md`, `deploy/rook-ceph-dr-lab/`).
 
 **Observe-first storage I/O sensor** (`docs/IO_EBPF.md`): `atlas-io` is a separate, optional node
 agent (`atlas-io-agent`, own Dockerfile.io/DaemonSet, `deploy/k8s/atlas-io-agent.yaml`) — kept out of
@@ -109,8 +110,8 @@ Production License v1.0 at the maintainer's explicit request — history in
 [`CLA.md`](CLA.md), [`DCO.md`](DCO.md), or [`NOTICE`](NOTICE) without an explicit human
 request. There is **no** runtime license-key or trial/JWT gate.
 
-Deferred: **real** RBD-mirroring/DR verification (needs a 2nd cluster; the API/jobs are scaffolded but
-the `rbd mirror` paths are unverified), per-product integrations beyond the gRPC surface.
+Deferred: two-way (`rx-tx`) RBD mirroring with clean failback (the DR lab is one-way), per-product
+integrations beyond the gRPC surface.
 
 ## Layout
 - `crates/atlas-common` — config, error, tracing, id helpers.
