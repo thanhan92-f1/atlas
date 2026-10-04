@@ -259,9 +259,14 @@ pub async fn provision_edge(
             crate::cr::psmdb::cluster_spec(1, "zyvor-rbd-prod", size_gib),
         ),
     };
-    k8s.apply_cr(group, version, kind, namespace, &cr_name, spec)
-        .await
-        .map_err(|e| anyhow!("apply {kind} CR: {e}"))?;
+    if let Err(e) = k8s.apply_cr(group, version, kind, namespace, &cr_name, spec).await {
+        // Nothing was created in the cluster, so hand the plan back to `assessed` for a retry; left
+        // in `provisioning` with no CR, the reconciler never advances it and `try_transition`
+        // refuses every later provision.
+        atlas_inventory::databridge::edge_clusters::delete_edge_cluster(pool, &edge_id).await?;
+        atlas_inventory::databridge::plans::set_state(pool, plan_id, "assessed").await?;
+        return Err(anyhow!("apply {kind} CR: {e}"));
+    }
 
     Ok(serde_json::json!({
         "plan_id": plan_id, "edge_cluster_id": edge_id, "engine": engine_str,
