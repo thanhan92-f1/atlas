@@ -17,13 +17,14 @@ use crate::{
     alloc::FreeList,
     checksum,
     device::{BlockStore, FileDevice},
-    durable, gc,
+    gc,
     metadata::{Catalog, ExtentRef, MetaCommand, MetaError, ReplicaRef, SnapshotId, VolumeId},
     metrics::PromText,
     namespace::{FsOp, InodeKind},
     placement::{select_replicas, Node, PlacementPolicy},
     raft::RaftError,
     raft_server::RaftServer,
+    store::{load_checkpoint, remove_legacy_catalog, CatalogStore, CATALOG_STORE},
     telemetry::NativeIoCounters,
     wal::{Wal, WalError, WalRecord},
 };
@@ -126,8 +127,8 @@ pub struct EngineConfig {
     pub root: PathBuf,
     pub extent_bytes: usize,
     pub placement: PlacementPolicy,
-    /// Compact the WAL once it retains this many records, or half as many as the catalog has
-    /// objects if that is more (0 disables automatic compaction).
+    /// Checkpoint the catalog and compact the WAL once it retains this many records (0 disables
+    /// automatic compaction).
     pub wal_compact_after: u64,
     /// After an I/O failure a node is skipped for placement (and tried last for reads) for this
     /// long, then given another chance.
@@ -164,6 +165,7 @@ enum Meta {
     Local {
         catalog: Box<RwLock<Catalog>>,
         wal: Mutex<Wal>,
+        store: CatalogStore,
     },
     Raft {
         server: Arc<RaftServer>,
@@ -283,8 +285,10 @@ impl NativeEngine {
             .collect();
         let meta = match meta {
             MetaBackend::Local => {
-                let (catalog, wal) = load_local(&cfg.root)?;
+                let store = CatalogStore::open(cfg.root.join(CATALOG_STORE))?;
+                let (catalog, wal) = load_local(&cfg.root, &store)?;
                 Meta::Local {
+                    store,
                     catalog: Box::new(RwLock::new(catalog)),
                     wal: Mutex::new(wal),
                 }
@@ -298,11 +302,12 @@ impl NativeEngine {
             write_lock: Mutex::new(()),
             telemetry: NativeIoCounters::default(),
         };
-        if let Meta::Local { catalog, .. } = &engine.meta {
-            let c = catalog
-                .read()
+        if let Meta::Local { catalog, store, .. } = &engine.meta {
+            let mut c = catalog
+                .write()
                 .map_err(|_| NativeError::Poisoned("catalog"))?;
-            engine.persist_locked(&c)?;
+            store.checkpoint(&mut c)?;
+            remove_legacy_catalog(&engine.cfg.root)?;
         }
         Ok(engine)
     }
@@ -1030,16 +1035,21 @@ impl NativeEngine {
     /// Persists the catalog and drops every WAL record it covers. Returns the records removed.
     /// Raft-backed engines compact their log inside the Raft node instead.
     pub fn checkpoint(&self) -> Result<u64, NativeError> {
-        let Meta::Local { catalog, wal } = &self.meta else {
+        let Meta::Local {
+            catalog,
+            wal,
+            store,
+        } = &self.meta
+        else {
             return Err(NativeError::Invalid(
                 "checkpoint applies to the local WAL; Raft compacts its own log".into(),
             ));
         };
         let mut wal = wal.lock().map_err(|_| NativeError::Poisoned("wal"))?;
-        let c = catalog
-            .read()
+        let mut c = catalog
+            .write()
             .map_err(|_| NativeError::Poisoned("catalog"))?;
-        self.persist_locked(&c)?;
+        store.checkpoint(&mut c)?;
         Ok(wal.compact_through(c.applied_index)?)
     }
 
@@ -1222,8 +1232,12 @@ impl NativeEngine {
     /// `fence` is the term data was written under; a Raft proposal is refused if leadership
     /// moved to another term since.
     fn commit(&self, command: MetaCommand, fence: Option<u64>) -> Result<(), NativeError> {
-        let (catalog, wal) = match &self.meta {
-            Meta::Local { catalog, wal } => (catalog, wal),
+        let (catalog, wal, store) = match &self.meta {
+            Meta::Local {
+                catalog,
+                wal,
+                store,
+            } => (catalog, wal, store),
             Meta::Raft { server, timeout } => {
                 match fence {
                     Some(term) => server.propose_in_term(command, term, *timeout)?,
@@ -1259,19 +1273,14 @@ impl NativeEngine {
         }
         if let Err(e) = wal.append(&rec) {
             // Whether the record reached disk is unknown: reload what a restart would see.
-            let (disk, reopened) = load_local(&self.cfg.root)?;
+            let (disk, reopened) = load_local(&self.cfg.root, store)?;
             *c = disk;
             *wal = reopened;
             return Err(e.into());
         }
-        // Checkpoints rewrite the whole catalog, so the WAL may hold records numbering half the
-        // catalog's objects before one: the cost per commit stays flat as it grows, and a
-        // create-only workload (one object per record) still checkpoints.
-        if self.cfg.wal_compact_after > 0
-            && wal.len() >= self.cfg.wal_compact_after.max(c.object_count() / 2)
-        {
-            // Once catalog.json durably covers `index`, every record up to it is redundant.
-            self.persist_locked(&c)?;
+        if self.cfg.wal_compact_after > 0 && wal.len() >= self.cfg.wal_compact_after {
+            // Once the store durably covers `index`, every record up to it is redundant.
+            store.checkpoint(&mut c)?;
             wal.compact_through(index)?;
         }
         Ok(())
@@ -1319,22 +1328,12 @@ impl NativeEngine {
         Err(NativeError::Checksum(ext.id.clone()))
     }
 
-    fn persist_locked(&self, catalog: &Catalog) -> Result<(), NativeError> {
-        let bytes = serde_json::to_vec(catalog)?;
-        durable::write_atomic(&self.cfg.root.join("catalog.json"), &bytes)?;
-        Ok(())
-    }
 }
 
-/// `catalog.json` plus every WAL record past it.
-fn load_local(root: &Path) -> Result<(Catalog, Wal), NativeError> {
+/// The checkpointed catalog plus every WAL record past it.
+fn load_local(root: &Path, store: &CatalogStore) -> Result<(Catalog, Wal), NativeError> {
     fs::create_dir_all(root)?;
-    let snapshot_path = root.join("catalog.json");
-    let mut catalog: Catalog = if snapshot_path.exists() {
-        serde_json::from_slice(&fs::read(&snapshot_path)?)?
-    } else {
-        Catalog::default()
-    };
+    let mut catalog = load_checkpoint(root, store)?;
     let mut wal = Wal::open(root.join("wal"))?;
     for rec in wal.replay::<MetaCommand>()? {
         if rec.index > catalog.applied_index {

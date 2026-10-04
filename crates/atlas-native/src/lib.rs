@@ -28,7 +28,9 @@ pub mod placement;
 pub mod raft;
 pub mod raft_server;
 pub mod raw;
+pub mod store;
 pub mod telemetry;
+pub mod tracked;
 pub mod tls;
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
 pub mod uring;

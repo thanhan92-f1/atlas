@@ -10,7 +10,10 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-use crate::metadata::{Catalog, ExtentId, ExtentRef, MetaError, SnapshotId};
+use crate::{
+    metadata::{Catalog, ExtentId, ExtentRef, MetaError, SnapshotId},
+    tracked::Tracked,
+};
 
 pub type FsId = String;
 
@@ -26,7 +29,7 @@ pub struct FsMeta {
     pub id: FsId,
     pub name: String,
     pub next_ino: u64,
-    pub inodes: BTreeMap<u64, Inode>,
+    pub inodes: Tracked<u64, Inode>,
     /// The snapshot this filesystem was cloned from, if any.
     #[serde(default)]
     pub source_snapshot: Option<SnapshotId>,
@@ -473,7 +476,7 @@ impl Catalog {
                         id: fs.clone(),
                         name: name.clone(),
                         next_ino: ROOT_INO + 1,
-                        inodes: BTreeMap::from([(ROOT_INO, root)]),
+                        inodes: BTreeMap::from([(ROOT_INO, root)]).into(),
                         source_snapshot: None,
                         extent_bytes: *extent_bytes,
                     },

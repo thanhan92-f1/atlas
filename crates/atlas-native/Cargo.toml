@@ -17,6 +17,7 @@ io-uring = ["dep:io-uring"]
 
 [dependencies]
 libc = "0.2"
+redb = "4"
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
