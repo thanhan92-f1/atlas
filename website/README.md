@@ -1,6 +1,6 @@
 # Copyright (c) 2026 ZyvorAI Labs Private Limited.
 # SPDX-License-Identifier: Apache-2.0
-# Atlas docs site (Docusaurus). Live: https://zyvorai.github.io/atlas/
+# Atlas docs site (Docusaurus). Live: https://zyvorai.github.io/zyvor-atlas/
 
 npm install
 npm start          # local preview

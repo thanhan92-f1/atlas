@@ -14,10 +14,10 @@ const config: Config = {
   },
 
   url: 'https://zyvorai.github.io',
-  baseUrl: '/atlas/',
+  baseUrl: '/zyvor-atlas/',
 
   organizationName: 'zyvorai',
-  projectName: 'atlas',
+  projectName: 'zyvor-atlas',
 
   onBrokenLinks: 'throw',
 
@@ -40,7 +40,7 @@ const config: Config = {
       {
         docs: {
           sidebarPath: './sidebars.ts',
-          editUrl: 'https://github.com/zyvorai/atlas/tree/main/website/',
+          editUrl: 'https://github.com/zyvorai/zyvor-atlas/tree/main/website/',
         },
         blog: false,
         theme: {
@@ -52,7 +52,8 @@ const config: Config = {
 
   themeConfig: {
     colorMode: {
-      respectPrefersColorScheme: true,
+      defaultMode: 'dark',
+      respectPrefersColorScheme: false,
     },
     navbar: {
       title: 'Atlas',
@@ -73,7 +74,7 @@ const config: Config = {
           position: 'left',
         },
         {
-          href: 'https://github.com/zyvorai/atlas',
+          href: 'https://github.com/zyvorai/zyvor-atlas',
           label: 'GitHub',
           position: 'right',
         },
@@ -99,14 +100,14 @@ const config: Config = {
         {
           title: 'Project',
           items: [
-            {label: 'GitHub', href: 'https://github.com/zyvorai/atlas'},
+            {label: 'GitHub', href: 'https://github.com/zyvorai/zyvor-atlas'},
             {
               label: 'Changelog',
-              href: 'https://github.com/zyvorai/atlas/blob/main/CHANGELOG.md',
+              href: 'https://github.com/zyvorai/zyvor-atlas/blob/main/CHANGELOG.md',
             },
             {
               label: 'License',
-              href: 'https://github.com/zyvorai/atlas/blob/main/LICENSE',
+              href: 'https://github.com/zyvorai/zyvor-atlas/blob/main/LICENSE',
             },
           ],
         },
