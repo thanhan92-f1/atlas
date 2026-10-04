@@ -15,25 +15,42 @@ For every metadata mutation:
 3. append `{term,index,command}` to `metadata.wal`;
 4. `fsync` the WAL;
 5. release the lock, publishing the new state. If the append fails, the catalog is reloaded from
-   disk (`catalog.json` plus the WAL), since whether the record landed is unknown.
+   disk (the catalog store plus the WAL), since whether the record landed is unknown.
 
-`catalog.json` is only rewritten at a checkpoint (below), not on every commit: one fsync per
-commit instead of three, and no per-commit cost that grows with the catalog.
+The catalog store is only written at a checkpoint (below), not on every commit, so a commit costs
+one fsync.
 
-On restart, Atlas loads `catalog.json` and replays every WAL record whose index is greater than
+On restart, Atlas loads the catalog store and replays every WAL record whose index is greater than
 `catalog.applied_index`. A torn final WAL line (a record that never finished its fsync, so was never
 acknowledged) is discarded on open; corruption anywhere else is a hard error.
 
+## Catalog store
+
+The catalog is checkpointed to `catalog.redb`, an embedded [redb](https://github.com/cberner/redb)
+key-value store with one record per volume, volume snapshot, extent, filesystem, inode and
+filesystem snapshot, plus one record for the rest (applied index, term, free list, membership,
+Raft addresses). The catalog's large maps record which keys change between checkpoints
+(`tracked::Tracked`: every mutation goes through it, so the record is complete by construction),
+and a checkpoint writes only those records, in one durable transaction. A checkpoint therefore
+costs time proportional to what changed since the last one, not to the size of the catalog. A
+catalog the store doesn't already hold (a new one, one read from a legacy `catalog.json`, or one
+installed from a Raft snapshot) is written in full.
+
+Upgrading: a node that finds a `catalog.json` and an empty store loads the JSON, writes it to the
+store and then deletes `catalog.json`. The store is preferred whenever it holds a checkpoint, so a
+crash between those steps is harmless. There is no way back to `catalog.json`, so downgrading past
+this version means restoring a backup.
+
+Limits: the working catalog still lives in memory in full; the store makes checkpoints
+incremental, but it doesn't page the catalog out yet. A directory is one inode record holding all
+of its entries, so a checkpoint after creates in a very large directory rewrites that whole record.
+
 ## Checkpoint and WAL compaction
 
-A checkpoint writes `catalog.json`, which then durably covers every applied index, so WAL records at
-or below it are redundant. The engine checkpoints and compacts the WAL once it holds
-`EngineConfig::wal_compact_after` records (default 1024, `0` disables) or half the catalog's object
-count (extents plus inodes), whichever is more, and on an explicit `NativeEngine::checkpoint()`. A
-checkpoint costs time proportional to the catalog, so tying the interval to the catalog's size
-keeps the cost per commit flat as the namespace grows; half (rather than all) of the object count
-keeps a create-only workload, which adds one object per record, compacting at geometrically
-spaced points. Raft compacts its log on the same rule (`RaftConfig::compact_after`). Compaction rewrites the
+A checkpoint writes the catalog store, which then durably covers every applied index, so WAL
+records at or below it are redundant. The engine checkpoints and compacts the WAL once it holds
+`EngineConfig::wal_compact_after` records (default 1024, `0` disables) and on an explicit
+`NativeEngine::checkpoint()`. Compaction rewrites the
 log through a temp file + fsync + rename + directory fsync. After compaction the WAL may be empty, so
 its index floor is raised to `catalog.applied_index` on open to keep indexes monotonic.
 
@@ -75,9 +92,8 @@ messages with `step()` and sends whatever `take_messages()` returns. Implemented
   consistency check after a lost message) rewinds it, and an acknowledgement never moves it back.
   Without this, concurrent proposals each resent the whole unacknowledged tail and throughput
   collapsed under load;
-- log compaction after `compact_after` applied entries (and at least half the catalog's object
-  count, see "Checkpoint and WAL compaction") and `InstallSnapshot` (the leader's applied catalog)
-  for followers behind the compaction point;
+- log compaction after `compact_after` applied entries and `InstallSnapshot` (the leader's applied
+  catalog) for followers behind the compaction point;
 - pre-vote: a node whose election timer fires first asks for pre-votes for `term + 1` without
   changing anyone's term, and only campaigns once a majority would vote for it, so a partitioned
   node cannot inflate its term and depose a healthy leader when it rejoins;
@@ -85,9 +101,10 @@ messages with `step()` and sends whatever `take_messages()` returns. Implemented
   steps down, and a node that has heard from a live leader within that window ignores
   higher-term vote requests.
 
-Each replica keeps its own `raft_state.json` (term + vote), WAL and `catalog.json`. Durability order:
+Each replica keeps its own `raft_state.json` (term + vote), WAL and catalog store. Durability order:
 the vote is fsynced before any reply; entries are fsynced before they are acknowledged or counted
-toward the leader's own vote; `catalog.json` is persisted before the log is compacted past it.
+toward the leader's own vote; the catalog is checkpointed before the log is compacted past it,
+and an installed snapshot is checkpointed (in full) before the log entries it covers are dropped.
 
 Proposals are validated on the leader against its applied catalog plus all uncommitted entries, so
 an invalid command is rejected instead of logged. If a committed command still fails to apply, it is
@@ -264,8 +281,11 @@ Not implemented yet:
 
 ## Failure model covered
 
-- process crash after WAL fsync but before catalog persistence (tested by restoring a stale
-  `catalog.json`);
+- process crash after WAL fsync but before the next checkpoint (commits between checkpoints are
+  replayed from the WAL);
+- incremental checkpoints read back identical to the in-memory catalog across edits, removals,
+  snapshots, clones and a filesystem deleted and recreated under the same id; a Raft snapshot is
+  written in full; a legacy `catalog.json` migrates into the store;
 - torn final WAL record;
 - restart/replay without double-applying committed commands;
 - snapshot copy-on-write isolation and space protection;

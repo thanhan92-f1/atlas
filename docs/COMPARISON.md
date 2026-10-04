@@ -66,9 +66,9 @@ The atlas-native roadmap, in order, each phase gated on a published benchmark:
    extent I/O, group commit, direct client reads, the `io_uring`/`O_DIRECT` backend and
    multi-device striping are done; direct client writes and an NVMe benchmark are not.
 2. **Metadata scale:** namespace sharded across Raft groups, an on-disk catalog, client leases.
-   Commit cost no longer grows with the catalog and Raft replication is pipelined (a 3-voter
-   group sustains ~15k creates/s on one host); sharding, the on-disk catalog and leases are not
-   done.
+   Commits cost one fsync, Raft replication is pipelined (a 3-voter group sustains ~12–15k
+   creates/s on one host), and checkpoints write only changed records to an embedded KV store.
+   Paging the catalog out of memory, sharding and leases are not done.
 3. **Efficiency:** erasure coding with a rebuild controller; cold extents tiered to S3.
 4. **AI:** RDMA transport, a GPUDirect Storage path, a checkpoint fast path, a CSI driver;
    MLPerf Storage results.

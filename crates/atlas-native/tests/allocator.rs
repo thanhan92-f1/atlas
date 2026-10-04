@@ -3,7 +3,7 @@
 
 use std::io::Write;
 
-use atlas_native::{EngineConfig, FailureDomain, NativeEngine, Node};
+use atlas_native::{Catalog, EngineConfig, FailureDomain, MetaCommand, NativeEngine, Node};
 
 fn nodes() -> Vec<Node> {
     (1..=3)
@@ -172,25 +172,55 @@ fn replays_wal_after_crash_before_checkpoint() {
     let td = tempfile::tempdir().unwrap();
     let mut c = cfg(td.path());
     c.wal_compact_after = 0;
-    let catalog = td.path().join("catalog.json");
 
+    // With compaction off, nothing after open is checkpointed: every commit lives only in the WAL.
     let e = NativeEngine::open(c.clone(), nodes()).unwrap();
     let v = e.create_volume("v", 8192).unwrap();
     e.write(&v, 0, b"one").unwrap();
-    let stale = std::fs::read(&catalog).unwrap();
     e.write(&v, 4096, b"two").unwrap();
     let s = e.create_snapshot(&v, "s").unwrap();
     let applied = e.applied_index().unwrap();
     drop(e);
-
-    // Simulate a crash after the WAL fsyncs but before catalog.json is replaced.
-    std::fs::write(&catalog, stale).unwrap();
 
     let e = NativeEngine::open(c, nodes()).unwrap();
     assert_eq!(e.applied_index().unwrap(), applied);
     assert_eq!(e.read(&v, 0, 3).unwrap(), b"one");
     assert_eq!(e.read(&v, 4096, 3).unwrap(), b"two");
     assert_eq!(e.read_snapshot(&s, 4096, 3).unwrap(), b"two");
+}
+
+#[test]
+fn a_legacy_catalog_json_is_migrated_into_the_store() {
+    let td = tempfile::tempdir().unwrap();
+    let mut legacy = Catalog::default();
+    legacy
+        .apply(
+            1,
+            1,
+            &MetaCommand::CreateVolume {
+                id: "vol-old".into(),
+                name: "old".into(),
+                size_bytes: 4096,
+            },
+        )
+        .unwrap();
+    std::fs::write(
+        td.path().join("catalog.json"),
+        serde_json::to_vec(&legacy).unwrap(),
+    )
+    .unwrap();
+
+    let e = NativeEngine::open(cfg(td.path()), nodes()).unwrap();
+    assert_eq!(e.applied_index().unwrap(), 1);
+    assert!(!td.path().join("catalog.json").exists());
+    assert!(td.path().join("catalog.redb").exists());
+    e.create_volume("new", 4096).unwrap();
+    drop(e);
+
+    let e = NativeEngine::open(cfg(td.path()), nodes()).unwrap();
+    let names: Vec<String> = e.volumes().unwrap().into_iter().map(|v| v.name).collect();
+    assert_eq!(names.len(), 2, "{names:?}");
+    assert!(names.contains(&"old".to_string()));
 }
 
 #[test]

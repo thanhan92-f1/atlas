@@ -9,7 +9,7 @@
 //! [`RaftNode::step`] and delivers whatever [`RaftNode::take_messages`] returns. Transport is the
 //! caller's concern. Durability is not: the vote is fsynced before any reply, log entries are
 //! fsynced before they are acknowledged or counted toward the leader's own quorum vote, and
-//! `catalog.json` is persisted before the log is compacted past it.
+//! the catalog is checkpointed to its store before the log is compacted past it.
 //!
 //! Pre-vote keeps a partitioned node from inflating its term: it only starts a real election after
 //! a majority confirms it could win. Check-quorum makes a leader that has not heard from a
@@ -35,6 +35,7 @@ use crate::{
     durable,
     membership::Membership,
     metadata::{Catalog, MetaCommand, MetaError},
+    store::{load_checkpoint, remove_legacy_catalog, CatalogStore, CATALOG_STORE},
     wal::{Wal, WalError, WalRecord},
 };
 
@@ -83,10 +84,9 @@ pub struct RaftConfig {
     pub election_ticks: (u64, u64),
     pub heartbeat_ticks: u64,
     pub max_batch: usize,
-    /// Compact the log once twice this many applied entries sit above the last compaction point
-    /// (and at least `compact_after` plus half the catalog's object count), keeping the newest
-    /// `compact_after` so a follower that is a little behind catches up through AppendEntries
-    /// rather than a full snapshot (0 disables compaction).
+    /// Compact the log once twice this many applied entries sit above the last compaction point,
+    /// keeping the newest `compact_after` so a follower that is a little behind catches up through
+    /// AppendEntries rather than a full snapshot (0 disables compaction).
     pub compact_after: u64,
 }
 
@@ -264,6 +264,7 @@ pub struct RaftNode {
     /// so a proposal is validated without copying the catalog. Built on first use in a term.
     spec: Option<Catalog>,
     wal: Wal,
+    store: CatalogStore,
     votes: BTreeSet<NodeId>,
     next_index: BTreeMap<NodeId, u64>,
     match_index: BTreeMap<NodeId, u64>,
@@ -304,12 +305,12 @@ impl RaftNode {
         } else {
             HardState::default()
         };
-        let catalog_path = cfg.root.join("catalog.json");
-        let catalog: Catalog = if catalog_path.exists() {
-            serde_json::from_slice(&fs::read(&catalog_path)?)?
-        } else {
-            Catalog::default()
-        };
+        let store = CatalogStore::open(cfg.root.join(CATALOG_STORE))?;
+        let mut catalog = load_checkpoint(&cfg.root, &store)?;
+        if !catalog.in_store {
+            store.checkpoint(&mut catalog)?;
+        }
+        remove_legacy_catalog(&cfg.root)?;
         let applied = catalog.applied_index;
 
         let mut wal = Wal::open(cfg.root.join("wal"))?;
@@ -360,6 +361,7 @@ impl RaftNode {
             catalog,
             spec: None,
             wal,
+            store,
             votes: BTreeSet::new(),
             next_index: BTreeMap::new(),
             match_index: BTreeMap::new(),
@@ -878,12 +880,17 @@ impl RaftNode {
         Ok((true, match_index))
     }
 
-    fn handle_snapshot(&mut self, snap: Catalog) -> Result<(), RaftError> {
+    fn handle_snapshot(&mut self, mut snap: Catalog) -> Result<(), RaftError> {
+        // The leader's catalog, whatever its own store holds: ours gets all of it.
+        snap.in_store = false;
         let si = snap.applied_index;
         let st = snap.current_term;
         if si <= self.commit_index {
             return Ok(());
         }
+        // The snapshot is durable before the log entries it covers go.
+        self.catalog = snap;
+        self.persist_catalog()?;
         if self.term_at(si) == Some(st) {
             self.log.drain(..(si - self.snapshot_index) as usize);
             self.wal.compact_through(si)?;
@@ -892,8 +899,6 @@ impl RaftNode {
             self.wal.reset(si)?;
         }
         self.wal.raise_floor(si);
-        self.catalog = snap;
-        self.persist_catalog()?;
         self.snapshot_index = si;
         self.snapshot_term = st;
         self.commit_index = si;
@@ -1132,12 +1137,7 @@ impl RaftNode {
     fn maybe_compact(&mut self) -> Result<(), RaftError> {
         let applied = self.catalog.applied_index;
         let keep = self.cfg.compact_after;
-        // Each compaction rewrites the whole catalog, so it waits for new entries numbering half
-        // the catalog's objects: the cost per entry stays flat as it grows, and a create-only
-        // workload (one object per entry) still compacts, at geometrically spaced points.
-        if keep == 0
-            || applied - self.snapshot_index < (2 * keep).max(keep + self.catalog.object_count() / 2)
-        {
+        if keep == 0 || applied - self.snapshot_index < 2 * keep {
             return Ok(());
         }
         let through = applied - keep;
@@ -1192,9 +1192,7 @@ impl RaftNode {
         Ok(())
     }
 
-    fn persist_catalog(&self) -> Result<(), RaftError> {
-        let bytes = serde_json::to_vec(&self.catalog)?;
-        durable::write_atomic(&self.cfg.root.join("catalog.json"), &bytes)?;
-        Ok(())
+    fn persist_catalog(&mut self) -> Result<(), RaftError> {
+        Ok(self.store.checkpoint(&mut self.catalog)?)
     }
 }

@@ -8,6 +8,7 @@ use crate::{
     alloc::FreeList,
     membership::Membership,
     namespace::{FsId, FsMeta, FsOp, FsSnapshotMeta},
+    tracked::Tracked,
 };
 
 pub type VolumeId = String;
@@ -59,9 +60,9 @@ pub struct ExtentMeta {
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct Catalog {
-    pub volumes: BTreeMap<VolumeId, VolumeMeta>,
-    pub snapshots: BTreeMap<SnapshotId, SnapshotMeta>,
-    pub extents: BTreeMap<ExtentId, ExtentMeta>,
+    pub volumes: Tracked<VolumeId, VolumeMeta>,
+    pub snapshots: Tracked<SnapshotId, SnapshotMeta>,
+    pub extents: Tracked<ExtentId, ExtentMeta>,
     pub applied_index: u64,
     pub current_term: u64,
     #[serde(default)]
@@ -74,9 +75,14 @@ pub struct Catalog {
     #[serde(default)]
     pub raft_addrs: BTreeMap<String, String>,
     #[serde(default)]
-    pub filesystems: BTreeMap<FsId, FsMeta>,
+    pub filesystems: Tracked<FsId, FsMeta>,
     #[serde(default)]
-    pub fs_snapshots: BTreeMap<SnapshotId, FsSnapshotMeta>,
+    pub fs_snapshots: Tracked<SnapshotId, FsSnapshotMeta>,
+    /// Whether the catalog store holds this catalog apart from the changes the maps track.
+    /// False for a catalog built any other way (new, from JSON, from a Raft snapshot), which the
+    /// next checkpoint writes in full.
+    #[serde(skip)]
+    pub in_store: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -478,18 +484,6 @@ impl Catalog {
         result
     }
 
-    /// Roughly how many records a checkpoint serializes: extents plus inodes, counting each
-    /// filesystem snapshot's frozen tree. Checkpoint cost grows with it.
-    pub fn object_count(&self) -> u64 {
-        let inodes: usize = self
-            .filesystems
-            .values()
-            .map(|f| f.inodes.len())
-            .chain(self.fs_snapshots.values().map(|s| s.tree.inodes.len()))
-            .sum();
-        (self.volumes.len() + self.snapshots.len() + self.extents.len() + inodes) as u64
-    }
-
     /// End of the last written byte among `extents`.
     pub fn written_end(&self, extents: &BTreeMap<u64, ExtentId>) -> u64 {
         extents
@@ -508,14 +502,18 @@ impl Catalog {
                     .reserve(&r.node_id, r.device_index, r.offset, extent.len as u64);
             }
         }
-        self.extents
-            .entry(extent.id.clone())
-            .and_modify(|e| e.refs += 1)
-            .or_insert(ExtentMeta {
-                extent: extent.clone(),
-                refs: 1,
-                tombstoned: false,
-            });
+        if let Some(e) = self.extents.get_mut(&extent.id) {
+            e.refs += 1;
+        } else {
+            self.extents.insert(
+                extent.id.clone(),
+                ExtentMeta {
+                    extent: extent.clone(),
+                    refs: 1,
+                    tombstoned: false,
+                },
+            );
+        }
     }
 
     pub(crate) fn dec_ref(
