@@ -92,6 +92,12 @@ pub enum MetaCommand {
         logical_offset: u64,
         extent: ExtentRef,
     },
+    /// [`MetaCommand::InstallExtent`] for several extents of one write (each at its own
+    /// `logical_offset`), committed as one entry.
+    InstallExtents {
+        volume_id: VolumeId,
+        extents: Vec<ExtentRef>,
+    },
     CreateSnapshot {
         id: SnapshotId,
         volume_id: VolumeId,
@@ -213,6 +219,24 @@ impl Catalog {
                 };
                 self.add_extent_ref(extent);
                 if let Some(old_id) = old {
+                    self.dec_ref(&old_id, &mut gc_candidates)?;
+                }
+            }
+            MetaCommand::InstallExtents { volume_id, extents } => {
+                let old: Vec<ExtentId> = {
+                    let vol = self
+                        .volumes
+                        .get_mut(volume_id)
+                        .ok_or_else(|| MetaError::NotFound(volume_id.clone()))?;
+                    extents
+                        .iter()
+                        .filter_map(|e| vol.extents.insert(e.logical_offset, e.id.clone()))
+                        .collect()
+                };
+                for e in extents {
+                    self.add_extent_ref(e);
+                }
+                for old_id in old {
                     self.dec_ref(&old_id, &mut gc_candidates)?;
                 }
             }

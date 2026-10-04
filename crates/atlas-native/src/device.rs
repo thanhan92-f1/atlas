@@ -31,6 +31,10 @@ pub trait BlockStore: std::fmt::Debug + Send + Sync {
     fn is_empty(&self) -> Result<bool, NativeError> {
         Ok(self.len()? == 0)
     }
+    /// Network address a client can read this device at directly, if it is remote.
+    fn endpoint(&self) -> Option<&str> {
+        None
+    }
 }
 
 impl BlockStore for FileDevice {

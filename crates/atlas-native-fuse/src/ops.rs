@@ -13,8 +13,9 @@ use std::{
 };
 
 use atlas_native::{
-    engine::{Attr, DirEntry, FsStat, NewNode},
-    NodeType, SetAttr,
+    checksum,
+    engine::{Attr, DirEntry, FileLayout, FsStat, LayoutExtent, NewNode},
+    BlockStore, NodeType, RemoteDevice, SetAttr, TlsIdentity,
 };
 use reqwest::Method;
 use serde_json::json;
@@ -41,6 +42,8 @@ pub struct OpsConfig {
     /// A read fetches at least this much (from the read offset) and serves following reads from
     /// it until the TTL expires or the file is written through this mount; 0 disables it.
     pub readahead_bytes: usize,
+    /// Read file data straight from the data nodes instead of through the metadata leader.
+    pub direct_reads: Option<DirectReads>,
 }
 
 impl Default for OpsConfig {
@@ -50,9 +53,24 @@ impl Default for OpsConfig {
             writeback_bytes: 4 << 20,
             max_io_bytes: 8 << 20,
             readahead_bytes: 4 << 20,
+            direct_reads: None,
         }
     }
 }
+
+/// Direct reads: the leader only returns where a range's extents live (`/layout`); the client
+/// fetches every extent from a replica's data node itself, in parallel, and verifies its
+/// SHA-256. Any failure (unreachable node, checksum mismatch, a layout made stale by a
+/// concurrent write) falls back to reading through the leader.
+#[derive(Debug, Clone)]
+pub struct DirectReads {
+    /// Client identity for data nodes that require mutual TLS; plaintext otherwise.
+    pub identity: Option<Arc<TlsIdentity>>,
+    pub timeout: Duration,
+}
+
+/// Extents a direct read fetches concurrently.
+const DIRECT_PARALLELISM: usize = 8;
 
 pub struct Ops {
     client: Client,
@@ -70,6 +88,9 @@ pub struct Ops {
     /// Files unlinked while open here: renamed to a hidden name in their directory and removed
     /// on last close, so open handles keep working (as libfuse does without `hard_remove`).
     hidden: Mutex<HashMap<u64, (u64, String)>>,
+    /// Data-node clients for direct reads, by `(node id, endpoint)`.
+    data_nodes: Mutex<HashMap<(String, String), Arc<RemoteDevice>>>,
+    direct_fallbacks: std::sync::atomic::AtomicU64,
 }
 
 /// Prefix of the names open-but-unlinked files are parked under; hidden from listings.
@@ -85,6 +106,10 @@ fn decode<T: serde::de::DeserializeOwned>(v: serde_json::Value) -> Result<T, Err
         tracing::warn!(error = %e, "undecodable response");
         libc::EIO
     })
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn check_name(name: &str) -> Result<(), Errno> {
@@ -110,8 +135,16 @@ impl Ops {
             last_read_end: Mutex::new(TtlCache::new(Duration::from_secs(10))),
             opens: Mutex::new(HashMap::new()),
             hidden: Mutex::new(HashMap::new()),
+            data_nodes: Mutex::new(HashMap::new()),
+            direct_fallbacks: std::sync::atomic::AtomicU64::new(0),
             cfg,
         }
+    }
+
+    /// Direct reads that fell back to reading through the leader.
+    pub fn direct_fallbacks(&self) -> u64 {
+        self.direct_fallbacks
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The mounted filesystem: `<fs>` or `<fs>@<snapshot>`.
@@ -513,15 +546,30 @@ impl Ops {
         while out.len() < len {
             let want = (len - out.len()).min(self.cfg.max_io_bytes);
             let at = offset + out.len() as u64;
-            let chunk = self
-                .client
-                .request(
-                    Method::GET,
-                    &self.path(&format!("/inodes/{ino}/data?offset={at}&len={want}")),
-                    Body::Empty,
-                    Retry::Idempotent,
-                )
-                .map_err(errno)?;
+            let direct = match &self.cfg.direct_reads {
+                Some(d) => match self.fetch_direct(d, ino, at, want) {
+                    Ok(chunk) => Some(chunk),
+                    Err(e) => {
+                        tracing::debug!(ino, offset = at, error = %e, "direct read fell back");
+                        self.direct_fallbacks
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        None
+                    }
+                },
+                None => None,
+            };
+            let chunk = match direct {
+                Some(chunk) => chunk,
+                None => self
+                    .client
+                    .request(
+                        Method::GET,
+                        &self.path(&format!("/inodes/{ino}/data?offset={at}&len={want}")),
+                        Body::Empty,
+                        Retry::Idempotent,
+                    )
+                    .map_err(errno)?,
+            };
             let short = chunk.len() < want;
             out.extend_from_slice(&chunk);
             if short {
@@ -529,6 +577,92 @@ impl Ops {
             }
         }
         Ok(out)
+    }
+
+    /// Up to `len` bytes at `offset`, fetched from the data nodes; see [`DirectReads`].
+    fn fetch_direct(
+        &self,
+        d: &DirectReads,
+        ino: u64,
+        offset: u64,
+        len: usize,
+    ) -> Result<Vec<u8>, String> {
+        let layout: FileLayout = self
+            .call(
+                Method::GET,
+                &format!("/inodes/{ino}/layout?offset={offset}&len={len}"),
+                Body::Empty,
+                Retry::Idempotent,
+            )
+            .and_then(decode)
+            .map_err(|e| format!("layout: errno {e}"))?;
+        let mut out = vec![0u8; layout.len];
+        let end = offset + layout.len as u64;
+        for window in layout.extents.chunks(DIRECT_PARALLELISM) {
+            let bufs: Vec<Result<Vec<u8>, String>> = std::thread::scope(|s| {
+                let handles: Vec<_> = window
+                    .iter()
+                    .map(|ext| s.spawn(|| self.read_extent_direct(d, ext)))
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().unwrap_or_else(|_| Err("reader panicked".into())))
+                    .collect()
+            });
+            for (ext, buf) in window.iter().zip(bufs) {
+                let buf = buf?;
+                let start = ext.logical_offset.max(offset);
+                let stop = (ext.logical_offset + ext.len as u64).min(end);
+                if start >= stop {
+                    continue;
+                }
+                out[(start - offset) as usize..(stop - offset) as usize].copy_from_slice(
+                    &buf[(start - ext.logical_offset) as usize
+                        ..(stop - ext.logical_offset) as usize],
+                );
+            }
+        }
+        Ok(out)
+    }
+
+    /// One whole extent from the first replica whose checksum verifies.
+    fn read_extent_direct(&self, d: &DirectReads, ext: &LayoutExtent) -> Result<Vec<u8>, String> {
+        let mut last = format!("extent at {} has no reachable replica", ext.logical_offset);
+        for r in &ext.replicas {
+            let Some(endpoint) = &r.endpoint else {
+                continue;
+            };
+            let dev = self.data_node(d, &r.node_id, endpoint)?;
+            match dev.read_exact_at(r.offset, ext.len) {
+                Ok(buf) if hex(&checksum::sha256(&buf)) == ext.checksum => return Ok(buf),
+                Ok(_) => last = format!("checksum mismatch on {}", r.node_id),
+                Err(e) => last = format!("{}: {e}", r.node_id),
+            }
+        }
+        Err(last)
+    }
+
+    fn data_node(
+        &self,
+        d: &DirectReads,
+        node_id: &str,
+        endpoint: &str,
+    ) -> Result<Arc<RemoteDevice>, String> {
+        let mut nodes = self
+            .data_nodes
+            .lock()
+            .map_err(|_| "data-node cache poisoned")?;
+        let key = (node_id.to_string(), endpoint.to_string());
+        if let Some(dev) = nodes.get(&key) {
+            return Ok(dev.clone());
+        }
+        let dev = Arc::new(match &d.identity {
+            Some(id) => RemoteDevice::with_tls(endpoint, node_id, id, d.timeout)
+                .map_err(|e| format!("{node_id}: {e}"))?,
+            None => RemoteDevice::new(endpoint, d.timeout),
+        });
+        nodes.insert(key, dev.clone());
+        Ok(dev)
     }
 
     fn drop_readahead(&self, ino: u64) {

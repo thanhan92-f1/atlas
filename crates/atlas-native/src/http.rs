@@ -175,7 +175,10 @@ fn serve(
     tls: Option<&Arc<ServerConfig>>,
     stop: &AtomicBool,
 ) {
+    // Without TCP_NODELAY a response whose tail doesn't fill a segment waits for the client's
+    // delayed ACK (40 ms on Linux).
     if stream.set_nonblocking(false).is_err()
+        || stream.set_nodelay(true).is_err()
         || stream.set_read_timeout(Some(IO_TIMEOUT)).is_err()
         || stream.set_write_timeout(Some(IO_TIMEOUT)).is_err()
     {
@@ -373,8 +376,15 @@ fn write_response(w: &mut impl Write, resp: &Response, keep_alive: bool) -> io::
         resp.body.len(),
         if keep_alive { "keep-alive" } else { "close" }
     );
-    w.write_all(head.as_bytes())?;
-    w.write_all(&resp.body)?;
+    // Small responses go out in one write; a large body is not copied just to join it.
+    if resp.body.len() <= 64 << 10 {
+        let mut msg = head.into_bytes();
+        msg.extend_from_slice(&resp.body);
+        w.write_all(&msg)?;
+    } else {
+        w.write_all(head.as_bytes())?;
+        w.write_all(&resp.body)?;
+    }
     w.flush()
 }
 

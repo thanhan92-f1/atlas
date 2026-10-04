@@ -14,6 +14,7 @@ use std::{
 use uuid::Uuid;
 
 use crate::{
+    alloc::FreeList,
     checksum,
     device::{BlockStore, FileDevice},
     durable, gc,
@@ -28,7 +29,15 @@ use crate::{
 };
 
 mod files;
-pub use files::{Attr, DirEntry, FsInfo, FsSnapshotInfo, FsStat, NewNode};
+pub use files::{
+    Attr, DirEntry, FileLayout, FsInfo, FsSnapshotInfo, FsStat, LayoutExtent, LayoutReplica,
+    NewNode,
+};
+
+/// Extents fetched concurrently by one read.
+const READ_PARALLELISM: usize = 8;
+/// Extents whose replicas are written concurrently by one write.
+const WRITE_PARALLELISM: usize = 4;
 
 /// What a data write lands in.
 enum Target<'a> {
@@ -62,6 +71,17 @@ impl Target<'_> {
             .and_then(|id| c.extents.get(id))
             .map(|m| m.extent.clone()))
     }
+}
+
+/// The replica index a read of extent `id` starts at (FNV-1a, stable across processes).
+pub(crate) fn replica_start(id: &str, replicas: usize) -> usize {
+    if replicas == 0 {
+        return 0;
+    }
+    let h = id.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)
+    });
+    (h % replicas as u64) as usize
 }
 
 fn now_ns() -> i64 {
@@ -400,6 +420,7 @@ impl NativeEngine {
         // two extents covering the same bytes. A write that covers only part of an existing
         // extent's bytes rewrites the whole extent with the old bytes merged in.
         let grid = self.with_catalog(|c| target.grid(c, self.cfg.extent_bytes))??;
+        let mut cells: Vec<(u64, std::borrow::Cow<[u8]>)> = Vec::new();
         let mut pos = offset;
         let mut rest = data;
         while !rest.is_empty() {
@@ -408,30 +429,87 @@ impl NativeEngine {
             let n = rest.len().min(grid as usize - within);
             let (part, tail) = rest.split_at(n);
             let existing = self.with_catalog(|c| target.extent_at(c, cell))??;
-            let merged;
-            let content: &[u8] = match existing {
+            let content = match existing {
                 Some(ext) if within > 0 || n < ext.len => {
                     let mut buf = self.read_extent(&ext)?;
                     if buf.len() < within + n {
                         buf.resize(within + n, 0);
                     }
                     buf[within..within + n].copy_from_slice(part);
-                    merged = buf;
-                    &merged
+                    buf.into()
                 }
                 None if within > 0 => {
                     let mut buf = vec![0u8; within + n];
                     buf[within..].copy_from_slice(part);
-                    merged = buf;
-                    &merged
+                    buf.into()
                 }
-                _ => part,
+                _ => part.into(),
             };
-            self.install_extent(target, cell, content, fence)?;
+            cells.push((cell, content));
             pos += n as u64;
             rest = tail;
         }
+        if let [(cell, content)] = cells.as_slice() {
+            return self.install_extent(target, *cell, content, fence);
+        }
+        // Every placement of this write draws from one scratch copy of the free list, so
+        // concurrent placements never pick the same free range; the single commit then
+        // reserves exactly those ranges.
+        let alloc = self.alloc_scratch()?;
+        let mut placed_all = Vec::with_capacity(cells.len());
+        for window in cells.chunks(WRITE_PARALLELISM) {
+            let placed: Vec<Result<ExtentRef, NativeError>> = if window.len() == 1 {
+                vec![self.place_extent(&window[0].1, fence, &alloc)]
+            } else {
+                std::thread::scope(|s| {
+                    let handles: Vec<_> = window
+                        .iter()
+                        .map(|(_, content)| s.spawn(|| self.place_extent(content, fence, &alloc)))
+                        .collect();
+                    handles
+                        .into_iter()
+                        .map(|h| {
+                            h.join()
+                                .unwrap_or(Err(NativeError::Poisoned("extent writer")))
+                        })
+                        .collect()
+                })
+            };
+            for ((cell, _), extent) in window.iter().zip(placed) {
+                let mut extent = extent?;
+                extent.logical_offset = *cell;
+                placed_all.push(extent);
+            }
+        }
+        let bytes: usize = placed_all.iter().map(|e| e.len).sum();
+        let end = placed_all
+            .iter()
+            .map(|e| e.logical_offset + e.len as u64)
+            .max()
+            .unwrap_or(0);
+        let cmd = match target {
+            Target::Volume(volume_id) => MetaCommand::InstallExtents {
+                volume_id: volume_id.to_string(),
+                extents: placed_all,
+            },
+            Target::File { fs, ino } => MetaCommand::Fs {
+                op: FsOp::InstallFileExtents {
+                    fs: fs.to_string(),
+                    ino: *ino,
+                    extents: placed_all,
+                    size: end,
+                    now_ns: now_ns(),
+                },
+            },
+        };
+        self.commit(cmd, Some(fence))?;
+        self.telemetry.record_write(bytes);
         Ok(())
+    }
+
+    /// A private copy of the applied free list for one batch of placements.
+    fn alloc_scratch(&self) -> Result<Mutex<FreeList>, NativeError> {
+        Ok(Mutex::new(self.with_catalog(|c| c.free.clone())?))
     }
 
     /// Writes `chunk` to fresh replicas and commits it as the extent at `logical`.
@@ -442,6 +520,18 @@ impl NativeEngine {
         chunk: &[u8],
         fence: u64,
     ) -> Result<(), NativeError> {
+        let alloc = self.alloc_scratch()?;
+        let extent = self.place_extent(chunk, fence, &alloc)?;
+        self.commit_extent(target, logical, chunk.len(), extent, fence)
+    }
+
+    /// Writes `chunk` to `replicas` fresh copies (in parallel) and returns the extent to commit.
+    fn place_extent(
+        &self,
+        chunk: &[u8],
+        fence: u64,
+        alloc: &Mutex<FreeList>,
+    ) -> Result<ExtentRef, NativeError> {
         let needed = self.cfg.placement.replicas;
         let order = self.placement_order(chunk.len() as u64, |_| false);
         if order.len() < needed {
@@ -462,7 +552,7 @@ impl NativeEngine {
             let placed: Vec<Result<Option<ReplicaRef>, NativeError>> = std::thread::scope(|s| {
                 let handles: Vec<_> = batch
                     .iter()
-                    .map(|node_id| s.spawn(|| self.place_replica(node_id, fence, chunk)))
+                    .map(|node_id| s.spawn(|| self.place_replica(node_id, fence, chunk, alloc)))
                     .collect();
                 handles
                     .into_iter()
@@ -484,13 +574,25 @@ impl NativeEngine {
                 found: replicas.len(),
             });
         }
-        let extent = ExtentRef {
+        Ok(ExtentRef {
             id: Uuid::new_v4().to_string(),
-            logical_offset: logical,
+            logical_offset: 0,
             len: chunk.len(),
             checksum: checksum::sha256(chunk),
             replicas,
-        };
+        })
+    }
+
+    /// Commits a placed extent of `len` bytes at `logical` of `target`.
+    fn commit_extent(
+        &self,
+        target: &Target,
+        logical: u64,
+        len: usize,
+        mut extent: ExtentRef,
+        fence: u64,
+    ) -> Result<(), NativeError> {
+        extent.logical_offset = logical;
         let cmd = match target {
             Target::Volume(volume_id) => MetaCommand::InstallExtent {
                 volume_id: volume_id.to_string(),
@@ -502,14 +604,14 @@ impl NativeEngine {
                     fs: fs.to_string(),
                     ino: *ino,
                     logical_offset: logical,
-                    size: logical + chunk.len() as u64,
+                    size: logical + len as u64,
                     extent,
                     now_ns: now_ns(),
                 },
             },
         };
         self.commit(cmd, Some(fence))?;
-        self.telemetry.record_write(chunk.len());
+        self.telemetry.record_write(len);
         Ok(())
     }
 
@@ -678,8 +780,9 @@ impl NativeEngine {
                         || (distinct && taken_hosts.contains(n.failure_domain.host.as_str()))
                 });
                 let mut placed = None;
+                let alloc = self.alloc_scratch()?;
                 for node_id in order {
-                    if let Some(r) = self.place_replica(&node_id, fence, &data)? {
+                    if let Some(r) = self.place_replica(&node_id, fence, &data, &alloc)? {
                         placed = Some(r);
                         break;
                     }
@@ -978,9 +1081,18 @@ impl NativeEngine {
         node_id: &str,
         fence: u64,
         data: &[u8],
+        alloc: &Mutex<FreeList>,
     ) -> Result<Option<ReplicaRef>, NativeError> {
         let node = self.node(node_id)?;
-        let free_off = self.with_catalog(|c| c.free.find(node_id, 0, data.len() as u64))?;
+        let len = data.len() as u64;
+        let free_off = {
+            let mut free = alloc.lock().map_err(|_| NativeError::Poisoned("alloc"))?;
+            let off = free.find(node_id, 0, len);
+            if let Some(off) = off {
+                free.reserve(node_id, 0, off, len);
+            }
+            off
+        };
         let device = &node.devices[0];
         let written = match free_off {
             Some(off) => device.write_at(fence, off, data).map(|()| off),
@@ -1061,16 +1173,39 @@ impl NativeEngine {
     ) -> Result<Vec<u8>, NativeError> {
         let mut out = vec![0u8; len];
         let end = offset + len as u64;
-        for ext in extents {
-            let start = ext.logical_offset.max(offset);
-            let stop = (ext.logical_offset + ext.len as u64).min(end);
-            if start >= stop {
-                continue;
+        let wanted: Vec<(ExtentRef, u64, u64)> = extents
+            .into_iter()
+            .filter_map(|ext| {
+                let start = ext.logical_offset.max(offset);
+                let stop = (ext.logical_offset + ext.len as u64).min(end);
+                (start < stop).then_some((ext, start, stop))
+            })
+            .collect();
+        for window in wanted.chunks(READ_PARALLELISM) {
+            let bufs: Vec<Result<Vec<u8>, NativeError>> = if window.len() == 1 {
+                vec![self.read_extent(&window[0].0)]
+            } else {
+                std::thread::scope(|s| {
+                    let handles: Vec<_> = window
+                        .iter()
+                        .map(|(ext, _, _)| s.spawn(|| self.read_extent(ext)))
+                        .collect();
+                    handles
+                        .into_iter()
+                        .map(|h| {
+                            h.join()
+                                .unwrap_or(Err(NativeError::Poisoned("extent reader")))
+                        })
+                        .collect()
+                })
+            };
+            for ((ext, start, stop), buf) in window.iter().zip(bufs) {
+                let buf = buf?;
+                out[(start - offset) as usize..(stop - offset) as usize].copy_from_slice(
+                    &buf[(start - ext.logical_offset) as usize
+                        ..(stop - ext.logical_offset) as usize],
+                );
             }
-            let buf = self.read_extent(&ext)?;
-            out[(start - offset) as usize..(stop - offset) as usize].copy_from_slice(
-                &buf[(start - ext.logical_offset) as usize..(stop - ext.logical_offset) as usize],
-            );
         }
         Ok(out)
     }
@@ -1113,29 +1248,35 @@ impl NativeEngine {
         Ok(())
     }
 
-    /// The whole extent from the first replica whose checksum verifies.
+    /// The whole extent from the first replica whose checksum verifies. Reads start at a
+    /// replica chosen from the extent id, so the read load of many extents spreads over all
+    /// their replicas instead of always landing on the first.
     fn read_extent(&self, ext: &ExtentRef) -> Result<Vec<u8>, NativeError> {
-        let mut order: Vec<(usize, &ReplicaRef, &NodeRuntime)> = ext
+        let start = replica_start(&ext.id, ext.replicas.len());
+        let mut order: Vec<(&ReplicaRef, &NodeRuntime)> = ext
             .replicas
             .iter()
-            .enumerate()
-            .filter_map(|(i, r)| {
+            .cycle()
+            .skip(start)
+            .take(ext.replicas.len())
+            .filter_map(|r| {
                 self.nodes
                     .iter()
                     .find(|n| n.spec.id == r.node_id && n.spec.healthy)
-                    .map(|n| (i, r, n))
+                    .map(|n| (r, n))
             })
             .collect();
         // Backed-off nodes are tried last rather than skipped: they may be the only copy left.
-        order.sort_by_key(|(_, _, n)| !self.is_up(n));
-        for (i, r, node) in order {
+        order.sort_by_key(|(_, n)| !self.is_up(n));
+        let mut failed = false;
+        for (r, node) in order {
             let Some(device) = node.devices.get(r.device_index) else {
                 continue;
             };
             match device.read_exact_at(r.offset, ext.len) {
                 Ok(buf) if checksum::verify(&buf, &ext.checksum) => {
                     self.mark_up(node);
-                    if i > 0 {
+                    if failed {
                         self.telemetry.replica_fallback();
                     }
                     self.telemetry.record_read(buf.len());
@@ -1144,6 +1285,7 @@ impl NativeEngine {
                 Ok(_) => self.telemetry.checksum_failure(),
                 Err(_) => self.mark_down(node),
             }
+            failed = true;
         }
         Err(NativeError::Checksum(ext.id.clone()))
     }

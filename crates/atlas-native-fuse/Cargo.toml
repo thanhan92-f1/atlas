@@ -33,3 +33,4 @@ fuser = { version = "0.18", optional = true, default-features = false }
 
 [dev-dependencies]
 tempfile.workspace = true
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }

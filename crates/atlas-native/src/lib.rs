@@ -35,7 +35,8 @@ pub use alloc::{FreeList, FreeRange};
 pub use data_node::{DataNodeServer, RemoteDevice};
 pub use device::{BlockStore, DeviceId, FileDevice};
 pub use engine::{
-    EngineConfig, MetaBackend, NativeEngine, NativeError, NodeStatus, RepairStats, VolumeInfo,
+    EngineConfig, FileLayout, LayoutExtent, LayoutReplica, MetaBackend, NativeEngine, NativeError,
+    NodeStatus, RepairStats, VolumeInfo,
 };
 pub use gc::GcStats;
 pub use membership::Membership;

@@ -23,8 +23,8 @@ columns state only what has been measured or verified in this repository.
 | | **Atlas over Ceph** | **Atlas native** | **WEKA** |
 |---|---|---|---|
 | What it is | Control plane driving Ceph (RBD, CephFS, RGW) through Rook | Atlas's own replicated block and POSIX store | Parallel filesystem with its own client and data path |
-| Data path | Ceph's (librbd, kernel RBD, CephFS) | HTTP/JSON to the Raft leader; FUSE client | Kernel-bypass NVMe and network stack |
-| Measured performance | Ceph's; Atlas adds no data-path hop | ~270 creates/s; FUSE 12.5 MiB/s write, 72.5 MiB/s read (lab, `docs/NATIVE_FS.md`) | Designed for very high IOPS and throughput at low latency |
+| Data path | Ceph's (librbd, kernel RBD, CephFS) | FUSE client; writes through the Raft leader, reads direct from data nodes over a binary protocol (optional) | Kernel-bypass NVMe and network stack |
+| Measured performance | Ceph's; Atlas adds no data-path hop | ~270 creates/s; FUSE ~380 MiB/s write, up to ~540 MiB/s read, ~600 4 KiB random-read IOPS (one host, tmpfs, `docs/NATIVE_FS.md`) | Designed for very high IOPS and throughput at low latency |
 | Metadata | Ceph MDS (CephFS) | One Raft group, in memory | Distributed across the cluster |
 | Data protection | Ceph replication or erasure coding | 3 replicas, SHA-256 checksums | Distributed erasure coding |
 | Tiering to object storage | Not managed by Atlas | Not yet | Yes |
@@ -62,7 +62,9 @@ doesn't return is reported as unknown.
 The atlas-native roadmap, in order, each phase gated on a published benchmark:
 
 1. **Data path:** clients read and write data nodes directly (striped across replicas) over a
-   binary streaming protocol; an `io_uring` device backend with `O_DIRECT` on raw NVMe.
+   binary streaming protocol; an `io_uring` device backend with `O_DIRECT` on raw NVMe. Parallel
+   extent I/O, group commit and direct client reads are done; direct writes and `io_uring` are
+   not.
 2. **Metadata scale:** namespace sharded across Raft groups, an on-disk catalog, client leases.
 3. **Efficiency:** erasure coding with a rebuild controller; cold extents tiered to S3.
 4. **AI:** RDMA transport, a GPUDirect Storage path, a checkpoint fast path, a CSI driver;
