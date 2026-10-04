@@ -478,6 +478,18 @@ impl Catalog {
         result
     }
 
+    /// Roughly how many records a checkpoint serializes: extents plus inodes, counting each
+    /// filesystem snapshot's frozen tree. Checkpoint cost grows with it.
+    pub fn object_count(&self) -> u64 {
+        let inodes: usize = self
+            .filesystems
+            .values()
+            .map(|f| f.inodes.len())
+            .chain(self.fs_snapshots.values().map(|s| s.tree.inodes.len()))
+            .sum();
+        (self.volumes.len() + self.snapshots.len() + self.extents.len() + inodes) as u64
+    }
+
     /// End of the last written byte among `extents`.
     pub fn written_end(&self, extents: &BTreeMap<u64, ExtentId>) -> u64 {
         extents

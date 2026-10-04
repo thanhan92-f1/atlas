@@ -10,11 +10,15 @@ WAL checkpoint/compaction, device-space free lists, and a Raft core that replica
 For every metadata mutation:
 
 1. build a `MetaCommand`;
-2. apply it to a copy of the catalog; a command that fails validation is rejected here and never logged;
+2. under the catalog write lock, apply it in place; a command that fails validation is rejected
+   here, leaves the catalog untouched (asserted in debug builds) and is never logged;
 3. append `{term,index,command}` to `metadata.wal`;
 4. `fsync` the WAL;
-5. publish the new catalog in memory;
-6. atomically replace `catalog.json` and fsync the directory.
+5. release the lock, publishing the new state. If the append fails, the catalog is reloaded from
+   disk (`catalog.json` plus the WAL), since whether the record landed is unknown.
+
+`catalog.json` is only rewritten at a checkpoint (below), not on every commit: one fsync per
+commit instead of three, and no per-commit cost that grows with the catalog.
 
 On restart, Atlas loads `catalog.json` and replays every WAL record whose index is greater than
 `catalog.applied_index`. A torn final WAL line (a record that never finished its fsync, so was never
@@ -22,9 +26,14 @@ acknowledged) is discarded on open; corruption anywhere else is a hard error.
 
 ## Checkpoint and WAL compaction
 
-`catalog.json` already durably covers every applied index, so WAL records at or below it are
-redundant. The engine compacts the WAL once it holds `EngineConfig::wal_compact_after` records
-(default 1024, `0` disables) and on an explicit `NativeEngine::checkpoint()`. Compaction rewrites the
+A checkpoint writes `catalog.json`, which then durably covers every applied index, so WAL records at
+or below it are redundant. The engine checkpoints and compacts the WAL once it holds
+`EngineConfig::wal_compact_after` records (default 1024, `0` disables) or half the catalog's object
+count (extents plus inodes), whichever is more, and on an explicit `NativeEngine::checkpoint()`. A
+checkpoint costs time proportional to the catalog, so tying the interval to the catalog's size
+keeps the cost per commit flat as the namespace grows; half (rather than all) of the object count
+keeps a create-only workload, which adds one object per record, compacting at geometrically
+spaced points. Raft compacts its log on the same rule (`RaftConfig::compact_after`). Compaction rewrites the
 log through a temp file + fsync + rename + directory fsync. After compaction the WAL may be empty, so
 its index floor is raised to `catalog.applied_index` on open to keep indexes monotonic.
 
@@ -61,8 +70,14 @@ messages with `step()` and sends whatever `take_messages()` returns. Implemented
   index) and a conflict hint so the leader backs off a whole term at a time;
 - leader commit only for entries of its own term (a new leader appends a `Noop` to commit earlier
   ones), quorum = majority of voters including itself;
-- log compaction after `compact_after` applied entries and `InstallSnapshot` (the leader's applied
-  catalog) for followers behind the compaction point;
+- pipelined replication: the leader advances a follower's `next_index` as soon as it sends
+  entries, so each proposal ships only new entries; a rejection (or the next heartbeat's
+  consistency check after a lost message) rewinds it, and an acknowledgement never moves it back.
+  Without this, concurrent proposals each resent the whole unacknowledged tail and throughput
+  collapsed under load;
+- log compaction after `compact_after` applied entries (and at least half the catalog's object
+  count, see "Checkpoint and WAL compaction") and `InstallSnapshot` (the leader's applied catalog)
+  for followers behind the compaction point;
 - pre-vote: a node whose election timer fires first asks for pre-votes for `term + 1` without
   changing anyone's term, and only campaigns once a majority would vote for it, so a partitioned
   node cannot inflate its term and depose a healthy leader when it rejoins;
