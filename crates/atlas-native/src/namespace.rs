@@ -219,6 +219,15 @@ pub enum FsOp {
         size: u64,
         now_ns: i64,
     },
+    /// [`FsOp::InstallFileExtent`] for several extents of one write (each at its own
+    /// `logical_offset`), committed as one entry.
+    InstallFileExtents {
+        fs: FsId,
+        ino: u64,
+        extents: Vec<ExtentRef>,
+        size: u64,
+        now_ns: i64,
+    },
     /// Freezes the whole inode table; shares every file extent.
     SnapshotFs {
         id: SnapshotId,
@@ -771,6 +780,32 @@ impl Catalog {
                 self.add_extent_ref(extent);
                 if let Some(old) = old {
                     self.dec_ref(&old, gc)?;
+                }
+            }
+            FsOp::InstallFileExtents {
+                fs,
+                ino,
+                extents: new,
+                size: at_least,
+                now_ns,
+            } => {
+                let i = self.fs_mut(fs)?.inode_mut(*ino)?;
+                let InodeKind::File { size, extents } = &mut i.kind else {
+                    return Err(MetaError::IsDir(format!(
+                        "inode {ino} is not a regular file"
+                    )));
+                };
+                let old: Vec<ExtentId> = new
+                    .iter()
+                    .filter_map(|e| extents.insert(e.logical_offset, e.id.clone()))
+                    .collect();
+                *size = (*size).max(*at_least);
+                i.touch(*now_ns);
+                for e in new {
+                    self.add_extent_ref(e);
+                }
+                for o in old {
+                    self.dec_ref(&o, gc)?;
                 }
             }
             FsOp::SnapshotFs {

@@ -88,8 +88,10 @@ atlas-native-mount ... --fs <id> --snapshot <snapshot-id> /mnt/data-at-snap   # 
 Options: `--identity-file` (client certificate + key PEM), `--ttl-ms` (attribute and name cache,
 default 1000), `--writeback-bytes` (default 4 MiB), `--readahead-bytes` (default 4 MiB, 0 disables),
 `--max-io-bytes` (largest request, default 8 MiB; keep at or below the nodes' `max_request_bytes`),
-`--retry-secs` (default 30), `--read-only`, `--allow-other`. It runs in the foreground until
-`fusermount3 -u`; the mount uses `default_permissions`, so the kernel checks modes and ownership.
+`--retry-secs` (default 30), `--read-only`, `--allow-other`, `--fuse-threads` (kernel request
+workers, each with its own `/dev/fuse` fd, default 4) and `--direct-reads` (below). It runs in the
+foreground until `fusermount3 -u`; the mount uses `default_permissions`, so the kernel checks
+modes and ownership.
 
 - **Failover**: every call goes to the last endpoint that answered and moves on through 421s,
   503s and unreachable nodes until `--retry-secs` runs out. Creates reuse their `op_id` and writes
@@ -103,6 +105,35 @@ default 1000), `--writeback-bytes` (default 4 MiB), `--readahead-bytes` (default
 - **Unlink while open**: removing a file another handle in the same mount still has open renames it
   to a hidden `.atlas_hidden_<ino>_<n>` entry (not listed by `readdir`) and removes it on the last
   close, or at unmount.
+- **Direct reads** (`--direct-reads`): the leader only answers
+  `GET /v1/fs/<fs>/inodes/<ino>/layout?offset=&len=` (each extent's offset, length, SHA-256 and
+  replicas with their data-node addresses, in the order a read should try them); the client then
+  fetches the extents from the data nodes itself, in parallel, over the data-node protocol, and
+  verifies every checksum. An unreachable node, a checksum mismatch or a layout made stale by a
+  concurrent write falls back to reading through the leader. The client needs network access to
+  the data nodes; when they require mTLS, `--identity-file` must hold a certificate signed by the
+  cluster CA in `--ca-file`, and that identity is also accepted for writes by the data nodes, so
+  give it only to trusted clients. Direct reads take read traffic off the leader; on a single host
+  they cost an extra round trip (see the table below).
+
+## Data path
+
+- A read fetches all the extents it covers in parallel (up to 8 at once), each from a replica
+  chosen from the extent id so the load spreads over every replica; any replica that fails or
+  doesn't verify falls back to the next.
+- A write that spans several extents writes their replicas in parallel (up to 4 extents at once,
+  each to 3 nodes) and installs them all with one metadata commit (`install_extents` /
+  `install_file_extents`), so a 4 MiB write costs one Raft round trip, not four. All placements of
+  one write draw from one copy of the free list, so concurrent placements never reuse the same
+  free range.
+- Each data-node client keeps up to 8 idle connections, so concurrent requests to one node don't
+  queue behind a single socket; payloads over 16 KiB are written straight from the caller's
+  buffer.
+- The node HTTP server sets `TCP_NODELAY` and sends small responses in one write. Before it did,
+  every small reply waited for the client's delayed ACK (40 ms on Linux), which capped random
+  reads at about 24/s and sequential writes at 18 MiB/s regardless of hardware.
+- Upgrades: the two batched commands are new log entries, so upgrade every metadata node before
+  clients write through an upgraded leader; an older node cannot apply them.
 
 ## Consistency
 
@@ -174,8 +205,23 @@ disk latency but stay flat with the inode count (same run shape, no retries):
 The practical limit is now memory: about 6 KiB
 of leader RSS per inode, so plan on roughly 1M inodes per 8 GiB node.
 
-Data path, lab FUSE mount (3 nodes on one host, fio, one job, `psync`): 1 MiB sequential write
-12.5 MiB/s, sequential read 72.5 MiB/s cold, 4 KiB random read about 94 IOPS.
+Data path, FUSE mount, measured 2026-10-04: 3 nodes on one 12-core host (other tenants' load
+average around 25), node data on tmpfs so the shared HDDs don't mask software overhead, fio with
+one job and `psync` on a 256 MiB file, page cache dropped before each read test, release builds,
+two rounds each (ranges shown):
+
+| | Before | After | After, `--direct-reads` |
+| --- | --- | --- | --- |
+| 1 MiB sequential write | 18 MiB/s | 379 MiB/s | 348–350 MiB/s |
+| 1 MiB sequential read | 328–374 MiB/s | 369–405 MiB/s | 483–541 MiB/s |
+| 4 KiB random read | 23 IOPS | 588–606 IOPS | 510–519 IOPS |
+
+Most of the write and random-read gain is the `TCP_NODELAY` fix (see Data path); the rest is
+group commit and parallel extent I/O. A 4 KiB random read still fetches and checksums its whole
+extent (1 MiB by default). On the lab hosts' shared disks the same runs are bound by fsync latency
+and other tenants' I/O (pressure 50–80%), so they are not a fair measure of either build.
+`crates/atlas-native/tests/datapath_bench.rs` (`--ignored`) measures the engine alone over
+localhost data nodes.
 
 Known limits:
 
@@ -190,6 +236,8 @@ Known limits:
   filesystems.
 - The client reuses connections (one per concurrent request) but does not pipeline or batch
   requests, so each metadata operation is one round trip to the leader.
+- A read verifies whole extents, so a small random read transfers and checksums a full extent.
+- Writes always go through the leader; only reads can go direct.
 - Unlink-while-open works only within one mount (see Consistency).
 
 ## Verification
@@ -200,7 +248,10 @@ Known limits:
 - `crates/atlas-native/tests/node.rs`: the file API on a 3-node in-process cluster.
 - `crates/atlas-native-fuse/tests/ops.rs`: the FUSE operations layer against a live in-process
   cluster, including a leader failure mid-workload, unlink-while-open, read-only snapshot mounts,
-  clone isolation and concurrent creates.
+  clone isolation, concurrent creates, direct reads (across extents, after a rewrite) and their
+  fallback to the leader.
+- `crates/atlas-native/tests/allocator.rs`: one write's concurrent extent placements reuse
+  distinct free ranges (verified by reading back and scrubbing every replica).
 - `crates/atlas-driver-native/tests/nodes.rs` and `crates/atlas-gateway/tests/native_backend.rs`:
   filesystem create, snapshot, clone, restore and delete through the driver and the gateway.
 - Lab (2026-10-04), a 3-node cluster on one host with a FUSE mount: pjdfstest `unlink`, `mkdir`,

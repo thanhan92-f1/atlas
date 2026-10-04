@@ -5,11 +5,12 @@
 //! filesystem (or, with `--snapshot`, one of its snapshots read-only) through FUSE. Runs in the
 //! foreground until unmounted (`fusermount3 -u /mnt/point`).
 
-use std::{path::PathBuf, process::ExitCode, time::Duration};
+use std::{path::PathBuf, process::ExitCode, sync::Arc, time::Duration};
 
+use atlas_native::TlsIdentity;
 use atlas_native_fuse::{
     client::{Client, ClientConfig},
-    ops::{Ops, OpsConfig},
+    ops::{DirectReads, Ops, OpsConfig},
 };
 use clap::Parser;
 
@@ -61,6 +62,14 @@ struct Args {
     /// Let other users access the mount (needs `user_allow_other` in /etc/fuse.conf unless root).
     #[arg(long)]
     allow_other: bool,
+    /// Read file data straight from the data nodes (verified by checksum, falling back to the
+    /// leader on any failure). Needs network access to the data nodes; when they require mTLS,
+    /// `--identity-file` must hold a certificate signed by the cluster CA in `--ca-file`.
+    #[arg(long)]
+    direct_reads: bool,
+    /// Kernel request worker threads (Linux; each gets its own /dev/fuse fd).
+    #[arg(long, default_value_t = 4)]
+    fuse_threads: usize,
 }
 
 fn read(path: &Option<PathBuf>, what: &str) -> Result<Option<Vec<u8>>, String> {
@@ -76,6 +85,20 @@ fn ops(args: &Args) -> Result<Ops, String> {
     cfg.ca_pem = read(&args.ca_file, "CA file")?;
     cfg.identity_pem = read(&args.identity_file, "identity file")?;
     cfg.retry_for = Duration::from_secs(args.retry_secs);
+    let direct_reads = if args.direct_reads {
+        let identity = match (&cfg.ca_pem, &cfg.identity_pem) {
+            (Some(ca), Some(id)) => Some(Arc::new(
+                TlsIdentity::from_pem(ca, id, id).map_err(|e| format!("identity: {e}"))?,
+            )),
+            _ => None,
+        };
+        Some(DirectReads {
+            identity,
+            timeout: cfg.request_timeout,
+        })
+    } else {
+        None
+    };
     let client = Client::new(cfg).map_err(|e| e.to_string())?;
     let fs = match &args.snapshot {
         Some(s) => format!("{}@{s}", args.fs),
@@ -89,6 +112,7 @@ fn ops(args: &Args) -> Result<Ops, String> {
             writeback_bytes: args.writeback_bytes,
             readahead_bytes: args.readahead_bytes,
             max_io_bytes: args.max_io_bytes,
+            direct_reads,
         },
     );
     // Fail fast on a wrong endpoint, token or filesystem id instead of at first access.
@@ -112,6 +136,8 @@ fn mount(args: &Args, ops: Ops) -> Result<(), String> {
     if args.allow_other {
         cfg.acl = SessionACL::All;
     }
+    cfg.n_threads = Some(args.fuse_threads.max(1));
+    cfg.clone_fd = args.fuse_threads > 1;
     let fs = atlas_native_fuse::fuse::AtlasFs { ops };
     fuser::mount(fs, &args.mountpoint, &cfg).map_err(|e| format!("mount: {e}"))
 }

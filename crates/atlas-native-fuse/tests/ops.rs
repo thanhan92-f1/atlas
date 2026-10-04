@@ -4,16 +4,17 @@
 //! The FUSE operations layer against a live in-process cluster: 3 Raft metadata nodes and 3
 //! data nodes on localhost.
 
-use std::{collections::BTreeMap, net::TcpListener, path::Path, time::Duration};
+use std::{collections::BTreeMap, net::TcpListener, path::Path, sync::Arc, time::Duration};
 
 use atlas_native::{
     node::{DataNodeRole, DataNodeSpec, Listeners, MetadataRole, NativeNode, NodeConfig},
-    NodeType, SetAttr, ROOT_INO,
+    NodeType, SetAttr, TlsIdentity, ROOT_INO,
 };
 use atlas_native_fuse::{
     client::{Body, Client, ClientConfig, Retry},
-    ops::{Ops, OpsConfig},
+    ops::{DirectReads, Ops, OpsConfig},
 };
+use rcgen::{BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair};
 use reqwest::Method;
 use serde_json::json;
 
@@ -312,6 +313,77 @@ fn posix_operations_through_the_ops_layer() {
         snap.mknode(ROOT_INO, "n", NodeType::File, None, 0, 0, 0),
         Err(libc::EROFS)
     );
+}
+
+fn direct(identity: Option<Arc<TlsIdentity>>) -> OpsConfig {
+    OpsConfig {
+        readahead_bytes: 0,
+        direct_reads: Some(DirectReads {
+            identity,
+            timeout: Duration::from_secs(5),
+        }),
+        ..OpsConfig::default()
+    }
+}
+
+#[test]
+fn direct_reads_fetch_extents_from_the_data_nodes() {
+    let c = Cluster::start();
+    create_fs(&c, "dr");
+    let writer = mount(&c, "dr", OpsConfig::default());
+    let f = writer
+        .mknode(ROOT_INO, "data.bin", NodeType::File, None, 0o644, 0, 0)
+        .unwrap();
+    // Spans many 64 KiB extents and ends mid-extent.
+    let data: Vec<u8> = (0..700_001u32).map(|i| (i * 31 % 251) as u8).collect();
+    writer.write(f.ino, 0, &data).unwrap();
+    writer.flush(f.ino).unwrap();
+
+    let ops = mount(&c, "dr", direct(None));
+    assert_eq!(ops.read(f.ino, 0, 1 << 20).unwrap(), data);
+    assert_eq!(ops.read(f.ino, 65_530, 20).unwrap(), &data[65_530..65_550]);
+    assert_eq!(ops.read(f.ino, 699_990, 100).unwrap(), &data[699_990..]);
+    assert_eq!(ops.direct_fallbacks(), 0);
+
+    // A rewrite moves extents to new replicas; a fresh layout follows it.
+    writer.write(f.ino, 100_000, b"rewritten").unwrap();
+    writer.flush(f.ino).unwrap();
+    assert_eq!(ops.read(f.ino, 100_000, 9).unwrap(), b"rewritten");
+    assert_eq!(ops.direct_fallbacks(), 0);
+}
+
+#[test]
+fn direct_reads_fall_back_to_the_leader() {
+    let c = Cluster::start();
+    create_fs(&c, "fb");
+    let writer = mount(&c, "fb", OpsConfig::default());
+    let f = writer
+        .mknode(ROOT_INO, "x", NodeType::File, None, 0o644, 0, 0)
+        .unwrap();
+    let data: Vec<u8> = (0..200_000u32).map(|i| (i % 253) as u8).collect();
+    writer.write(f.ino, 0, &data).unwrap();
+    writer.flush(f.ino).unwrap();
+
+    // The test data nodes speak plaintext, so a client that insists on TLS can't use them.
+    let key = KeyPair::generate().unwrap();
+    let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    let ca = params.self_signed(&key).unwrap();
+    let issuer = Issuer::new(params, key);
+    let client_key = KeyPair::generate().unwrap();
+    let mut cp = CertificateParams::new(vec!["client".to_string()]).unwrap();
+    cp.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+    let cert = cp.signed_by(&client_key, &issuer).unwrap();
+    let identity = TlsIdentity::from_pem(
+        ca.pem().as_bytes(),
+        cert.pem().as_bytes(),
+        client_key.serialize_pem().as_bytes(),
+    )
+    .unwrap();
+
+    let ops = mount(&c, "fb", direct(Some(Arc::new(identity))));
+    assert_eq!(ops.read(f.ino, 0, 1 << 20).unwrap(), data);
+    assert!(ops.direct_fallbacks() > 0);
 }
 
 #[test]

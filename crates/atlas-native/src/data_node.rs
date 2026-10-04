@@ -41,6 +41,8 @@ use crate::{
 
 const MAX_HEADER: usize = 64 << 10;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Payloads up to this size are sent in the same write as their header.
+const SMALL_PAYLOAD: usize = 16 << 10;
 /// Largest payload accepted in either direction.
 pub const MAX_PAYLOAD: u64 = 256 << 20;
 
@@ -399,12 +401,16 @@ fn serve(mut stream: Conn, sh: &Shared) {
     }
 }
 
-/// Client for a [`DataNodeServer`]. Keeps one connection open and reconnects on failure.
+/// Idle connections a [`RemoteDevice`] keeps open for reuse.
+const MAX_IDLE_CONNS: usize = 8;
+
+/// Client for a [`DataNodeServer`]. Concurrent requests each use their own connection (one is
+/// opened when none is idle); up to [`MAX_IDLE_CONNS`] are kept open between requests.
 pub struct RemoteDevice {
     target: String,
     timeout: Duration,
     tls: Option<(Arc<ClientConfig>, ServerName<'static>)>,
-    conn: Mutex<Option<Conn>>,
+    idle: Mutex<Vec<Conn>>,
 }
 
 impl std::fmt::Debug for RemoteDevice {
@@ -424,7 +430,7 @@ impl RemoteDevice {
             target: target.to_string(),
             timeout,
             tls: None,
-            conn: Mutex::new(None),
+            idle: Mutex::new(Vec::new()),
         }
     }
 
@@ -439,7 +445,7 @@ impl RemoteDevice {
             target: target.to_string(),
             timeout,
             tls: Some((identity.client_config()?, tls::server_name(node_id)?)),
-            conn: Mutex::new(None),
+            idle: Mutex::new(Vec::new()),
         })
     }
 
@@ -468,12 +474,13 @@ impl RemoteDevice {
     /// Sends one request. A failure on a reused connection (e.g. the node restarted) is retried
     /// once on a fresh one; a retried append can therefore leave an unreferenced copy behind.
     fn call(&self, req: &Request, payload: &[u8]) -> Result<(Response, Vec<u8>), NativeError> {
-        let mut guard = self
-            .conn
+        let pooled = self
+            .idle
             .lock()
-            .map_err(|_| NativeError::Poisoned("remote device"))?;
-        let reused = guard.is_some();
-        let mut stream = match guard.take() {
+            .map_err(|_| NativeError::Poisoned("remote device"))?
+            .pop();
+        let reused = pooled.is_some();
+        let mut stream = match pooled {
             Some(s) => s,
             None => self.connect()?,
         };
@@ -484,7 +491,11 @@ impl RemoteDevice {
             }
             other => other,
         }?;
-        *guard = Some(stream);
+        if let Ok(mut idle) = self.idle.lock() {
+            if idle.len() < MAX_IDLE_CONNS {
+                idle.push(stream);
+            }
+        }
         match out.0 {
             Response::Fenced { current } => Err(NativeError::Fenced { current }),
             Response::Error { message } => Err(NativeError::Remote(message)),
@@ -538,6 +549,10 @@ impl BlockStore for RemoteDevice {
             other => Err(unexpected(other)),
         }
     }
+
+    fn endpoint(&self) -> Option<&str> {
+        Some(&self.target)
+    }
 }
 
 fn write_message(w: &mut impl Write, header: &impl Serialize, payload: &[u8]) -> io::Result<()> {
@@ -548,11 +563,18 @@ fn write_message(w: &mut impl Write, header: &impl Serialize, payload: &[u8]) ->
             "data-node message too large",
         ));
     }
-    let mut frame = Vec::with_capacity(4 + body.len() + payload.len());
-    frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
-    frame.extend_from_slice(&body);
-    frame.extend_from_slice(payload);
-    w.write_all(&frame)?;
+    // The header goes out in one write and a large payload in a second, rather than copying
+    // the payload into one frame buffer first.
+    let mut head = Vec::with_capacity(4 + body.len() + payload.len().min(SMALL_PAYLOAD));
+    head.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    head.extend_from_slice(&body);
+    if payload.len() <= SMALL_PAYLOAD {
+        head.extend_from_slice(payload);
+        w.write_all(&head)?;
+    } else {
+        w.write_all(&head)?;
+        w.write_all(payload)?;
+    }
     w.flush()
 }
 

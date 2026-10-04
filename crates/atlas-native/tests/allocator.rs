@@ -57,6 +57,28 @@ fn reclaimed_extent_space_is_reused() {
     assert_eq!(e.free_bytes().unwrap(), 0);
 }
 
+/// One write spanning many extents places them concurrently; each must get its own free range.
+#[test]
+fn concurrent_extent_placements_reuse_distinct_free_ranges() {
+    let td = tempfile::tempdir().unwrap();
+    let e = NativeEngine::open(cfg(td.path()), nodes()).unwrap();
+    let v = e.create_volume("v", 16 * 4096).unwrap();
+
+    e.write(&v, 0, &vec![1u8; 16 * 4096]).unwrap();
+    e.write(&v, 0, &vec![2u8; 16 * 4096]).unwrap();
+    assert_eq!(e.gc_once().unwrap().reclaimed, 16);
+
+    let data: Vec<u8> = (0..16 * 4096u32).map(|i| (i / 4096) as u8 + 10).collect();
+    e.write(&v, 0, &data).unwrap();
+    for n in ["n1", "n2", "n3"] {
+        assert_eq!(e.device_len(n).unwrap(), 2 * 16 * 4096, "{n} grew");
+    }
+    assert_eq!(e.free_bytes().unwrap(), 0);
+    assert_eq!(e.read(&v, 0, data.len()).unwrap(), data);
+    let st = e.repair_once().unwrap();
+    assert_eq!((st.replicas_repaired, st.unrecoverable), (0, 0));
+}
+
 #[test]
 fn partial_reuse_splits_free_range() {
     let td = tempfile::tempdir().unwrap();

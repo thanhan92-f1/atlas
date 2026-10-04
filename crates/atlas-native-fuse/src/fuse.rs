@@ -15,9 +15,9 @@ use atlas_native::{
 };
 use fuser::{
     AccessFlags, BsdFileFlags, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags,
-    Generation, INodeNo, LockOwner, OpenAccMode, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate,
-    ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite,
-    ReplyXattr, Request, TimeOrNow, WriteFlags,
+    Generation, INodeNo, KernelConfig, LockOwner, OpenAccMode, OpenFlags, RenameFlags, ReplyAttr,
+    ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs,
+    ReplyWrite, ReplyXattr, Request, TimeOrNow, WriteFlags,
 };
 
 use crate::ops::Ops;
@@ -125,6 +125,15 @@ macro_rules! tri {
 }
 
 impl Filesystem for AtlasFs {
+    fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> std::io::Result<()> {
+        // The kernel's default read-ahead (128 KiB) would cap sequential reads far below what
+        // the client's own read-ahead window can serve.
+        if let Err(max) = config.set_max_readahead(16 << 20) {
+            let _ = config.set_max_readahead(max);
+        }
+        Ok(())
+    }
+
     fn destroy(&mut self) {
         if let Err(e) = self.ops.flush_all() {
             tracing::error!(errno = e, "buffered writes lost at unmount");

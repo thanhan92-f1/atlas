@@ -620,6 +620,7 @@ dependencies = [
  "clap",
  "fuser",
  "libc",
+ "rcgen",
  "reqwest 0.13.5",
  "rustls",
  "serde",

@@ -35,6 +35,37 @@ pub struct Attr {
     pub ctime_ns: i64,
 }
 
+/// The extents behind a byte range of a file; see [`NativeEngine::file_layout`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileLayout {
+    pub offset: u64,
+    /// The requested length clipped to end of file; bytes not covered by an extent are zeros.
+    pub len: usize,
+    pub size: u64,
+    pub extents: Vec<LayoutExtent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LayoutExtent {
+    pub logical_offset: u64,
+    pub len: usize,
+    /// Hex SHA-256 of the whole extent.
+    pub checksum: String,
+    pub replicas: Vec<LayoutReplica>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LayoutReplica {
+    pub node_id: String,
+    /// The data node's address, absent for a local device or an unhealthy node.
+    pub endpoint: Option<String>,
+    pub offset: u64,
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DirEntry {
     pub name: String,
@@ -452,6 +483,70 @@ impl NativeEngine {
             Ok((self.extents_in(c, extents, grid, *size, offset, len)?, len))
         })?;
         self.read_range(extents, offset, len)
+    }
+
+    /// Where the bytes [`Self::read_file`] would return live: each overlapping extent with its
+    /// checksum and replicas (in the order a read should try them), so a client can fetch them
+    /// from the data nodes itself. Replicas on local devices carry no endpoint.
+    pub fn file_layout(
+        &self,
+        fs: &str,
+        ino: u64,
+        offset: u64,
+        len: usize,
+    ) -> Result<FileLayout, NativeError> {
+        let (extents, len, size) = self.with_fs(fs, |c, f| {
+            let InodeKind::File { size, extents } = &f.inode(ino)?.kind else {
+                return Err(NativeError::Invalid(format!(
+                    "inode {ino} is not a regular file"
+                )));
+            };
+            let len = (*size).saturating_sub(offset).min(len as u64) as usize;
+            if len == 0 {
+                return Ok((Vec::new(), 0, *size));
+            }
+            let grid = f.extent_bytes.unwrap_or(self.cfg.extent_bytes as u64);
+            Ok((
+                self.extents_in(c, extents, grid, *size, offset, len)?,
+                len,
+                *size,
+            ))
+        })?;
+        let extents = extents
+            .into_iter()
+            .map(|ext| {
+                let start = super::replica_start(&ext.id, ext.replicas.len());
+                let replicas = ext
+                    .replicas
+                    .iter()
+                    .cycle()
+                    .skip(start)
+                    .take(ext.replicas.len())
+                    .map(|r| LayoutReplica {
+                        node_id: r.node_id.clone(),
+                        endpoint: self
+                            .nodes
+                            .iter()
+                            .find(|n| n.spec.id == r.node_id && n.spec.healthy)
+                            .and_then(|n| n.devices.get(r.device_index))
+                            .and_then(|d| d.endpoint().map(str::to_string)),
+                        offset: r.offset,
+                    })
+                    .collect();
+                LayoutExtent {
+                    logical_offset: ext.logical_offset,
+                    len: ext.len,
+                    checksum: hex(&ext.checksum),
+                    replicas,
+                }
+            })
+            .collect();
+        Ok(FileLayout {
+            offset,
+            len,
+            size,
+            extents,
+        })
     }
 
     /// Freezes `fs` as a read-only snapshot (metadata only), with a caller-chosen id.

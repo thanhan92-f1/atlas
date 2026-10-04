@@ -178,6 +178,16 @@ fn inode_route(
             };
             Ok(Response::bytes(200, e.read_file(fs, ino, offset, len)?))
         }
+        ("GET", ["layout"]) => {
+            let (offset, len) = match read_range(sh, req) {
+                Ok(r) => r,
+                Err(r) => return Ok(r),
+            };
+            Ok(Response::json(
+                200,
+                &json!(e.file_layout(fs, ino, offset, len)?),
+            ))
+        }
         ("PUT", ["data"]) => {
             let offset = match query_u64(req, "offset") {
                 Ok(o) => o,
