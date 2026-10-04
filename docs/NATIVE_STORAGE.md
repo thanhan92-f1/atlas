@@ -29,7 +29,7 @@ The roadmap and the comparison it serves are in [`COMPARISON.md`](COMPARISON.md)
 | POSIX namespace and FUSE client | Done (`docs/NATIVE_FS.md`) |
 | Data path: parallel extent I/O, group commit, pooled data-node connections, direct client reads | Done (`docs/NATIVE_FS.md`, "Data path") |
 | `io_uring` device backend with `O_DIRECT` on raw NVMe, multi-device striping | Done (`docs/NATIVE_NODE.md`, "Devices"); verified on ext4, not yet benchmarked on NVMe |
-| Namespace sharded across Raft groups, on-disk catalog, client leases | Not started; one in-memory catalog |
+| Namespace sharded across Raft groups, on-disk catalog, client leases | Started: metadata commits no longer scale with catalog size and Raft replication is pipelined (`metadata_bench`: ~240k creates/s local, ~15k/s on a 3-voter group, flat to 20k files). Sharding, an on-disk KV catalog and leases are not started; one in-memory catalog per group |
 | Erasure coding, rebuild controller, S3 tiering of cold extents | Not started; 3 replicas |
 | RDMA transport, GPUDirect Storage, checkpoint fast path, CSI driver | Not started |
 | NFS, SMB and S3 front ends, POSIX ACLs, quotas, `O_DIRECT` | Not started |

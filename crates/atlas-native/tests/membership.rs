@@ -347,12 +347,16 @@ fn membership_survives_restart_and_compaction() {
     for id in all {
         s.restart(id);
     }
-    assert!(
-        s.stable_everywhere(&all, &four),
-        "membership lost on restart"
-    );
+    for id in all {
+        assert!(
+            matches!(s.node(id).membership(), Membership::Stable { voters } if *voters == four),
+            "{id}: membership lost on restart"
+        );
+    }
     assert!(s.node("m4").is_voter());
     s.elect();
+    // Entries above the last compaction re-apply once the new leader advertises its commit.
+    assert!(s.run_until(200, |s| s.stable_everywhere(&all, &four)));
     s.propose(create("post-restart"));
     assert!(s.run_until(200, |s| all.iter().all(|i| s.has_volume(i, "post-restart"))));
 }

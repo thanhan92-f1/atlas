@@ -119,7 +119,8 @@ fn wal_compacts_and_state_survives_reopen() {
     for i in 0..10u8 {
         e.write(&v, i as u64 * 4096, &[i; 16]).unwrap();
     }
-    assert!(e.wal_records().unwrap() < 4);
+    // 11 commits; compaction also waits for half the catalog's object count in records.
+    assert!(e.wal_records().unwrap() < 11);
     let applied = e.applied_index().unwrap();
     drop(e);
 
@@ -130,6 +131,21 @@ fn wal_compacts_and_state_survives_reopen() {
     }
     e.create_volume("w", 4096).unwrap();
     assert_eq!(e.applied_index().unwrap(), applied + 1);
+}
+
+#[test]
+fn a_create_only_workload_still_compacts_the_wal() {
+    let td = tempfile::tempdir().unwrap();
+    let mut c = cfg(td.path());
+    c.wal_compact_after = 4;
+    let e = NativeEngine::open(c, nodes()).unwrap();
+    for i in 0..400 {
+        e.create_volume(format!("v{i}"), 4096).unwrap();
+    }
+    // Each create adds an object, so the threshold grows with every record; half the object
+    // count keeps it reachable.
+    let records = e.wal_records().unwrap();
+    assert!(records <= 200, "{records} WAL records after 400 creates");
 }
 
 #[test]

@@ -83,9 +83,10 @@ pub struct RaftConfig {
     pub election_ticks: (u64, u64),
     pub heartbeat_ticks: u64,
     pub max_batch: usize,
-    /// Compact the log once twice this many applied entries sit above the last compaction point,
-    /// keeping the newest `compact_after` so a follower that is a little behind catches up through
-    /// AppendEntries rather than a full snapshot (0 disables compaction).
+    /// Compact the log once twice this many applied entries sit above the last compaction point
+    /// (and at least `compact_after` plus half the catalog's object count), keeping the newest
+    /// `compact_after` so a follower that is a little behind catches up through AppendEntries
+    /// rather than a full snapshot (0 disables compaction).
     pub compact_after: u64,
 }
 
@@ -762,7 +763,8 @@ impl RaftNode {
                 if success {
                     let m = self.match_index.entry(from.clone()).or_insert(0);
                     *m = (*m).max(match_index);
-                    let next = *m + 1;
+                    // next_index already moved past entries in flight; an ack never moves it back.
+                    let next = (*m + 1).max(self.next_index.get(&from).copied().unwrap_or(0));
                     self.next_index.insert(from.clone(), next);
                     // Covers every proposal appended since the last ack with one fsync.
                     self.wal.sync()?;
@@ -1050,6 +1052,11 @@ impl RaftNode {
         let start = (next - self.snapshot_index - 1) as usize;
         let end = (start + self.cfg.max_batch).min(self.log.len());
         let entries = self.log[start..end].to_vec();
+        if let Some(last) = entries.last() {
+            // Pipelining: the next send carries only newer entries. A rejection or a lost message
+            // (caught by the next heartbeat's consistency check) rewinds it.
+            self.next_index.insert(peer.clone(), last.index + 1);
+        }
         self.send(
             peer.clone(),
             Message::AppendEntries {
@@ -1125,7 +1132,12 @@ impl RaftNode {
     fn maybe_compact(&mut self) -> Result<(), RaftError> {
         let applied = self.catalog.applied_index;
         let keep = self.cfg.compact_after;
-        if keep == 0 || applied - self.snapshot_index < 2 * keep {
+        // Each compaction rewrites the whole catalog, so it waits for new entries numbering half
+        // the catalog's objects: the cost per entry stays flat as it grows, and a create-only
+        // workload (one object per entry) still compacts, at geometrically spaced points.
+        if keep == 0
+            || applied - self.snapshot_index < (2 * keep).max(keep + self.catalog.object_count() / 2)
+        {
             return Ok(());
         }
         let through = applied - keep;

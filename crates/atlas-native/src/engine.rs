@@ -126,7 +126,8 @@ pub struct EngineConfig {
     pub root: PathBuf,
     pub extent_bytes: usize,
     pub placement: PlacementPolicy,
-    /// Compact the WAL once it retains this many records (0 disables automatic compaction).
+    /// Compact the WAL once it retains this many records, or half as many as the catalog has
+    /// objects if that is more (0 disables automatic compaction).
     pub wal_compact_after: u64,
     /// After an I/O failure a node is skipped for placement (and tried last for reads) for this
     /// long, then given another chance.
@@ -266,7 +267,10 @@ impl NativeEngine {
             return Err(NativeError::Invalid("extent_bytes must be > 0".into()));
         }
         if let Some((n, _)) = nodes.iter().find(|(_, d)| d.is_empty()) {
-            return Err(NativeError::Invalid(format!("node {} has no devices", n.id)));
+            return Err(NativeError::Invalid(format!(
+                "node {} has no devices",
+                n.id
+            )));
         }
         let runtimes = nodes
             .into_iter()
@@ -279,20 +283,7 @@ impl NativeEngine {
             .collect();
         let meta = match meta {
             MetaBackend::Local => {
-                fs::create_dir_all(&cfg.root)?;
-                let snapshot_path = cfg.root.join("catalog.json");
-                let mut catalog: Catalog = if snapshot_path.exists() {
-                    serde_json::from_slice(&fs::read(&snapshot_path)?)?
-                } else {
-                    Catalog::default()
-                };
-                let mut wal = Wal::open(cfg.root.join("wal"))?;
-                for rec in wal.replay::<MetaCommand>()? {
-                    if rec.index > catalog.applied_index {
-                        catalog.apply(rec.term, rec.index, &rec.command)?;
-                    }
-                }
-                wal.raise_floor(catalog.applied_index);
+                let (catalog, wal) = load_local(&cfg.root)?;
                 Meta::Local {
                     catalog: Box::new(RwLock::new(catalog)),
                     wal: Mutex::new(wal),
@@ -881,11 +872,7 @@ impl NativeEngine {
 
     /// Bytes in use across `node_id`'s devices.
     pub fn device_len(&self, node_id: &str) -> Result<u64, NativeError> {
-        self.node(node_id)?
-            .devices
-            .iter()
-            .map(|d| d.len())
-            .sum()
+        self.node(node_id)?.devices.iter().map(|d| d.len()).sum()
     }
 
     /// Records currently retained in the metadata log (the local WAL, or the Raft log above its
@@ -1256,15 +1243,35 @@ impl NativeEngine {
             index,
             command,
         };
-        // A record that fails to apply must never reach the WAL, or every later replay fails on it.
-        // The WAL still reaches stable storage before the new state becomes visible.
-        let mut next = c.clone();
-        next.apply(term, index, &rec.command)?;
-        wal.append(&rec)?;
-        *c = next;
-        self.persist_locked(&c)?;
-        if self.cfg.wal_compact_after > 0 && wal.len() >= self.cfg.wal_compact_after {
-            // catalog.json now durably covers `index`, so every record up to it is redundant.
+        // A record that fails to apply must never reach the WAL, or every later replay fails on
+        // it. `apply` leaves the catalog untouched when it rejects a command, so it runs in place;
+        // readers wait on the write lock, so the new state is only visible once the WAL is durable.
+        #[cfg(debug_assertions)]
+        let before = serde_json::to_value(&*c)?;
+        if let Err(e) = c.apply(term, index, &rec.command) {
+            #[cfg(debug_assertions)]
+            assert_eq!(
+                serde_json::to_value(&*c)?,
+                before,
+                "a rejected command changed the catalog"
+            );
+            return Err(e.into());
+        }
+        if let Err(e) = wal.append(&rec) {
+            // Whether the record reached disk is unknown: reload what a restart would see.
+            let (disk, reopened) = load_local(&self.cfg.root)?;
+            *c = disk;
+            *wal = reopened;
+            return Err(e.into());
+        }
+        // Checkpoints rewrite the whole catalog, so the WAL may hold records numbering half the
+        // catalog's objects before one: the cost per commit stays flat as it grows, and a
+        // create-only workload (one object per record) still checkpoints.
+        if self.cfg.wal_compact_after > 0
+            && wal.len() >= self.cfg.wal_compact_after.max(c.object_count() / 2)
+        {
+            // Once catalog.json durably covers `index`, every record up to it is redundant.
+            self.persist_locked(&c)?;
             wal.compact_through(index)?;
         }
         Ok(())
@@ -1313,8 +1320,27 @@ impl NativeEngine {
     }
 
     fn persist_locked(&self, catalog: &Catalog) -> Result<(), NativeError> {
-        let bytes = serde_json::to_vec_pretty(catalog)?;
+        let bytes = serde_json::to_vec(catalog)?;
         durable::write_atomic(&self.cfg.root.join("catalog.json"), &bytes)?;
         Ok(())
     }
+}
+
+/// `catalog.json` plus every WAL record past it.
+fn load_local(root: &Path) -> Result<(Catalog, Wal), NativeError> {
+    fs::create_dir_all(root)?;
+    let snapshot_path = root.join("catalog.json");
+    let mut catalog: Catalog = if snapshot_path.exists() {
+        serde_json::from_slice(&fs::read(&snapshot_path)?)?
+    } else {
+        Catalog::default()
+    };
+    let mut wal = Wal::open(root.join("wal"))?;
+    for rec in wal.replay::<MetaCommand>()? {
+        if rec.index > catalog.applied_index {
+            catalog.apply(rec.term, rec.index, &rec.command)?;
+        }
+    }
+    wal.raise_floor(catalog.applied_index);
+    Ok((catalog, wal))
 }
