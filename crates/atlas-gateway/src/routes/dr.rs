@@ -145,9 +145,13 @@ pub(crate) async fn rbd_of_volume(s: &AppState, volume_id: &str) -> AppResult<(S
 pub(crate) struct MirrorQuery {
     mode: Option<String>,
     peer: Option<String>,
+    /// `secondary`: record this site's copy of an image the peer mirrors to us instead of enabling
+    /// mirroring here. Defaults to `primary`.
+    role: Option<String>,
 }
 
-/// `POST /volumes/{id}/mirror?mode=snapshot&peer=<id>` — enable RBD mirroring for a volume (admin).
+/// `POST /volumes/{id}/mirror?mode=snapshot&peer=<id>[&role=secondary]` — enable RBD mirroring for
+/// a volume, or register the peer site's non-primary copy so it can later be promoted (admin).
 pub(crate) async fn enable_mirror(
     State(s): State<AppState>,
     Extension(actor): Extension<Actor>,
@@ -178,11 +182,68 @@ pub(crate) async fn enable_mirror(
         }
         None
     };
+    let role = q.role.as_deref().unwrap_or("primary");
+    if !matches!(role, "primary" | "secondary") {
+        return Err(AppError::Validation(
+            "role must be primary or secondary".into(),
+        ));
+    }
     let mirror_id = ids::stable_id("drm", &format!("{rbd_pool}/{image}"));
     let real = matches!(
         s.config.ceph_driver_mode,
         atlas_common::config::CephDriverMode::Real
     );
+    let primary_here = if real {
+        atlas_driver_ceph::rbd_mirror_primary(&rbd_pool, &image)
+            .await
+            .map_err(|e| AppError::Unavailable(format!("rbd info {rbd_pool}/{image}: {e}")))?
+    } else {
+        None
+    };
+    // `rbd mirror image enable` on the peer's replicated copy is a successful no-op, so without
+    // this check that copy would be catalogued as an enabled primary.
+    if role == "primary" && primary_here == Some(false) {
+        return Err(AppError::Conflict(format!(
+            "{rbd_pool}/{image} is the peer's non-primary copy — register it with role=secondary"
+        )));
+    }
+    if role == "secondary" {
+        if real {
+            match primary_here {
+                Some(false) => {}
+                Some(true) => {
+                    return Err(AppError::Conflict(format!(
+                        "{rbd_pool}/{image} is primary on this cluster — enable it as primary instead"
+                    )))
+                }
+                None => {
+                    return Err(AppError::Conflict(format!(
+                        "{rbd_pool}/{image} is not mirrored here yet — enable it on the peer and wait for rbd-mirror to create it"
+                    )))
+                }
+            }
+        }
+        atlas_inventory::dr::upsert_mirror(
+            &s.pool,
+            &mirror_id,
+            "global",
+            Some(&volume_id),
+            &rbd_pool,
+            &image,
+            peer.as_deref(),
+            mode,
+            "secondary",
+            "enabled",
+        )
+        .await?;
+        return Ok((
+            StatusCode::CREATED,
+            Json(json!({
+                "mirror_id": mirror_id, "rbd": format!("{rbd_pool}/{image}"),
+                "role": "secondary", "state": "enabled",
+            })),
+        ));
+    }
     let state = if real { "enabling" } else { "enabled" };
     atlas_inventory::dr::upsert_mirror(
         &s.pool,
@@ -280,6 +341,16 @@ pub(crate) async fn demote_mirror(
     mirror_role_op(&s, &actor, &id, "demote", false).await
 }
 
+/// `POST /dr/mirrors/{id}/resync` — discard this cluster's non-primary copy and pull a full copy
+/// from the peer's primary; the way out of split-brain after a forced or one-way failback (admin).
+pub(crate) async fn resync_mirror(
+    State(s): State<AppState>,
+    Extension(actor): Extension<Actor>,
+    Path(id): Path<String>,
+) -> AppResult<(StatusCode, Json<Value>)> {
+    mirror_role_op(&s, &actor, &id, "resync", false).await
+}
+
 pub(crate) async fn mirror_role_op(
     s: &AppState,
     actor: &Actor,
@@ -307,6 +378,11 @@ pub(crate) async fn mirror_role_op(
                 "mirror {id} is already secondary"
             )));
         }
+        "resync" if role != "secondary" => {
+            return Err(AppError::Conflict(format!(
+                "resync discards this copy and needs role=secondary (have {role}); demote first"
+            )));
+        }
         "promote" if role != "secondary" && !force => {
             return Err(AppError::Conflict(format!(
                 "promote requires role=secondary (have {role}); use ?force=1 for unclean failover"
@@ -329,10 +405,10 @@ pub(crate) async fn mirror_role_op(
             let _ = atlas_inventory::dr::record_failover(&s.pool, id, force).await;
         }
     } else {
-        let pending = if action == "promote" {
-            "promoting"
-        } else {
-            "demoting"
+        let pending = match action {
+            "promote" => "promoting",
+            "resync" => "resyncing",
+            _ => "demoting",
         };
         atlas_inventory::dr::set_mirror(&s.pool, id, &role, pending).await?;
     }

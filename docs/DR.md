@@ -3,8 +3,8 @@
 # Cross-cluster DR (RBD mirroring)
 
 Atlas exposes a control-plane catalog and failover API for Ceph RBD mirroring. The real
-`rbd mirror` CLI paths run as jobs and still need a **live second Ceph cluster** to be
-production-verified. Fake mode (`ATLAS_CEPH_DRIVER_MODE=fake` / `make run`) exercises the full
+`rbd mirror` CLI paths run as jobs. They were verified live between two Rook Ceph clusters on
+2026-10-04 (see below). Fake mode (`ATLAS_CEPH_DRIVER_MODE=fake` / `make run`) exercises the full
 API and catalog without calling `rbd`.
 
 ## Status
@@ -16,8 +16,10 @@ API and catalog without calling `rbd`.
 | Role transition guards + force promote | Done |
 | Preflight + one-click failover runbook | Done (`control_plane_ready`; `dataplane_verified` now a config flag — see below) |
 | Fake-mode job success (no second cluster) | Done (`cargo test -p atlas-gateway --test dr`) |
-| Live two-site `rbd mirror` peer bootstrap | **Attempted, not completed** (2026-08-25 — see below) |
-| Live promote/demote drill through Atlas's API | **Pending** (blocked on the above) |
+| Live two-site `rbd mirror` peer bootstrap | **Verified** (2026-10-04, Rook `peers.secretNames`) |
+| Live enable / replicate / demote / failover through Atlas's API | **Verified** (2026-10-04) |
+| Secondary-site registration (`role=secondary`) + `resync` | **Verified** (2026-10-04) |
+| Two-way (`rx-tx`) replication, clean failback | Not run; the lab is one-way, see below |
 
 `GET /dr/status` and `GET /dr/preflight` both expose `control_plane_ready` (catalog coherent) and
 `dataplane_verified`. The latter used to be a hard-coded `false`; it's now `Config::
@@ -25,6 +27,58 @@ dr_dataplane_verified` (env `ATLAS_DR_DATAPLANE_VERIFIED`, default `false`) — 
 toggle an operator sets only after *personally* completing the checklist below against their own
 real hardware, never a blanket product claim. Preflight `ready` means you can enqueue a failover
 **job**; it is not a claim that Ceph mirroring is live.
+
+### 2026-10-04 live two-site drill: verified
+
+The setup is in [`deploy/rook-ceph-dr-lab/`](../deploy/rook-ceph-dr-lab/README.md):
+
+- **Primary:** a new host-networked Rook cluster `rook-ceph-dr` (Squid 19.2.3, fsid `e03b3aca…`)
+  on the second lab host. Its Ceph ports are firewalled to the peer's IP.
+- **Secondary:** the first lab host's existing pod-networked cluster (fsid `7785878b…`), running a
+  `CephRBDMirror`.
+- **Atlas:** a real-Ceph gateway on each site.
+
+Both August blockers are avoided:
+
+- Host networking makes the bootstrap token's `mon_host` the routable `v2:<host-ip>:3300`.
+- Rook imports the token itself (`CephBlockPool.spec.mirroring.peers.secretNames`) using admin
+  credentials, so there's no `site_name_set` permission error.
+
+What ran, all through the `/dr/*` API unless noted:
+
+1. On the primary, `POST /dr/peers`, `POST /rbd-images` (pool `atlas-dr-mirror-test`), then
+   `POST /volumes/{id}/mirror?mode=snapshot`. The job ran a real `rbd mirror image enable`.
+2. Wrote 32 MiB of random 4K writes (`rbd bench`). The secondary went `up+replaying`, and once it
+   was idle the image's SHA-256 matched the primary's. A second 16 MiB round matched again about
+   140 s after the writes stopped (1-minute snapshot schedule plus sync on an HDD-backed OSD),
+   recorded with `POST /dr/mirrors/{id}/rpo`.
+3. On the secondary, the gateway's discovery had already catalogued the replicated image.
+   `POST /volumes/{id}/mirror?role=secondary` registered it. Mirror ids hash `pool/image`, so
+   both sites agree on the id.
+4. **Planned failover:** `demote` on the primary. The secondary showed "remote image demoted"
+   within about 10 s, its preflight went `ready`, and `POST /dr/failover` promoted it without
+   force. Both images were identical, and the new primary accepted writes.
+5. **Failback in a one-way topology is split-brain.** After `demote` on the new primary, a
+   *non-forced* `promote` on the original primary succeeded. The original primary has no
+   `rbd-mirror`, so it never received the other side's writes, and its newest snapshot is its own
+   "demoted" one, which Ceph accepts. Result: the original primary silently lacked the 4 MiB the
+   other site wrote, and the other site reported `up+error split-brain`. Neither Ceph nor Atlas
+   can see this from the promoting side. In a one-way setup, treat failback as unclean.
+6. **Recovery:** `POST /dr/mirrors/{id}/resync` on the split-brained secondary
+   (`rbd mirror image resync`). It went `up+replaying`, then idle, and its checksum matched the
+   primary again.
+
+Bugs found and fixed on the way:
+
+- Enabling mirroring as primary on the peer's replicated copy was a successful no-op in Ceph, so
+  Atlas catalogued a read-only image as an enabled primary. A real-mode enable now checks
+  `rbd info` and returns 409, pointing at `role=secondary`.
+- There was no way to record the secondary side, and no `resync`. Both have been added.
+
+Not covered: two-way replication (it needs both clusters host-networked or otherwise mutually
+routable), journal-mode mirroring, and pool-mode mirroring. `rbd mirror image snapshot` (manual)
+segfaulted once in the gateway image's Squid client. Atlas doesn't call it; the pool's snapshot
+schedule takes the snapshots.
 
 ### 2026-08-25 real two-cluster attempt — what was reached, what blocked it
 
@@ -68,17 +122,19 @@ actually completed it.
 | `POST` | `/dr/peers` | Register peer (`secret_ref` = k8s Secret name, never the token) |
 | `GET` | `/dr/peers` | List peers |
 | `DELETE` | `/dr/peers/{id}` | Remove peer (+ dependent mirrors) |
-| `POST` | `/volumes/{id}/mirror?mode=snapshot&peer=` | Enable (requires a registered peer) |
+| `POST` | `/volumes/{id}/mirror?mode=snapshot&peer=` | Enable (requires a registered peer; 409 on the peer's non-primary copy) |
+| `POST` | `/volumes/{id}/mirror?role=secondary&peer=` | Register this site's non-primary copy (checked with `rbd info`; no CLI write) |
 | `DELETE` | `/volumes/{id}/mirror` | Disable |
 | `GET` | `/dr/mirrors` · `/dr/status` | Catalog + posture (`verified: false` until live) |
 | `GET` | `/dr/preflight` | Checklist before failover |
 | `POST` | `/dr/mirrors/{id}/demote` | Primary → secondary |
 | `POST` | `/dr/mirrors/{id}/promote?force=0\|1` | Secondary → primary (`force` = split-brain) |
+| `POST` | `/dr/mirrors/{id}/resync` | Discard this secondary copy and re-pull from the peer's primary |
 | `POST` | `/dr/failover` | `{ mirror_id, confirm: true, force? }` runbook |
 | `POST` | `/dr/mirrors/{id}/rpo` | `{ rpo_seconds }` observed RPO |
 
 Guards: promote of an already-primary mirror is **409** unless `?force=1`; demote of an already-secondary
-is **409**; disabled mirrors cannot be promoted/demoted.
+is **409**; resync of a primary is **409**; disabled mirrors cannot be promoted/demoted/resynced.
 
 ## Failover drill (fake)
 
@@ -98,6 +154,8 @@ curl -sS -X POST $B/dr/failover -H 'Content-Type: application/json' \
 ## Live two-site checklist (when a second cluster exists)
 
 1. Bootstrap RBD mirroring between sites (`rbd mirror pool peer bootstrap` / Rook CephRBDMirror).
+   The setup that worked (2026-10-04) is a host-networked primary plus Rook
+   `peers.secretNames` on the secondary; see `deploy/rook-ceph-dr-lab/`.
    **Gotcha (confirmed 2026-08-25):** the bootstrap token embeds the mon's address as whatever
    `mon_host` the local cluster resolves to — inside Kubernetes that's a ClusterIP, not routable
    from a genuinely separate cluster. Either NodePort/LoadBalancer-expose the mon (Rook won't do
@@ -114,6 +172,6 @@ curl -sS -X POST $B/dr/failover -H 'Content-Type: application/json' \
 5. Measure RPO and `POST /dr/mirrors/{id}/rpo`.
 6. Document site roles and force-promote policy for split-brain.
 
-Until step 1–6 are done on real hardware, treat DR as **control-plane complete, data-plane
-unverified** — and even then, only for the specific deployment that did it (see
-`Config::dr_dataplane_verified` above).
+Steps 1–6 were run on the 2026-10-04 lab (above). That verifies the code paths, not your
+deployment: set `ATLAS_DR_DATAPLANE_VERIFIED` only on a deployment whose own operator has drilled
+it (see `Config::dr_dataplane_verified` above).

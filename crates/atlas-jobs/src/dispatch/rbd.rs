@@ -311,7 +311,7 @@ pub(crate) async fn dispatch_rbd(
                             .await?;
                         let _ = atlas_inventory::dr::record_failover(pool, &mirror_id, force).await;
                     }
-                    "demote" => {
+                    "demote" | "resync" => {
                         atlas_inventory::dr::set_mirror(pool, &mirror_id, "secondary", "enabled")
                             .await?;
                     }

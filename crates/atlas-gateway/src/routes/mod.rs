@@ -82,6 +82,7 @@ pub fn router(state: AppState) -> Router {
         .route("/dr/preflight", get(dr_preflight))
         .route("/dr/mirrors/{id}/promote", post(promote_mirror))
         .route("/dr/mirrors/{id}/demote", post(demote_mirror))
+        .route("/dr/mirrors/{id}/resync", post(resync_mirror))
         .route("/dr/mirrors/{id}/rpo", post(set_mirror_rpo))
         .route("/dr/failover", post(dr_failover))
         .route("/protection-status", get(list_protection_status))
