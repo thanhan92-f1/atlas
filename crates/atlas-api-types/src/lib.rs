@@ -26,6 +26,8 @@ pub enum BackendType {
     Kubernetes,
     /// An atlas-native-node cluster (`atlas-driver-native`).
     Native,
+    /// A WEKA cluster, discovered read-only (`atlas-driver-weka`).
+    Weka,
 }
 
 /// How a backend is operated (PDF §6).

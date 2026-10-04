@@ -137,6 +137,9 @@ The longer comparison from earlier releases:
 | Kubernetes-native provisioning | Yes (via drivers) | No | Yes |
 | eBPF I/O observability, kept out of the control plane | Yes (`atlas-io`) | No | No |
 
+Compared with a parallel filesystem such as WEKA, including where WEKA is the better choice
+today: [docs/COMPARISON.md](docs/COMPARISON.md).
+
 ---
 
 ## See it live

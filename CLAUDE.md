@@ -152,6 +152,8 @@ integrations beyond the gRPC surface.
 - `crates/atlas-native-fuse` — `atlas-native-mount` FUSE client for native filesystems (`fuse`
   feature, Linux only; the kernel-independent `ops` layer is tested on any OS against in-process
   nodes). See `docs/NATIVE_FS.md`.
+- `crates/atlas-driver-weka` — read-only WEKA discovery over its REST API (`ATLAS_WEKA_ENABLE`, fake/real);
+ see `docs/COMPARISON.md`.
 - `crates/atlas-driver-k8s` — `kube-rs` read-only StorageClass/PVC/PV listing.
 - `crates/atlas-inventory` — read/upsert model against `sqlx::AnyPool` (SQLite or Postgres); also
   DB-backed rate-limit counters (`rate_limit.rs`).
