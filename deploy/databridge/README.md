@@ -62,7 +62,7 @@ Percona `Cluster` binds its PVCs on `zyvor-rbd-prod`; Atlas's reconciler advance
 | MySQL | live | live | live | live | live |
 | MariaDB | live | live | live | live | live |
 | MongoDB | live | live | live | live | live |
-| Oracle / SQL Server | live | via Debezium `initial` | advisory | live (podman) | pending |
+| Oracle / SQL Server | live | via Debezium `initial` | advisory | live | live |
 
 ## Lab CDC stack (`deploy/databridge/up.sh`)
 
