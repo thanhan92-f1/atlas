@@ -27,8 +27,11 @@ pub mod node;
 pub mod placement;
 pub mod raft;
 pub mod raft_server;
+pub mod raw;
 pub mod telemetry;
 pub mod tls;
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+pub mod uring;
 pub mod wal;
 
 pub use alloc::{FreeList, FreeRange};
@@ -45,4 +48,5 @@ pub use namespace::{FsId, FsOp, Inode, InodeKind, NodeType, SetAttr, XattrMode, 
 pub use placement::{FailureDomain, Node, PlacementPolicy};
 pub use raft::{Envelope, Message, RaftConfig, RaftCounters, RaftError, RaftNode, Role};
 pub use raft_server::{RaftServer, RaftStatus};
+pub use raw::{open_store, DeviceBackend};
 pub use tls::TlsIdentity;

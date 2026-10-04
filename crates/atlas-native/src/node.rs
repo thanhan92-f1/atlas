@@ -30,6 +30,7 @@ use crate::{
     placement::{FailureDomain, Node, PlacementPolicy},
     raft::{RaftConfig, RaftError, Role},
     raft_server::RaftServer,
+    raw::{open_store, DeviceBackend},
     tls::TlsIdentity,
 };
 
@@ -82,6 +83,18 @@ pub struct HttpTlsFiles {
 #[serde(deny_unknown_fields)]
 pub struct DataNodeRole {
     pub listen: SocketAddr,
+    /// Devices to serve, in index order. Empty: one `file` device at `<data_dir>/data/nvme0.data`.
+    #[serde(default)]
+    pub devices: Vec<DeviceConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeviceConfig {
+    /// A regular file, or a block device for the `aligned` and `io_uring` backends.
+    pub path: PathBuf,
+    #[serde(default)]
+    pub backend: DeviceBackend,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -128,6 +141,14 @@ pub struct DataNodeSpec {
     pub host: Option<String>,
     #[serde(default = "default_free_bytes")]
     pub free_bytes: u64,
+    /// How many devices that data node serves (its `data_node.devices`). Raise this only once
+    /// the data node runs a version that serves several devices.
+    #[serde(default = "default_devices")]
+    pub devices: usize,
+}
+
+fn default_devices() -> usize {
+    1
 }
 
 fn default_max_request_bytes() -> usize {
@@ -323,12 +344,24 @@ impl NativeNode {
                     Some(l) => l,
                     None => TcpListener::bind(role.listen)?,
                 };
-                let srv = DataNodeServer::start_with(
-                    cfg.node_id.clone(),
-                    cfg.data_dir.join("data"),
-                    l,
-                    tls.clone(),
-                )?;
+                let root = cfg.data_dir.join("data");
+                let srv = if role.devices.is_empty() {
+                    DataNodeServer::start_with(cfg.node_id.clone(), root, l, tls.clone())?
+                } else {
+                    let devices = role
+                        .devices
+                        .iter()
+                        .enumerate()
+                        .map(|(i, d)| open_store(&d.path, d.backend, &root.join(format!("dev{i}"))))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    DataNodeServer::start_devices(
+                        cfg.node_id.clone(),
+                        root,
+                        devices,
+                        l,
+                        tls.clone(),
+                    )?
+                };
                 data_addr = Some(srv.local_addr());
                 Some(srv)
             }
@@ -360,12 +393,14 @@ impl NativeNode {
                 let io_timeout = Duration::from_millis(m.proposal_timeout_ms);
                 let mut stores = Vec::new();
                 for d in &m.data_nodes {
-                    let dev: Arc<dyn BlockStore> = match &tls {
-                        Some(id) => {
-                            Arc::new(RemoteDevice::with_tls(&d.addr, &d.id, id, io_timeout)?)
-                        }
-                        None => Arc::new(RemoteDevice::new(&d.addr, io_timeout)),
-                    };
+                    let mut devs: Vec<Arc<dyn BlockStore>> = Vec::new();
+                    for index in 0..d.devices.max(1) {
+                        let dev = match &tls {
+                            Some(id) => RemoteDevice::with_tls(&d.addr, &d.id, id, io_timeout)?,
+                            None => RemoteDevice::new(&d.addr, io_timeout),
+                        };
+                        devs.push(Arc::new(dev.on_device(index)));
+                    }
                     let spec = Node {
                         id: d.id.clone(),
                         failure_domain: FailureDomain {
@@ -376,7 +411,7 @@ impl NativeNode {
                         free_bytes: d.free_bytes,
                         healthy: true,
                     };
-                    stores.push((spec, dev));
+                    stores.push((spec, devs));
                 }
                 let mut ecfg = EngineConfig::new(cfg.data_dir.join("engine"));
                 ecfg.extent_bytes = m.extent_bytes;
@@ -384,7 +419,7 @@ impl NativeNode {
                     replicas: m.replicas,
                     ..PlacementPolicy::default()
                 };
-                let engine = NativeEngine::open_with(
+                let engine = NativeEngine::open_with_devices(
                     ecfg,
                     stores,
                     MetaBackend::Raft {

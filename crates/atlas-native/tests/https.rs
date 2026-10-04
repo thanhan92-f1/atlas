@@ -121,6 +121,7 @@ fn start_node(root: &Path, server: &(String, String), client_ca: &str) -> Native
         }),
         data_node: Some(DataNodeRole {
             listen: data_l.local_addr().unwrap(),
+            devices: Vec::new(),
         }),
         metadata: Some(MetadataRole {
             listen: raft_l.local_addr().unwrap(),
@@ -133,6 +134,7 @@ fn start_node(root: &Path, server: &(String, String), client_ca: &str) -> Native
                 rack: None,
                 host: None,
                 free_bytes: 1 << 30,
+                devices: 1,
             }],
             replicas: 1,
             extent_bytes: 4096,

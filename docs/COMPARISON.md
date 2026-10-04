@@ -63,8 +63,8 @@ The atlas-native roadmap, in order, each phase gated on a published benchmark:
 
 1. **Data path:** clients read and write data nodes directly (striped across replicas) over a
    binary streaming protocol; an `io_uring` device backend with `O_DIRECT` on raw NVMe. Parallel
-   extent I/O, group commit and direct client reads are done; direct writes and `io_uring` are
-   not.
+   extent I/O, group commit, direct client reads, the `io_uring`/`O_DIRECT` backend and
+   multi-device striping are done; direct client writes and an NVMe benchmark are not.
 2. **Metadata scale:** namespace sharded across Raft groups, an on-disk catalog, client leases.
 3. **Efficiency:** erasure coding with a rebuild controller; cold extents tiered to S3.
 4. **AI:** RDMA transport, a GPUDirect Storage path, a checkpoint fast path, a CSI driver;

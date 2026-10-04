@@ -28,7 +28,7 @@ The roadmap and the comparison it serves are in [`COMPARISON.md`](COMPARISON.md)
 | Metadata WAL, one Raft group, extent refcounts and GC, repair | Done (`docs/NATIVE_NODE.md`) |
 | POSIX namespace and FUSE client | Done (`docs/NATIVE_FS.md`) |
 | Data path: parallel extent I/O, group commit, pooled data-node connections, direct client reads | Done (`docs/NATIVE_FS.md`, "Data path") |
-| `io_uring` device backend with `O_DIRECT` on raw NVMe, multi-device striping | Not started; devices are files |
+| `io_uring` device backend with `O_DIRECT` on raw NVMe, multi-device striping | Done (`docs/NATIVE_NODE.md`, "Devices"); verified on ext4, not yet benchmarked on NVMe |
 | Namespace sharded across Raft groups, on-disk catalog, client leases | Not started; one in-memory catalog |
 | Erasure coding, rebuild controller, S3 tiering of cold extents | Not started; 3 replicas |
 | RDMA transport, GPUDirect Storage, checkpoint fast path, CSI driver | Not started |

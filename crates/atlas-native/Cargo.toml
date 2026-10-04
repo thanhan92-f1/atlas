@@ -11,7 +11,12 @@ authors.workspace = true
 name = "atlas-native-node"
 path = "src/bin/atlas-native-node.rs"
 
+[features]
+# io_uring + O_DIRECT device backend for data nodes (Linux only).
+io-uring = ["dep:io-uring"]
+
 [dependencies]
+libc = "0.2"
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -19,6 +24,9 @@ uuid.workspace = true
 ring.workspace = true
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["ring", "std"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = { version = "0.7", optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true

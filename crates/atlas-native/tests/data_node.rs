@@ -11,8 +11,8 @@ use std::{
 };
 
 use atlas_native::{
-    BlockStore, DataNodeServer, EngineConfig, FailureDomain, MetaBackend, NativeEngine,
-    NativeError, Node, RaftConfig, RaftError, RaftServer, RemoteDevice,
+    open_store, BlockStore, DataNodeServer, DeviceBackend, EngineConfig, FailureDomain,
+    MetaBackend, NativeEngine, NativeError, Node, RaftConfig, RaftError, RaftServer, RemoteDevice,
 };
 
 const TICK: Duration = Duration::from_millis(10);
@@ -101,7 +101,7 @@ fn remote_device_round_trip_and_bounds() {
 
     let m = dn.render_metrics().unwrap();
     assert!(m.contains("atlas_native_data_requests_total{node=\"n1\",op=\"append\"} 2"));
-    assert!(m.contains("atlas_native_data_device_bytes{node=\"n1\"} 10"));
+    assert!(m.contains("atlas_native_data_device_bytes{node=\"n1\",device=\"0\"} 10"));
 }
 
 #[test]
@@ -164,6 +164,80 @@ fn engine_over_remote_data_nodes_survives_a_lost_replica() {
     assert_eq!(e.read(&v, 4096, 4096).unwrap(), vec![2u8; 4096]);
     // Three replicas are required and only two data nodes remain.
     assert!(e.write(&v, 0, &[5u8; 4096]).is_err());
+}
+
+#[test]
+fn engine_stripes_replicas_across_a_nodes_devices() {
+    let td = tempfile::tempdir().unwrap();
+    let backends = [
+        DeviceBackend::File,
+        DeviceBackend::Aligned,
+        DeviceBackend::Aligned,
+    ];
+    let servers: Vec<_> = (1..=3)
+        .map(|i| {
+            let root = td.path().join(format!("dn{i}"));
+            let devices = backends
+                .iter()
+                .enumerate()
+                .map(|(d, b)| {
+                    open_store(
+                        &root.join(format!("dev{d}.data")),
+                        *b,
+                        &root.join(format!("hwm{d}")),
+                    )
+                    .unwrap()
+                })
+                .collect();
+            DataNodeServer::start_devices(format!("n{i}"), &root, devices, bind(), None).unwrap()
+        })
+        .collect();
+    let stores = servers
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let devs = (0..backends.len())
+                .map(|d| {
+                    Arc::new(RemoteDevice::new(s.local_addr(), IO_TIMEOUT).on_device(d))
+                        as Arc<dyn BlockStore>
+                })
+                .collect();
+            (node(i + 1), devs)
+        })
+        .collect();
+    let e =
+        NativeEngine::open_with_devices(cfg(&td.path().join("meta")), stores, MetaBackend::Local)
+            .unwrap();
+    let v = e.create_volume("v", 6 * 4096).unwrap();
+    let data: Vec<u8> = (0..6 * 4096).map(|i| (i % 251) as u8).collect();
+    e.write(&v, 0, &data).unwrap();
+    assert_eq!(e.read(&v, 0, data.len()).unwrap(), data);
+    // Six extents over three devices: each device of each node holds two.
+    for (i, s) in servers.iter().enumerate() {
+        let m = s.render_metrics().unwrap();
+        for d in 0..backends.len() {
+            let dev = RemoteDevice::new(s.local_addr(), IO_TIMEOUT).on_device(d);
+            assert!(dev.len().unwrap() >= 2 * 4096, "n{} device {d}", i + 1);
+            assert!(m.contains(&format!("device=\"{d}\"")), "{m}");
+        }
+    }
+    // An unaligned overwrite inside one extent goes through read-modify-write on raw devices.
+    e.write(&v, 4096 + 100, b"patched").unwrap();
+    let mut want = data.clone();
+    want[4096 + 100..4096 + 107].copy_from_slice(b"patched");
+    assert_eq!(e.read(&v, 0, want.len()).unwrap(), want);
+}
+
+#[test]
+fn a_device_index_the_data_node_does_not_serve_is_rejected() {
+    let td = tempfile::tempdir().unwrap();
+    let dn = DataNodeServer::start("n1", td.path(), bind()).unwrap();
+    let dev = RemoteDevice::new(dn.local_addr(), IO_TIMEOUT).on_device(1);
+    assert!(matches!(dev.len(), Err(NativeError::Invalid(_))));
+    assert!(matches!(dev.append(1, b"x"), Err(NativeError::Invalid(_))));
+    // Device 0 on the same node still works.
+    let dev0 = RemoteDevice::new(dn.local_addr(), IO_TIMEOUT);
+    assert_eq!(dev0.append(1, b"x").unwrap(), 0);
 }
 
 struct RaftGroup {

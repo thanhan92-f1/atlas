@@ -190,6 +190,8 @@ struct NodeRuntime {
     spec: Node,
     devices: Vec<Arc<dyn BlockStore>>,
     health: NodeHealth,
+    /// Round-robin cursor striping new replicas across `devices`.
+    next_device: std::sync::atomic::AtomicUsize,
 }
 
 /// A node's health as the engine currently sees it.
@@ -249,15 +251,30 @@ impl NativeEngine {
         nodes: Vec<(Node, Arc<dyn BlockStore>)>,
         meta: MetaBackend,
     ) -> Result<Self, NativeError> {
+        let nodes = nodes.into_iter().map(|(n, d)| (n, vec![d])).collect();
+        Self::open_with_devices(cfg, nodes, meta)
+    }
+
+    /// [`Self::open_with`] with several devices per node (a replica's `device_index` is its
+    /// position); new replicas are striped across a node's devices.
+    pub fn open_with_devices(
+        cfg: EngineConfig,
+        nodes: Vec<(Node, Vec<Arc<dyn BlockStore>>)>,
+        meta: MetaBackend,
+    ) -> Result<Self, NativeError> {
         if cfg.extent_bytes == 0 {
             return Err(NativeError::Invalid("extent_bytes must be > 0".into()));
         }
+        if let Some((n, _)) = nodes.iter().find(|(_, d)| d.is_empty()) {
+            return Err(NativeError::Invalid(format!("node {} has no devices", n.id)));
+        }
         let runtimes = nodes
             .into_iter()
-            .map(|(spec, d)| NodeRuntime {
+            .map(|(spec, devices)| NodeRuntime {
                 spec,
-                devices: vec![d],
+                devices,
                 health: NodeHealth::default(),
+                next_device: std::sync::atomic::AtomicUsize::new(0),
             })
             .collect();
         let meta = match meta {
@@ -862,9 +879,13 @@ impl NativeEngine {
         self.with_catalog(|c| c.free.total_bytes())
     }
 
-    /// Size of `node_id`'s first device.
+    /// Bytes in use across `node_id`'s devices.
     pub fn device_len(&self, node_id: &str) -> Result<u64, NativeError> {
-        self.node(node_id)?.devices[0].len()
+        self.node(node_id)?
+            .devices
+            .iter()
+            .map(|d| d.len())
+            .sum()
     }
 
     /// Records currently retained in the metadata log (the local WAL, or the Raft log above its
@@ -980,11 +1001,11 @@ impl NativeEngine {
         p.family(
             "atlas_native_device_bytes",
             "gauge",
-            "Size of each reachable node's backing device.",
+            "Bytes in use across each reachable node's devices.",
         );
         for n in &self.nodes {
             // An unreachable data node has no sample rather than failing the whole scrape.
-            if let Ok(len) = n.devices[0].len() {
+            if let Ok(len) = n.devices.iter().map(|d| d.len()).sum::<Result<u64, _>>() {
                 p.sample(
                     "atlas_native_device_bytes",
                     &[("node", n.spec.id.as_str())],
@@ -1085,15 +1106,16 @@ impl NativeEngine {
     ) -> Result<Option<ReplicaRef>, NativeError> {
         let node = self.node(node_id)?;
         let len = data.len() as u64;
+        let device_index = node.next_device.fetch_add(1, Ordering::Relaxed) % node.devices.len();
         let free_off = {
             let mut free = alloc.lock().map_err(|_| NativeError::Poisoned("alloc"))?;
-            let off = free.find(node_id, 0, len);
+            let off = free.find(node_id, device_index, len);
             if let Some(off) = off {
-                free.reserve(node_id, 0, off, len);
+                free.reserve(node_id, device_index, off, len);
             }
             off
         };
-        let device = &node.devices[0];
+        let device = &node.devices[device_index];
         let written = match free_off {
             Some(off) => device.write_at(fence, off, data).map(|()| off),
             None => device.append(fence, data),
@@ -1103,7 +1125,7 @@ impl NativeEngine {
                 self.mark_up(node);
                 Ok(Some(ReplicaRef {
                     node_id: node_id.to_string(),
-                    device_index: 0,
+                    device_index,
                     offset,
                 }))
             }

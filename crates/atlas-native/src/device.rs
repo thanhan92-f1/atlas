@@ -3,7 +3,8 @@
 
 use std::{
     fs::{File, OpenOptions},
-    io::{Read, Seek, SeekFrom, Write},
+    io::{Seek, SeekFrom, Write},
+    os::unix::fs::FileExt,
     path::{Path, PathBuf},
     sync::Mutex,
 };
@@ -52,11 +53,14 @@ impl BlockStore for FileDevice {
     }
 }
 
+/// Appends are serialized (they extend the file); reads and in-place writes use positional I/O
+/// on a second handle and run concurrently.
 #[derive(Debug)]
 pub struct FileDevice {
     id: DeviceId,
     path: PathBuf,
     file: Mutex<File>,
+    positional: File,
 }
 
 impl FileDevice {
@@ -71,10 +75,12 @@ impl FileDevice {
             .read(true)
             .write(true)
             .open(&path)?;
+        let positional = file.try_clone()?;
         Ok(Self {
             id: DeviceId(Uuid::new_v4().to_string()),
             path,
             file: Mutex::new(file),
+            positional,
         })
     }
 
@@ -98,29 +104,20 @@ impl FileDevice {
 
     /// Overwrites `data.len()` bytes at `offset` (reuse of a freed range). Never extends the file.
     pub fn write_at(&self, offset: u64, data: &[u8]) -> Result<(), NativeError> {
-        let mut f = self
-            .file
-            .lock()
-            .map_err(|_| NativeError::Poisoned("device"))?;
-        let end = f.seek(SeekFrom::End(0))?;
+        let end = self.len()?;
         if offset + data.len() as u64 > end {
             return Err(NativeError::Invalid(format!(
                 "write_at {offset}+{} past device end {end}",
                 data.len()
             )));
         }
-        f.seek(SeekFrom::Start(offset))?;
-        f.write_all(data)?;
-        f.sync_data()?;
+        self.positional.write_all_at(data, offset)?;
+        self.positional.sync_data()?;
         Ok(())
     }
 
     pub fn len(&self) -> Result<u64, NativeError> {
-        let f = self
-            .file
-            .lock()
-            .map_err(|_| NativeError::Poisoned("device"))?;
-        Ok(f.metadata()?.len())
+        Ok(self.positional.metadata()?.len())
     }
 
     pub fn is_empty(&self) -> Result<bool, NativeError> {
@@ -128,13 +125,8 @@ impl FileDevice {
     }
 
     pub fn read_exact_at(&self, offset: u64, len: usize) -> Result<Vec<u8>, NativeError> {
-        let mut f = self
-            .file
-            .lock()
-            .map_err(|_| NativeError::Poisoned("device"))?;
-        f.seek(SeekFrom::Start(offset))?;
         let mut buf = vec![0u8; len];
-        f.read_exact(&mut buf)?;
+        self.positional.read_exact_at(&mut buf, offset)?;
         Ok(buf)
     }
 }

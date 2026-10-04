@@ -128,7 +128,7 @@ binary yet). All Raft series carry a `node` label:
   `atlas_native_wal_records`, `atlas_native_{volumes,snapshots,extents}`,
   `atlas_native_allocator_free_{bytes,ranges}`, `atlas_native_device_bytes{node}`;
 - data node: `atlas_native_data_requests_total{op}`, `atlas_native_data_{fenced_writes,errors,
-  written_bytes,read_bytes}_total`, `atlas_native_data_fence`, `atlas_native_data_device_bytes`.
+  written_bytes,read_bytes}_total`, `atlas_native_data_fence`, `atlas_native_data_device_bytes{node,device}`.
 
 ### Data nodes (`data_node` module)
 
