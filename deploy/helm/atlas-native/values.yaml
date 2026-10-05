@@ -28,6 +28,9 @@ node:
   proposalTimeoutMs: 5000
   repairIntervalSecs: 300
   gcIntervalSecs: 60
+  # Raft groups the metadata namespace is sharded across (1-64). May be raised on an existing
+  # cluster (objects stay in their group), never lowered.
+  metadataGroups: 1
   # Placement capacity hint per data node (bytes); defaults to the PVC size.
   freeBytes: 0
 

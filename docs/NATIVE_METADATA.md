@@ -204,6 +204,19 @@ redirect, and leader shutdown, failover and rejoin from disk. `tests/raft_groups
 groups on each node's one listener: they replicate independently, and one group failing over (its
 leader's server stopped, the listener kept) leaves the other groups' leaders and terms alone.
 
+### Namespace sharding (`node::shards`)
+
+A node with `metadata.groups > 1` runs one engine per group (each with its own catalog, WAL, free
+list and data-node fence) and routes each request to the group holding its id: new volumes and
+filesystems to `FNV-1a(id) % groups`, snapshots and clones to their source's group, and lookups by
+checking the local catalogs first and, on a miss, after a read barrier on every group. Data nodes
+allocate appends themselves, so groups share devices without coordinating; a range a group frees
+returns to that group's free list. Operations and placement rules are in `docs/NATIVE_NODE.md`,
+"Metadata groups"; `tests/node.rs` (`http_namespace_sharded_across_raft_groups`,
+`http_members_change_reaches_every_raft_group`) covers routing from every node, snapshot and clone
+placement, cross-group duplicate ids, merged lists and metrics, a node failure and a membership
+change across groups.
+
 ### Quorum configuration (`membership` module)
 
 Every Raft quorum decision (pre-votes, votes, commit acknowledgements, check-quorum) goes through

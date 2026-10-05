@@ -14,7 +14,8 @@ client, and "Atlas gateway" below for how the gateway drives it.
 - **Data nodes** serve `data_dir/data/nvme0.data` by default, or the devices listed in
   `data_node.devices` (see "Devices" below). Their `node_id` is the id the metadata replicas use
   for them (and their TLS server name).
-- **Metadata replicas** form one Raft group (3 or 5 voters) and all list the same `data_nodes`.
+- **Metadata replicas** form one Raft group (3 or 5 voters), or several sharing the same voters
+  (`metadata.groups`), and all list the same `data_nodes`.
   Only the leader accepts mutations; any replica serves reads from its applied state.
 
 A typical small cluster runs metadata and data roles on the same three hosts, or three metadata
@@ -72,6 +73,7 @@ data-node addresses are `host:port` and resolved on every connect, so DNS names 
 | `metadata.proposal_timeout_ms` | 5000 | Bounds leader readiness, each proposal and each data-node I/O. |
 | `metadata.repair_interval_secs` | 300 | Leader-only scrub/repair loop; 0 disables. |
 | `metadata.gc_interval_secs` | 60 | Leader-only GC loop; 0 disables. |
+| `metadata.groups` | 1 | Raft groups the namespace is sharded across (1–64), all on `metadata.listen`; see [Metadata groups](#metadata-groups). Every metadata node must use the same value. It can be raised later but never lowered. |
 | `data_nodes[].host` / `rack` / `zone` | `id` / `id` / empty | Failure domains for placement; replicas always land on distinct hosts. |
 | `data_nodes[].free_bytes` | 1 TiB | Placement capacity hint. |
 | `data_nodes[].devices` | 1 | How many devices that data node serves; new replicas are striped across them round-robin. |
@@ -117,9 +119,9 @@ silently landing on device 0. Requests for device 0 are unchanged on the wire.
 | Method and path | Auth | Description |
 | --- | --- | --- |
 | `GET /healthz` | no | Process is up. |
-| `GET /readyz` | no | 200 once a metadata leader is known (metadata role; a non-voter waiting to be added counts as ready) or the data node is serving; 503 otherwise, including after a fatal storage error. |
+| `GET /readyz` | no | 200 once every metadata group has a known leader (metadata role; a non-voter waiting to be added counts as ready) or the data node is serving; 503 otherwise, including after a fatal storage error. |
 | `GET /metrics` | no | Prometheus text: Raft/transport, engine, data node, and `atlas_native_{repair,gc}_{runs,errors}_total`. |
-| `GET /v1/status` | yes | Raft role/term/leader/indexes and voter flag, `layout` (`extent_bytes`, `replicas`), per-data-node health, last repair result, data-node fence. |
+| `GET /v1/status` | yes | Raft role/term/leader/indexes and voter flag (`metadata`, group 0; `metadata_groups` lists `{group, leader, ...}` for every group), `layout` (`extent_bytes`, `replicas`), per-data-node health, last repair result, data-node fence. |
 | `GET /v1/volumes` | yes | Volumes in the applied catalog. |
 | `POST /v1/volumes` | yes | `{"name": "...", "size_bytes": N, "id"?: "..."}` → 201 `{"id": "..."}`. An optional client-chosen `id` (1–64 of `[A-Za-z0-9-]`) makes the create idempotent: repeating it with the same parameters is a no-op, different parameters get 409. |
 | `DELETE /v1/volumes/{id}` | yes | 204. |
@@ -130,9 +132,9 @@ silently landing on device 0. Requests for device 0 are unchanged on the wire.
 | `POST /v1/snapshots/{id}/clone` | yes | `{"name": "...", "size_bytes"?: N, "id"?: "..."}` → 201 `{"id": "..."}`: a new volume sharing the snapshot's extents (copy-on-write; it survives deleting the snapshot and its source). `size_bytes` defaults to the snapshot's size and may only be larger. |
 | `DELETE /v1/snapshots/{id}` | yes | 204. |
 | `GET /v1/snapshots/{id}/data?offset=N&len=M` | yes | Same as the volume read, against the snapshot. |
-| `GET /v1/members` | yes | `{"membership": {"type": "stable", "voters": [...]}, "addrs": {id: "host:port"}}` (`type` is `joint` with `old`/`new` mid-change); `addrs` are the Raft addresses learned from membership changes. |
-| `POST /v1/members` | yes | `{"voters": {"<id>": "<host:port>", ...}}`: move to exactly this voter set (leader only) and return once the final configuration has committed. 409 while another change is in flight. |
-| `POST /v1/repair`, `POST /v1/gc` | yes | Run one pass now (leader only) and return its stats. |
+| `GET /v1/members` | yes | `{"membership": {"type": "stable", "voters": [...]}, "addrs": {id: "host:port"}}` (`type` is `joint` with `old`/`new` mid-change); `addrs` are the Raft addresses learned from membership changes; `groups` lists `{group, membership}` for every metadata group. |
+| `POST /v1/members` | yes | `{"voters": {"<id>": "<host:port>", ...}}`: move to exactly this voter set (leader only) and return once the final configuration has committed. 409 while another change is in flight. With several groups each node changes the groups it leads and answers 421 until every group has the new set, so repeat it across the metadata nodes until it returns 200. |
+| `POST /v1/repair`, `POST /v1/gc` | yes | Run one pass now over the groups this node leads (421 if it leads none) and return the summed stats. |
 | `/v1/fs/...`, `/v1/fs-snapshots/...` | yes | Filesystems, inodes, file data and filesystem snapshots/clones: see `docs/NATIVE_FS.md`. |
 
 Errors are JSON `{"error": "...", "code": "...", "leader": ...}`; `code` is a stable machine-readable
@@ -196,6 +198,30 @@ commits (bounded by `6 × proposal_timeout_ms`).
 - Change one voter at a time where possible and keep the voter count odd. Data placement
   (`data_nodes`) is separate from Raft membership: removing a data node from the config makes repair
   re-replicate its extents onto the remaining nodes (`POST /v1/repair` to run it now).
+
+## Metadata groups
+
+`metadata.groups: N` shards the namespace across N Raft groups. Every metadata node runs a replica
+of every group over its one `metadata.listen` port (frames carry their group), so the groups share
+voters but elect leaders independently and spread leadership, commits and catalog memory across
+the nodes. Each group keeps its own log, catalog and free list (`raft`/`engine` for group 0,
+`raft-g<N>`/`engine-g<N>` for the rest) and its own fence on every data node.
+
+- **Placement.** A new volume or filesystem goes to its id's home group (FNV-1a of the id, modulo
+  N). Snapshots and clones stay in their source's group, because they share its extents. Data nodes
+  are shared: each append is allocated by the data node, so groups never coordinate space.
+- **Routing.** Any node accepts any request and finds the group holding the id. It checks its local
+  catalogs first, and on a miss runs a read barrier on every group (`docs/NATIVE_METADATA.md`, "Read
+  barriers") before answering 404, so a lagging replica never misses a committed object. A create
+  or clone whose id another group already holds gets 409. Two concurrent creates of the same id
+  that land in different groups can both succeed; give every object a unique id.
+- **Lists** (`GET /v1/volumes`, `/v1/fs`) merge every group's catalog after a barrier on each.
+- **Health.** `/readyz` waits for a leader in every group, and the driver reports a group without
+  one as critical. `/metrics` labels engine metrics with `group`.
+- **Changing N.** Raising it is safe: existing objects stay where they are and are found by lookup.
+  Lowering it would orphan the objects in the removed groups, so a node whose data directory holds
+  a group at or above the configured count refuses to start. Every metadata node must use the same
+  value.
 
 ## Kubernetes
 

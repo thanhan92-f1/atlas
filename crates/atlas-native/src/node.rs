@@ -23,18 +23,20 @@ use serde_json::json;
 use crate::{
     data_node::{DataNodeServer, RemoteDevice},
     device::BlockStore,
-    engine::{EngineConfig, MetaBackend, NativeEngine, NativeError, RepairStats},
+    engine::{EngineConfig, MetaBackend, NativeEngine, NativeError, ObjectKind, RepairStats},
+    gc::GcStats,
     http::{Handler, HttpServer, Request, Response},
     metadata::MetaError,
-    metrics::PromText,
+    metrics::{self, PromText},
     placement::{FailureDomain, Node, PlacementPolicy},
     raft::{RaftConfig, RaftError, Role},
-    raft_server::RaftServer,
+    raft_server::{RaftMux, RaftServer},
     raw::{open_store, DeviceBackend},
     tls::TlsIdentity,
 };
 
 mod fs_api;
+mod shards;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -123,6 +125,11 @@ pub struct MetadataRole {
     /// 0 disables the background GC loop.
     #[serde(default = "default_gc_interval_secs")]
     pub gc_interval_secs: u64,
+    /// Raft groups the namespace is sharded across, all on `listen`. Every metadata node must
+    /// run the same number. Raising it later is safe (existing objects stay in their group);
+    /// lowering it would strand the objects of the groups dropped.
+    #[serde(default = "default_groups")]
+    pub groups: u32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -150,6 +157,11 @@ pub struct DataNodeSpec {
 fn default_devices() -> usize {
     1
 }
+fn default_groups() -> u32 {
+    1
+}
+/// Upper bound on `metadata.groups`: each group runs its own Raft log and engine.
+pub const MAX_GROUPS: u32 = 64;
 
 fn default_max_request_bytes() -> usize {
     64 << 20
@@ -245,6 +257,11 @@ impl NodeConfig {
             if m.tick_ms == 0 {
                 return invalid("metadata.tick_ms must be > 0".into());
             }
+            if !(1..=MAX_GROUPS).contains(&m.groups) {
+                return invalid(format!(
+                    "metadata.groups must be between 1 and {MAX_GROUPS}"
+                ));
+            }
             let mut ids: Vec<&str> = m.data_nodes.iter().map(|d| d.id.as_str()).collect();
             ids.sort_unstable();
             if ids.windows(2).any(|w| w[0] == w[1]) {
@@ -285,13 +302,50 @@ struct NodeShared {
     membership_timeout: Duration,
     /// `(extent_bytes, replicas)` of the metadata role, reported by `/v1/status`.
     layout: Option<(usize, usize)>,
-    raft: Option<Arc<RaftServer>>,
-    engine: Option<NativeEngine>,
+    /// The metadata groups this node replicates (empty without the metadata role).
+    groups: Vec<MetaGroup>,
     data: Mutex<Option<DataNodeServer>>,
     stop: AtomicBool,
     repair: TaskStats,
     gc: TaskStats,
     last_repair: Mutex<Option<RepairStats>>,
+}
+
+/// One metadata Raft group on this node and the engine committing through it.
+struct MetaGroup {
+    raft: Arc<RaftServer>,
+    engine: NativeEngine,
+}
+
+/// Group 0 keeps the directories of a node that predates groups.
+fn group_dir(root: &Path, name: &str, group: u32) -> PathBuf {
+    if group == 0 {
+        root.join(name)
+    } else {
+        root.join(format!("{name}-g{group}"))
+    }
+}
+
+/// Objects in a group above `groups` would become unreachable, so a lowered count is refused.
+fn refuse_fewer_groups(root: &Path, groups: u32) -> Result<(), NativeError> {
+    for entry in std::fs::read_dir(root)? {
+        let name = entry?.file_name();
+        let Some(g) = name
+            .to_str()
+            .and_then(|n| n.strip_prefix("raft-g"))
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if g >= groups {
+            return Err(NativeError::Invalid(format!(
+                "metadata.groups is {groups} but {} holds group {g}; the group count can be \
+                 raised but never lowered",
+                root.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 pub struct NativeNode {
@@ -369,71 +423,77 @@ impl NativeNode {
         };
 
         let mut raft_addr = None;
-        let (raft, engine, intervals) = match &cfg.metadata {
+        let mut groups = Vec::new();
+        let intervals = match &cfg.metadata {
             Some(m) => {
                 let l = match listeners.metadata {
                     Some(l) => l,
                     None => TcpListener::bind(m.listen)?,
                 };
+                refuse_fewer_groups(&cfg.data_dir, m.groups)?;
+                let mux = RaftMux::start(l, tls.as_ref())?;
+                raft_addr = Some(mux.local_addr());
                 let peers = cfg.raft_peers();
-                let mut rcfg = RaftConfig::new(
-                    cfg.node_id.clone(),
-                    peers.keys().cloned().collect(),
-                    cfg.data_dir.join("raft"),
-                );
-                rcfg.bootstrap = m.bootstrap.clone();
-                let server = Arc::new(RaftServer::start_with(
-                    rcfg,
-                    l,
-                    peers,
-                    Duration::from_millis(m.tick_ms),
-                    tls.clone(),
-                )?);
-                raft_addr = Some(server.local_addr());
                 let io_timeout = Duration::from_millis(m.proposal_timeout_ms);
-                let mut stores = Vec::new();
-                for d in &m.data_nodes {
-                    let mut devs: Vec<Arc<dyn BlockStore>> = Vec::new();
-                    for index in 0..d.devices.max(1) {
-                        let dev = match &tls {
-                            Some(id) => RemoteDevice::with_tls(&d.addr, &d.id, id, io_timeout)?,
-                            None => RemoteDevice::new(&d.addr, io_timeout),
+                for g in 0..m.groups {
+                    let mut rcfg = RaftConfig::new(
+                        cfg.node_id.clone(),
+                        peers.keys().cloned().collect(),
+                        group_dir(&cfg.data_dir, "raft", g),
+                    );
+                    rcfg.bootstrap = m.bootstrap.clone();
+                    let server = Arc::new(RaftServer::start_in(
+                        &mux,
+                        g,
+                        rcfg,
+                        peers.clone(),
+                        Duration::from_millis(m.tick_ms),
+                        tls.clone(),
+                    )?);
+                    let mut stores = Vec::new();
+                    for d in &m.data_nodes {
+                        let mut devs: Vec<Arc<dyn BlockStore>> = Vec::new();
+                        for index in 0..d.devices.max(1) {
+                            let dev = match &tls {
+                                Some(id) => RemoteDevice::with_tls(&d.addr, &d.id, id, io_timeout)?,
+                                None => RemoteDevice::new(&d.addr, io_timeout),
+                            };
+                            devs.push(Arc::new(dev.on_device(index).in_group(g)));
+                        }
+                        let spec = Node {
+                            id: d.id.clone(),
+                            failure_domain: FailureDomain {
+                                zone: d.zone.clone().unwrap_or_default(),
+                                rack: d.rack.clone().unwrap_or_else(|| d.id.clone()),
+                                host: d.host.clone().unwrap_or_else(|| d.id.clone()),
+                            },
+                            free_bytes: d.free_bytes,
+                            healthy: true,
                         };
-                        devs.push(Arc::new(dev.on_device(index)));
+                        stores.push((spec, devs));
                     }
-                    let spec = Node {
-                        id: d.id.clone(),
-                        failure_domain: FailureDomain {
-                            zone: d.zone.clone().unwrap_or_default(),
-                            rack: d.rack.clone().unwrap_or_else(|| d.id.clone()),
-                            host: d.host.clone().unwrap_or_else(|| d.id.clone()),
-                        },
-                        free_bytes: d.free_bytes,
-                        healthy: true,
+                    let mut ecfg = EngineConfig::new(group_dir(&cfg.data_dir, "engine", g));
+                    ecfg.extent_bytes = m.extent_bytes;
+                    ecfg.placement = PlacementPolicy {
+                        replicas: m.replicas,
+                        ..PlacementPolicy::default()
                     };
-                    stores.push((spec, devs));
+                    let engine = NativeEngine::open_with_devices(
+                        ecfg,
+                        stores,
+                        MetaBackend::Raft {
+                            server: server.clone(),
+                            timeout: io_timeout,
+                        },
+                    )?;
+                    groups.push(MetaGroup {
+                        raft: server,
+                        engine,
+                    });
                 }
-                let mut ecfg = EngineConfig::new(cfg.data_dir.join("engine"));
-                ecfg.extent_bytes = m.extent_bytes;
-                ecfg.placement = PlacementPolicy {
-                    replicas: m.replicas,
-                    ..PlacementPolicy::default()
-                };
-                let engine = NativeEngine::open_with_devices(
-                    ecfg,
-                    stores,
-                    MetaBackend::Raft {
-                        server: server.clone(),
-                        timeout: io_timeout,
-                    },
-                )?;
-                (
-                    Some(server),
-                    Some(engine),
-                    Some((m.repair_interval_secs, m.gc_interval_secs)),
-                )
+                Some((m.repair_interval_secs, m.gc_interval_secs))
             }
-            None => (None, None, None),
+            None => None,
         };
 
         let shared = Arc::new(NodeShared {
@@ -447,8 +507,7 @@ impl NativeNode {
                 .unwrap_or_default(),
             require_client_cert: cfg.http_tls.as_ref().is_some_and(|t| t.client_ca.is_some()),
             layout: cfg.metadata.as_ref().map(|m| (m.extent_bytes, m.replicas)),
-            raft,
-            engine,
+            groups,
             data: Mutex::new(data),
             stop: AtomicBool::new(false),
             repair: TaskStats::default(),
@@ -523,7 +582,7 @@ impl NativeNode {
     /// A storage error that stopped the metadata replica (e.g. a failed fsync), if any. The
     /// process should exit so its supervisor restarts it from disk.
     pub fn fatal_error(&self) -> Option<String> {
-        self.shared.raft.as_ref().and_then(|r| r.fatal_error())
+        self.shared.groups.iter().find_map(|g| g.raft.fatal_error())
     }
 
     pub fn shutdown(&mut self) {
@@ -548,16 +607,13 @@ impl Drop for NativeNode {
     }
 }
 
-/// Runs `task` every `every` while this replica is the metadata leader.
+/// Runs `task` every `every` on each metadata group this replica leads.
 fn maintenance(
     sh: &NodeShared,
     every: Duration,
     task: impl Fn(&NodeShared, &NativeEngine) -> Result<(), NativeError>,
     stats: impl Fn(&NodeShared) -> &TaskStats,
 ) {
-    let (Some(engine), Some(raft)) = (&sh.engine, &sh.raft) else {
-        return;
-    };
     let mut next = Instant::now() + every;
     while !sh.stop.load(Ordering::SeqCst) {
         if Instant::now() < next {
@@ -565,15 +621,17 @@ fn maintenance(
             continue;
         }
         next = Instant::now() + every;
-        if !raft.status().is_ok_and(|s| s.role == Role::Leader) {
-            continue;
-        }
-        let st = stats(sh);
-        st.runs.fetch_add(1, Ordering::Relaxed);
-        match task(sh, engine) {
-            Ok(()) | Err(NativeError::Raft(RaftError::NotLeader { .. })) => {}
-            Err(_) => {
-                st.errors.fetch_add(1, Ordering::Relaxed);
+        for g in &sh.groups {
+            if !g.raft.status().is_ok_and(|s| s.role == Role::Leader) {
+                continue;
+            }
+            let st = stats(sh);
+            st.runs.fetch_add(1, Ordering::Relaxed);
+            match task(sh, &g.engine) {
+                Ok(()) | Err(NativeError::Raft(RaftError::NotLeader { .. })) => {}
+                Err(_) => {
+                    st.errors.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
     }
@@ -679,8 +737,11 @@ fn read_range(sh: &NodeShared, req: &Request) -> Result<(u64, usize), Response> 
     Ok((offset, len as usize))
 }
 
-/// `{"voters": {"<id>": "<raft host:port>", ...}}`: the complete new voter set.
-fn change_members(sh: &NodeShared, r: &RaftServer, req: &Request) -> Response {
+/// `{"voters": {"<id>": "<raft host:port>", ...}}`: the complete new voter set. Each group's
+/// leader applies it to its group: this node changes the groups it leads, skips those already
+/// there, and answers 421 while another node's groups still need it, so a client repeating the
+/// request across the metadata nodes (as it does for any 421) completes the change.
+fn change_members(sh: &NodeShared, req: &Request) -> Response {
     let body = match body_json(req) {
         Ok(b) => b,
         Err(r) => return r,
@@ -701,10 +762,32 @@ fn change_members(sh: &NodeShared, r: &RaftServer, req: &Request) -> Response {
     {
         return Response::text(400, format!("voter {id}: address {a:?} is not host:port"));
     }
-    match r.change_membership(voters, sh.membership_timeout) {
-        Ok(m) => Response::json(200, &json!({ "membership": m })),
-        Err(e) => error_response(e.into()),
+    let target = crate::membership::Membership::stable(voters.keys().cloned());
+    let mut first = None;
+    let mut elsewhere = None;
+    for g in &sh.groups {
+        match g
+            .raft
+            .change_membership(voters.clone(), sh.membership_timeout)
+        {
+            Ok(m) => {
+                first.get_or_insert(m);
+            }
+            Err(RaftError::NotLeader { leader }) => match g.raft.membership() {
+                Ok((m, _)) if m == target => {
+                    first.get_or_insert(m);
+                }
+                _ => {
+                    elsewhere.get_or_insert(leader);
+                }
+            },
+            Err(e) => return error_response(e.into()),
+        }
     }
+    if let Some(leader) = elsewhere {
+        return error_response(RaftError::NotLeader { leader }.into());
+    }
+    Response::json(200, &json!({ "membership": first }))
 }
 
 /// The optional client-chosen `"id"` of a create (repeating a create with the same id is a
@@ -752,28 +835,62 @@ fn handle(sh: &NodeShared, req: Request) -> Response {
     if let ("GET", ["v1", "status"]) = (req.method.as_str(), segs.as_slice()) {
         return status(sh);
     }
-    if let (Some(r), ["v1", "members"]) = (&sh.raft, segs.as_slice()) {
+    let Some(g0) = sh.groups.first() else {
+        return Response::text(404, "the metadata role is not enabled on this node");
+    };
+    if let ["v1", "members"] = segs.as_slice() {
         return match req.method.as_str() {
-            "GET" => match r.membership() {
-                Ok((m, addrs)) => Response::json(200, &json!({ "membership": m, "addrs": addrs })),
-                Err(e) => error_response(e.into()),
-            },
-            "POST" => change_members(sh, r, &req),
+            "GET" => {
+                let groups: Result<Vec<_>, _> = sh
+                    .groups
+                    .iter()
+                    .map(|g| {
+                        g.raft
+                            .membership()
+                            .map(|(m, _)| json!({ "group": g.raft.group(), "membership": m }))
+                    })
+                    .collect();
+                match (g0.raft.membership(), groups) {
+                    (Ok((m, addrs)), Ok(groups)) => Response::json(
+                        200,
+                        &json!({ "membership": m, "addrs": addrs, "groups": groups }),
+                    ),
+                    (Err(e), _) | (_, Err(e)) => error_response(e.into()),
+                }
+            }
+            "POST" => change_members(sh, &req),
             _ => Response::text(405, "GET or POST"),
         };
     }
-    let Some(e) = &sh.engine else {
-        return Response::text(404, "the metadata role is not enabled on this node");
-    };
     if let ["v1", "fs" | "fs-snapshots", ..] = segs.as_slice() {
-        return fs_api::route(sh, e, &req, &segs).unwrap_or_else(error_response);
+        return fs_api::route(sh, &req, &segs).unwrap_or_else(error_response);
     }
-    let result = match (req.method.as_str(), segs.as_slice()) {
-        ("GET", ["v1", "volumes"]) => e
-            .volumes()
-            .map(|v| Response::json(200, &json!({ "volumes": v }))),
+    volume_route(sh, &req, &segs)
+}
+
+/// The engine of the group holding volume `id`, else of the group a new one goes to.
+fn volume_engine<'a>(sh: &'a NodeShared, id: &str) -> Result<&'a NativeEngine, NativeError> {
+    Ok(&sh.route(ObjectKind::Volume, id)?.1.engine)
+}
+
+fn snapshot_engine<'a>(sh: &'a NodeShared, id: &str) -> Result<&'a NativeEngine, NativeError> {
+    Ok(&sh.route(ObjectKind::Snapshot, id)?.1.engine)
+}
+
+fn volume_route(sh: &NodeShared, req: &Request, segs: &[&str]) -> Response {
+    let result = match (req.method.as_str(), segs) {
+        ("GET", ["v1", "volumes"]) => sh
+            .groups
+            .iter()
+            .map(|g| g.engine.volumes())
+            .collect::<Result<Vec<_>, _>>()
+            .map(|v| {
+                let mut all: Vec<_> = v.into_iter().flatten().collect();
+                all.sort_by(|a, b| a.id.cmp(&b.id));
+                Response::json(200, &json!({ "volumes": all }))
+            }),
         ("POST", ["v1", "volumes"]) => {
-            let body = match body_json(&req) {
+            let body = match body_json(req) {
                 Ok(b) => b,
                 Err(r) => return r,
             };
@@ -788,38 +905,45 @@ fn handle(sh: &NodeShared, req: Request) -> Response {
                 Ok(id) => id,
                 Err(r) => return r,
             };
-            e.create_volume_as(id, name, size)
+            volume_engine(sh, &id)
+                .and_then(|e| e.create_volume_as(id, name, size))
                 .map(|id| Response::json(201, &json!({ "id": id })))
         }
-        ("DELETE", ["v1", "volumes", id]) => e.delete_volume(id).map(|()| Response::text(204, "")),
+        ("DELETE", ["v1", "volumes", id]) => volume_engine(sh, id)
+            .and_then(|e| e.delete_volume(id))
+            .map(|()| Response::text(204, "")),
         ("POST", ["v1", "volumes", id, "resize"]) => {
-            let body = match body_json(&req) {
+            let body = match body_json(req) {
                 Ok(b) => b,
                 Err(r) => return r,
             };
             let Some(size) = body["size_bytes"].as_u64() else {
                 return Response::text(400, "body must be {\"size_bytes\": integer}");
             };
-            e.resize_volume(id, size)
+            volume_engine(sh, id)
+                .and_then(|e| e.resize_volume(id, size))
                 .map(|()| Response::json(200, &json!({ "id": id, "size_bytes": size })))
         }
         ("PUT", ["v1", "volumes", id, "data"]) => {
-            let offset = match query_u64(&req, "offset") {
+            let offset = match query_u64(req, "offset") {
                 Ok(o) => o,
                 Err(r) => return r,
             };
-            e.write(id, offset, &req.body)
+            volume_engine(sh, id)
+                .and_then(|e| e.write(id, offset, &req.body))
                 .map(|()| Response::text(204, ""))
         }
         ("GET", ["v1", "volumes", id, "data"]) => {
-            let (offset, len) = match read_range(sh, &req) {
+            let (offset, len) = match read_range(sh, req) {
                 Ok(r) => r,
                 Err(r) => return r,
             };
-            e.read(id, offset, len).map(|b| Response::bytes(200, b))
+            volume_engine(sh, id)
+                .and_then(|e| e.read(id, offset, len))
+                .map(|b| Response::bytes(200, b))
         }
         ("POST", ["v1", "volumes", id, "snapshots"]) => {
-            let body = match body_json(&req) {
+            let body = match body_json(req) {
                 Ok(b) => b,
                 Err(r) => return r,
             };
@@ -830,14 +954,19 @@ fn handle(sh: &NodeShared, req: Request) -> Response {
                 Ok(id) => id,
                 Err(r) => return r,
             };
-            e.create_snapshot_as(sid, id, name)
+            // A snapshot shares its volume's extents, so it lives in the volume's group.
+            sh.route(ObjectKind::Volume, id)
+                .and_then(|(g, group)| {
+                    sh.claim(ObjectKind::Snapshot, &sid, g)?;
+                    group.engine.create_snapshot_as(sid, id, name)
+                })
                 .map(|sid| Response::json(201, &json!({ "id": sid })))
         }
-        ("DELETE", ["v1", "snapshots", id]) => {
-            e.delete_snapshot(id).map(|()| Response::text(204, ""))
-        }
+        ("DELETE", ["v1", "snapshots", id]) => snapshot_engine(sh, id)
+            .and_then(|e| e.delete_snapshot(id))
+            .map(|()| Response::text(204, "")),
         ("POST", ["v1", "snapshots", id, "clone"]) => {
-            let body = match body_json(&req) {
+            let body = match body_json(req) {
                 Ok(b) => b,
                 Err(r) => return r,
             };
@@ -853,58 +982,113 @@ fn handle(sh: &NodeShared, req: Request) -> Response {
                 Ok(id) => id,
                 Err(r) => return r,
             };
-            e.clone_snapshot_as(vid, id, name, size.as_u64())
+            // A clone shares the snapshot's extents, so it lives in the snapshot's group.
+            sh.route(ObjectKind::Snapshot, id)
+                .and_then(|(g, group)| {
+                    sh.claim(ObjectKind::Volume, &vid, g)?;
+                    group.engine.clone_snapshot_as(vid, id, name, size.as_u64())
+                })
                 .map(|vid| Response::json(201, &json!({ "id": vid })))
         }
         ("GET", ["v1", "snapshots", id, "data"]) => {
-            let (offset, len) = match read_range(sh, &req) {
+            let (offset, len) = match read_range(sh, req) {
                 Ok(r) => r,
                 Err(r) => return r,
             };
-            e.read_snapshot(id, offset, len)
+            snapshot_engine(sh, id)
+                .and_then(|e| e.read_snapshot(id, offset, len))
                 .map(|b| Response::bytes(200, b))
         }
-        ("POST", ["v1", "repair"]) => e.repair_once().map(|st| {
-            if let Ok(mut last) = sh.last_repair.lock() {
-                *last = Some(st);
-            }
-            Response::json(200, &json!(st))
-        }),
-        ("POST", ["v1", "gc"]) => e.gc_once().map(|st| Response::json(200, &json!(st))),
+        ("POST", ["v1", "repair"]) => repair_all(sh).map(|st| Response::json(200, &json!(st))),
+        ("POST", ["v1", "gc"]) => gc_all(sh).map(|st| Response::json(200, &json!(st))),
         _ => return Response::text(404, "no such route"),
     };
     result.unwrap_or_else(error_response)
 }
 
+/// The groups this node leads, or `NotLeader` (pointing at group 0's leader) if none.
+fn led_groups(sh: &NodeShared) -> Result<Vec<&MetaGroup>, NativeError> {
+    let led: Vec<&MetaGroup> = sh
+        .groups
+        .iter()
+        .filter(|g| g.raft.status().is_ok_and(|s| s.role == Role::Leader))
+        .collect();
+    if led.is_empty() {
+        let leader = sh
+            .groups
+            .first()
+            .and_then(|g| g.raft.status().ok())
+            .and_then(|s| s.leader);
+        return Err(RaftError::NotLeader { leader }.into());
+    }
+    Ok(led)
+}
+
+/// One repair pass over each group this node leads.
+fn repair_all(sh: &NodeShared) -> Result<RepairStats, NativeError> {
+    let mut st = RepairStats::default();
+    for g in led_groups(sh)? {
+        let r = g.engine.repair_once()?;
+        st.extents_checked += r.extents_checked;
+        st.replicas_repaired += r.replicas_repaired;
+        st.unrecoverable += r.unrecoverable;
+        st.deferred += r.deferred;
+    }
+    if let Ok(mut last) = sh.last_repair.lock() {
+        *last = Some(st);
+    }
+    Ok(st)
+}
+
+/// One GC pass over each group this node leads.
+fn gc_all(sh: &NodeShared) -> Result<GcStats, NativeError> {
+    let mut st = GcStats::default();
+    for g in led_groups(sh)? {
+        let r = g.engine.gc_once()?;
+        st.candidates += r.candidates;
+        st.reclaimed += r.reclaimed;
+        st.freed_bytes += r.freed_bytes;
+    }
+    Ok(st)
+}
+
 fn readiness(sh: &NodeShared) -> Response {
-    if let Some(r) = &sh.raft {
-        if let Some(err) = r.fatal_error() {
-            return Response::text(503, format!("metadata replica stopped: {err}"));
+    for g in &sh.groups {
+        let n = g.raft.group();
+        if let Some(err) = g.raft.fatal_error() {
+            return Response::text(503, format!("metadata replica (group {n}) stopped: {err}"));
         }
-        match r.status() {
+        match g.raft.status() {
             // A non-voter hears from no leader until it is added; it is ready to be added.
             Ok(s) if s.leader.is_some() || !s.voter => {}
-            _ => return Response::text(503, "no metadata leader known"),
+            _ => return Response::text(503, format!("no metadata leader known for group {n}")),
         }
     }
-    if sh.data.lock().map(|d| d.is_none()).unwrap_or(true) && sh.raft.is_none() {
+    if sh.data.lock().map(|d| d.is_none()).unwrap_or(true) && sh.groups.is_empty() {
         return Response::text(503, "no role running");
     }
     Response::text(200, "ready")
 }
 
 fn status(sh: &NodeShared) -> Response {
-    let raft = sh.raft.as_ref().and_then(|r| r.status().ok()).map(|s| {
-        json!({
-            "role": format!("{:?}", s.role).to_lowercase(),
-            "term": s.term,
-            "leader": s.leader,
-            "commit_index": s.commit_index,
-            "applied_index": s.applied_index,
-            "voter": s.voter,
+    let groups: Vec<serde_json::Value> = sh
+        .groups
+        .iter()
+        .filter_map(|g| {
+            g.raft.status().ok().map(|s| {
+                json!({
+                    "group": g.raft.group(),
+                    "role": format!("{:?}", s.role).to_lowercase(),
+                    "term": s.term,
+                    "leader": s.leader,
+                    "commit_index": s.commit_index,
+                    "applied_index": s.applied_index,
+                    "voter": s.voter,
+                })
+            })
         })
-    });
-    let nodes = sh.engine.as_ref().map(NativeEngine::node_status);
+        .collect();
+    let nodes = sh.groups.first().map(|g| g.engine.node_status());
     let last_repair = sh.last_repair.lock().ok().and_then(|l| *l);
     let fence = sh
         .data
@@ -915,7 +1099,9 @@ fn status(sh: &NodeShared) -> Response {
         200,
         &json!({
             "node_id": sh.id,
-            "metadata": raft,
+            // Group 0, as before groups existed; `metadata_groups` lists every group.
+            "metadata": groups.first(),
+            "metadata_groups": (!groups.is_empty()).then_some(&groups),
             "layout": sh.layout.map(|(e, r)| json!({ "extent_bytes": e, "replicas": r })),
             "data_nodes": nodes,
             "last_repair": last_repair,
@@ -925,16 +1111,23 @@ fn status(sh: &NodeShared) -> Response {
 }
 
 fn metrics(sh: &NodeShared) -> Response {
-    let mut out = String::new();
-    if let Some(r) = &sh.raft {
-        if let Ok(m) = r.render_metrics() {
-            out.push_str(&m);
+    let mut parts = Vec::new();
+    for g in &sh.groups {
+        if let Ok(m) = g.raft.render_metrics() {
+            parts.push(m);
         }
     }
-    if let Some(e) = &sh.engine {
-        if let Ok(m) = e.render_metrics() {
-            out.push_str(&m);
+    for g in &sh.groups {
+        if let Ok(m) = g.engine.render_metrics() {
+            // Several groups' engines are told apart by a group label.
+            parts.push(if sh.groups.len() > 1 {
+                metrics::with_label(&m, "group", &g.raft.group().to_string())
+            } else {
+                m
+            });
         }
+    }
+    if !sh.groups.is_empty() {
         let node = [("node", sh.id.as_str())];
         let mut p = PromText::new();
         for (task, st) in [("repair", &sh.repair), ("gc", &sh.gc)] {
@@ -955,17 +1148,17 @@ fn metrics(sh: &NodeShared) -> Response {
                     .sample(&name, &node, v.load(Ordering::Relaxed));
             }
         }
-        out.push_str(&p.finish());
+        parts.push(p.finish());
     }
     if let Ok(d) = sh.data.lock() {
         if let Some(m) = d.as_ref().and_then(|d| d.render_metrics().ok()) {
-            out.push_str(&m);
+            parts.push(m);
         }
     }
     Response {
         status: 200,
         content_type: "text/plain; version=0.0.4",
-        body: out.into_bytes(),
+        body: metrics::merge(&parts).into_bytes(),
     }
 }
 

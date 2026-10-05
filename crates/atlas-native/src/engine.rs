@@ -214,6 +214,15 @@ pub struct NodeStatus {
     pub failures: u64,
 }
 
+/// The kinds of catalog object an id can name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectKind {
+    Volume,
+    Snapshot,
+    Filesystem,
+    FsSnapshot,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct VolumeInfo {
     pub id: VolumeId,
@@ -846,6 +855,16 @@ impl NativeEngine {
             server.leader_ready(*timeout)?;
         }
         Ok(())
+    }
+
+    /// Whether this replica's applied catalog holds an object of `kind` named `id`.
+    pub fn holds(&self, kind: ObjectKind, id: &str) -> Result<bool, NativeError> {
+        self.with_catalog(|c| match kind {
+            ObjectKind::Volume => c.volumes.contains_key(id),
+            ObjectKind::Snapshot => c.snapshots.contains_key(id),
+            ObjectKind::Filesystem => c.filesystems.contains_key(id),
+            ObjectKind::FsSnapshot => c.fs_snapshots.contains_key(id),
+        })
     }
 
     /// Waits until this replica's catalog reflects every metadata write committed before the

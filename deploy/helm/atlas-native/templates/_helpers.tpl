@@ -99,7 +99,8 @@ helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version }}
     "tick_ms" (.Values.node.tickMs | int)
     "proposal_timeout_ms" (.Values.node.proposalTimeoutMs | int)
     "repair_interval_secs" (.Values.node.repairIntervalSecs | int)
-    "gc_interval_secs" (.Values.node.gcIntervalSecs | int)) -}}
+    "gc_interval_secs" (.Values.node.gcIntervalSecs | int)
+    "groups" (.Values.node.metadataGroups | int)) -}}
 {{- if .Values.tls.enabled -}}
 {{- $_ := set $cfg "tls" (dict "ca" "/etc/atlas-native/tls/ca.crt" "cert" "/etc/atlas-native/tls/tls.crt" "key" "/etc/atlas-native/tls/tls.key") -}}
 {{- end -}}

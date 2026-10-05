@@ -65,6 +65,11 @@ struct Cluster {
 impl Cluster {
     /// `meta` metadata-only nodes and `data` data-only nodes, all on localhost.
     fn start(meta: usize, data: usize, repair_interval_secs: u64) -> Self {
+        Self::start_groups(meta, data, repair_interval_secs, 1)
+    }
+
+    /// [`Self::start`] with the namespace sharded across `groups` Raft groups.
+    fn start_groups(meta: usize, data: usize, repair_interval_secs: u64, groups: u32) -> Self {
         let td = tempfile::tempdir().unwrap();
         std::fs::write(td.path().join("token"), format!("{TOKEN}\n")).unwrap();
         let data_l: BTreeMap<String, TcpListener> =
@@ -140,6 +145,7 @@ impl Cluster {
                 proposal_timeout_ms: 3000,
                 repair_interval_secs,
                 gc_interval_secs: 0,
+                groups,
             });
             let n = NativeNode::start_with(
                 cfg,
@@ -517,6 +523,29 @@ fn config_validation_rejects_bad_files() {
 }
 
 #[test]
+fn a_lowered_metadata_group_count_is_refused() {
+    let td = tempfile::tempdir().unwrap();
+    let dir = td.path().join("m1");
+    std::fs::create_dir_all(dir.join("raft-g2")).unwrap();
+    let cfg = |groups: u32| {
+        let body = format!(
+            r#"{{"node_id":"m1","data_dir":"{}","http_listen":"127.0.0.1:0",
+                "metadata":{{"listen":"127.0.0.1:0","peers":{{}},"replicas":1,"groups":{groups},
+                "data_nodes":[{{"id":"d1","addr":"127.0.0.1:1"}}]}}}}"#,
+            dir.display()
+        );
+        let p = td.path().join("cfg.json");
+        std::fs::write(&p, body).unwrap();
+        NodeConfig::from_file(&p).unwrap()
+    };
+    let err = NativeNode::start(cfg(2))
+        .err()
+        .expect("started with fewer groups");
+    assert!(err.to_string().contains("never lowered"), "{err}");
+    NativeNode::start(cfg(3)).expect("same group count");
+}
+
+#[test]
 fn http_members_list_and_remove_a_voter() {
     let c = Cluster::start(3, 3, 0);
     let (_, first) = c.meta_addrs()[0].clone();
@@ -789,4 +818,200 @@ fn http_file_api_on_a_three_node_cluster() {
     let (st, b) = call("POST", "/v1/gc", b"");
     assert_eq!(st, 200);
     assert!(json(&b)["reclaimed"].as_u64().unwrap() > 0);
+}
+
+#[test]
+fn http_namespace_sharded_across_raft_groups() {
+    const GROUPS: usize = 4;
+    let mut c = Cluster::start_groups(3, 3, 0, GROUPS as u32);
+    let ids: Vec<String> = (0..12).map(|i| format!("v{i}")).collect();
+    for (i, id) in ids.iter().enumerate() {
+        let body = format!(r#"{{"id":"{id}","name":"vol{i}","size_bytes":8192}}"#);
+        c.on_leader("POST", "/v1/volumes", body.as_bytes(), 201);
+        c.on_leader(
+            "PUT",
+            &format!("/v1/volumes/{id}/data?offset=0"),
+            &[i as u8 + 1; 4096],
+            204,
+        );
+    }
+
+    // Every node replicates every group, each with its own leader.
+    let (_, addr) = c.meta_addrs()[0].clone();
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let (_, b) = api(addr, "GET", "/v1/status", b"");
+        let groups = json(&b)["metadata_groups"].as_array().unwrap().clone();
+        assert_eq!(groups.len(), GROUPS);
+        if groups.iter().all(|g| g["leader"].is_string()) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "a group has no leader");
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    // The volumes spread over the groups; each group's engine reports its own share.
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let (_, b) = api(addr, "GET", "/metrics", b"");
+        let m = String::from_utf8(b).unwrap();
+        assert_eq!(m.matches("# TYPE atlas_native_volumes ").count(), 1, "{m}");
+        let per_group: Vec<u64> = (0..GROUPS)
+            .map(|g| {
+                let key = format!("atlas_native_volumes{{group=\"{g}\"}} ");
+                m.lines()
+                    .find_map(|l| l.strip_prefix(&key))
+                    .map_or(0, |v| v.parse().unwrap())
+            })
+            .collect();
+        if per_group.iter().sum::<u64>() == 12 {
+            assert!(
+                per_group.iter().filter(|n| **n > 0).count() >= 2,
+                "{per_group:?}"
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "volumes never replicated: {per_group:?}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    // A snapshot joins its volume's group and a clone its snapshot's, wherever their ids hash.
+    c.on_leader(
+        "POST",
+        "/v1/volumes/v3/snapshots",
+        br#"{"id":"s3","name":"snap"}"#,
+        201,
+    );
+    c.on_leader(
+        "POST",
+        "/v1/snapshots/s3/clone",
+        br#"{"id":"c3","name":"clone"}"#,
+        201,
+    );
+    c.wait_read("/v1/volumes/c3/data?offset=0&len=4096", &[4u8; 4096]);
+    // An id another group already holds is refused, not duplicated.
+    for id in &ids {
+        let body = format!(r#"{{"id":"{id}","name":"dup"}}"#);
+        let (st, _) = c.on_leader_any("POST", "/v1/snapshots/s3/clone", body.as_bytes());
+        assert_eq!(st, 409, "clone over {id}");
+    }
+    // Any node lists every group's volumes.
+    for (id, addr) in c.meta_addrs() {
+        let deadline = Instant::now() + WAIT;
+        loop {
+            let (_, b) = api(addr, "GET", "/v1/volumes", b"");
+            if json(&b)["volumes"].as_array().unwrap().len() == 13 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "{id} never listed every volume");
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    // Filesystems shard the same way; a listing needs no node to lead every group.
+    for f in 0..4 {
+        let body = format!(r#"{{"id":"f{f}","name":"fs{f}"}}"#);
+        c.on_leader("POST", "/v1/fs", body.as_bytes(), 201);
+        let (_, b) = c.on_leader(
+            "POST",
+            &format!("/v1/fs/f{f}/inodes/1/entries"),
+            br#"{"name":"a","op_id":"o1","kind":"file","mode":420}"#,
+            201,
+        );
+        let ino = json(&b)["ino"].as_u64().unwrap();
+        c.on_leader(
+            "PUT",
+            &format!("/v1/fs/f{f}/inodes/{ino}/data?offset=0"),
+            format!("hello {f}").as_bytes(),
+            200,
+        );
+        c.on_leader(
+            "POST",
+            &format!("/v1/fs/f{f}/snapshots"),
+            format!(r#"{{"id":"fs{f}","name":"snap"}}"#).as_bytes(),
+            201,
+        );
+        c.on_leader(
+            "POST",
+            &format!("/v1/fs-snapshots/fs{f}/clone"),
+            format!(r#"{{"id":"g{f}","name":"clone"}}"#).as_bytes(),
+            201,
+        );
+        c.wait_read(
+            &format!("/v1/fs/g{f}/inodes/{ino}/data?offset=0&len=7&stale=1"),
+            format!("hello {f}").as_bytes(),
+        );
+    }
+    for (id, addr) in c.meta_addrs() {
+        let (st, b) = api(addr, "GET", "/v1/fs", b"");
+        assert_eq!(st, 200, "{id}: {}", String::from_utf8_lossy(&b));
+        assert_eq!(json(&b)["filesystems"].as_array().unwrap().len(), 8);
+        let (st, b) = api(addr, "GET", "/v1/fs-snapshots", b"");
+        assert_eq!(st, 200, "{id}");
+        assert_eq!(json(&b)["snapshots"].as_array().unwrap().len(), 4);
+    }
+
+    // Losing a metadata node moves its groups' leadership; every group keeps serving.
+    let gone = c.meta_addrs()[0].0.clone();
+    c.meta.insert(gone, None);
+    for (i, id) in ids.iter().enumerate() {
+        c.wait_read(
+            &format!("/v1/volumes/{id}/data?offset=0&len=4096"),
+            &[i as u8 + 1; 4096],
+        );
+    }
+    c.on_leader(
+        "POST",
+        "/v1/volumes",
+        br#"{"id":"after","name":"after","size_bytes":4096}"#,
+        201,
+    );
+}
+
+#[test]
+fn http_members_change_reaches_every_raft_group() {
+    let c = Cluster::start_groups(3, 3, 0, 3);
+    let (_, first) = c.meta_addrs()[0].clone();
+    let m = json(&api(first, "GET", "/v1/members", b"").1);
+    assert_eq!(m["groups"].as_array().unwrap().len(), 3);
+    let keep: serde_json::Map<String, serde_json::Value> = m["addrs"]
+        .as_object()
+        .unwrap()
+        .clone()
+        .into_iter()
+        .filter(|(id, _)| id != "m3")
+        .collect();
+    let mut body = serde_json::json!({ "voters": keep });
+    for id in ["m1", "m2"] {
+        body["voters"]
+            .as_object_mut()
+            .unwrap()
+            .entry(id)
+            .or_insert("127.0.0.1:1".into());
+    }
+    // Each node changes the groups it leads; repeating the request across nodes finishes it.
+    c.on_leader("POST", "/v1/members", body.to_string().as_bytes(), 200);
+    for (id, addr) in c.meta_addrs().into_iter().filter(|(id, _)| id != "m3") {
+        let deadline = Instant::now() + WAIT;
+        loop {
+            let m = json(&api(addr, "GET", "/v1/members", b"").1);
+            let done = m["groups"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|g| g["membership"]["voters"] == serde_json::json!(["m1", "m2"]));
+            if done {
+                break;
+            }
+            assert!(Instant::now() < deadline, "{id}: {m}");
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+    for v in 0..6 {
+        let body = format!(r#"{{"id":"after{v}","name":"after","size_bytes":4096}}"#);
+        c.on_leader("POST", "/v1/volumes", body.as_bytes(), 201);
+    }
 }

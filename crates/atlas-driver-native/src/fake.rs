@@ -44,6 +44,7 @@ impl NativeApi for FakeApi {
                 leader: Some("fake-0".into()),
                 commit_index: lock(&self.state)?.next,
             }),
+            metadata_groups: None,
             layout: Some(Layout {
                 extent_bytes: 4 << 20,
                 replicas: 3,

@@ -174,7 +174,8 @@ mount them with `atlas-native-mount` instead.
 
 ## Limits and performance
 
-The whole namespace lives in one Raft group's in-memory catalog. Commands apply in place: every
+Each filesystem lives in one Raft group's catalog (`metadata.groups` spreads filesystems across
+groups; `docs/NATIVE_NODE.md`, "Metadata groups"). Commands apply in place: every
 command checks its inputs before it changes anything, so a rejected one leaves the catalog as it
 was (debug builds assert this on every apply), and the leader validates proposals against one
 running copy of the catalog plus its uncommitted entries. A create therefore costs the same at
@@ -232,7 +233,7 @@ localhost data nodes.
 
 Known limits:
 
-- One Raft group and one leader serve all metadata; there is no namespace sharding.
+- One filesystem never spans groups: its inodes all live in one group, behind one leader.
 - The catalog lives in memory (twice on the leader) and is written whole to disk at each log
   compaction.
 - A write that covers part of an extent reads, merges and rewrites the whole extent: up to the

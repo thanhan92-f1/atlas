@@ -46,6 +46,9 @@ const FS_NATIVE_PREFIX: &str = "fs:";
 pub struct NodeStatus {
     pub node_id: String,
     pub metadata: Option<RaftInfo>,
+    /// Every metadata Raft group the node replicates (absent on nodes that predate groups).
+    #[serde(default)]
+    pub metadata_groups: Option<Vec<GroupInfo>>,
     #[serde(default)]
     pub layout: Option<Layout>,
     #[serde(default)]
@@ -58,6 +61,26 @@ pub struct RaftInfo {
     pub term: u64,
     pub leader: Option<String>,
     pub commit_index: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GroupInfo {
+    pub group: u32,
+    pub leader: Option<String>,
+}
+
+impl NodeStatus {
+    /// The first metadata group without a known leader.
+    pub fn leaderless_group(&self) -> Option<u32> {
+        match &self.metadata_groups {
+            Some(groups) => groups.iter().find(|g| g.leader.is_none()).map(|g| g.group),
+            None => self
+                .metadata
+                .as_ref()
+                .is_some_and(|m| m.leader.is_none())
+                .then_some(0),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -223,6 +246,12 @@ fn health_of(status: &NodeStatus) -> (Health, String) {
     let Some(leader) = &m.leader else {
         return (Health::Critical, "no metadata leader".into());
     };
+    if let Some(g) = status.leaderless_group() {
+        return (
+            Health::Critical,
+            format!("no metadata leader for group {g}"),
+        );
+    }
     let nodes = status.data_nodes.as_deref().unwrap_or_default();
     let down: Vec<&str> = nodes
         .iter()
@@ -775,6 +804,7 @@ mod tests {
                 leader: Some("m2".into()),
                 commit_index: 5,
             }),
+            metadata_groups: None,
             layout: None,
             data_nodes: Some(vec![
                 DataNodeInfo {
@@ -788,6 +818,22 @@ mod tests {
             ]),
         };
         assert_eq!(health_of(&s).0, Health::Warn);
+        s.metadata_groups = Some(vec![
+            GroupInfo {
+                group: 0,
+                leader: Some("m2".into()),
+            },
+            GroupInfo {
+                group: 1,
+                leader: None,
+            },
+        ]);
+        let (h, msg) = health_of(&s);
+        assert_eq!(
+            (h, msg.as_str()),
+            (Health::Critical, "no metadata leader for group 1")
+        );
+        s.metadata_groups = None;
         s.metadata.as_mut().unwrap().leader = None;
         assert_eq!(health_of(&s).0, Health::Critical);
         s.metadata = None;
