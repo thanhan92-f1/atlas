@@ -20,10 +20,11 @@ use fuser::{
     ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request, TimeOrNow, WriteFlags,
 };
 
-use crate::{locks::F_UNLCK, ops::Ops};
+use crate::{dirs::DirStreams, locks::F_UNLCK, ops::Ops};
 
 pub struct AtlasFs {
     pub ops: Ops,
+    dirs: DirStreams,
 }
 
 fn time(ns: i64) -> SystemTime {
@@ -96,8 +97,15 @@ fn xattr_reply(reply: ReplyXattr, value: &[u8], size: u32) {
 }
 
 impl AtlasFs {
+    pub fn new(ops: Ops) -> Self {
+        Self {
+            ops,
+            dirs: DirStreams::default(),
+        }
+    }
+
     fn ttl(&self) -> Duration {
-        self.ops.cfg.ttl
+        self.ops.kernel_ttl()
     }
 
     fn entry(&self, r: Result<Attr, i32>, reply: ReplyEntry) {
@@ -552,31 +560,40 @@ impl Filesystem for AtlasFs {
         }
     }
 
+    fn opendir(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+        reply.opened(FileHandle(self.dirs.open(ino.0)), FopenFlags::empty());
+    }
+
     fn readdir(
         &self,
         _req: &Request,
         ino: INodeNo,
-        _fh: FileHandle,
+        fh: FileHandle,
         offset: u64,
         mut reply: ReplyDirectory,
     ) {
-        let entries = match self.ops.readdir(ino.0) {
-            Ok(e) => e,
-            Err(e) => return reply.error(err(e)),
-        };
-        let dots = [
-            (ino.0, FileType::Directory, "."),
-            (ino.0, FileType::Directory, ".."),
-        ];
-        let all = dots
-            .into_iter()
-            .map(|(i, k, n)| (i, k, n.to_string()))
-            .chain(entries.into_iter().map(|e| (e.ino, kind(e.kind), e.name)));
-        for (i, (ino, k, n)) in all.enumerate().skip(offset as usize) {
-            if reply.add(INodeNo(ino), (i + 1) as u64, k, n) {
-                break;
-            }
+        let stream = self.dirs.get(fh.0, ino.0);
+        let mut s = stream.lock().unwrap_or_else(|e| e.into_inner());
+        let r = s.read(
+            offset,
+            |after| self.ops.readdir_page(ino.0, after, crate::dirs::PAGE),
+            |i, k, n, off| reply.add(INodeNo(i), off, kind(k), n),
+        );
+        match r {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(err(e)),
         }
+    }
+
+    fn releasedir(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        _flags: OpenFlags,
+        reply: ReplyEmpty,
+    ) {
+        self.dirs.close(fh.0);
         reply.ok();
     }
 

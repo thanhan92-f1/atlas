@@ -680,6 +680,23 @@ fn http_file_api_on_a_three_node_cluster() {
         .map(|e| e["name"].as_str().unwrap().to_string())
         .collect::<Vec<_>>();
     assert_eq!(names, ["d", "ln"]);
+    let page = |q: &str| {
+        let (st, b) = call("GET", &format!("/v1/fs/f1/inodes/1/entries?{q}"), b"");
+        assert_eq!(st, 200, "{q}");
+        json(&b)["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["name"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(page("limit=1"), ["d"]);
+    assert_eq!(page("limit=1&after=d"), ["ln"]);
+    assert!(page("limit=5&after=ln").is_empty());
+    assert_eq!(
+        call("GET", "/v1/fs/f1/inodes/1/entries?limit=x", b"").0,
+        400
+    );
 
     // After a read barrier any replica serves a read that sees the latest write, at once.
     let (st, _) = call(
@@ -1102,4 +1119,111 @@ fn http_sessions_and_file_locks_survive_failover_and_expire() {
         })
         .sum();
     assert_eq!(expired, 1);
+}
+
+#[test]
+fn http_cache_leases_are_recalled_and_outlive_a_leader_change() {
+    let mut c = Cluster::start(3, 3, 0);
+    c.on_leader("POST", "/v1/fs", br#"{"id":"cl","name":"leases"}"#, 201);
+    let (_, b) = c.on_leader(
+        "POST",
+        "/v1/fs/cl/inodes/1/entries",
+        br#"{"name":"f","op_id":"o1","kind":"file","mode":420}"#,
+        201,
+    );
+    let ino = json(&b)["ino"].as_u64().unwrap();
+    c.on_leader(
+        "POST",
+        "/v1/fs/cl/sessions",
+        br#"{"session":"x","ttl_ms":60000,"cache":true}"#,
+        200,
+    );
+    // Without a session nothing is leased; with one the reply says for how long.
+    let (_, b) = c.on_leader("GET", &format!("/v1/fs/cl/inodes/{ino}?lease=1"), b"", 200);
+    assert!(json(&b).get("lease_ms").is_none());
+    let (st, _) = c.on_leader_any(
+        "GET",
+        &format!("/v1/fs/cl/inodes/{ino}?lease=1&session=nope"),
+        b"",
+    );
+    assert_eq!(st, 410);
+    let (leader, b) = c.on_leader(
+        "GET",
+        "/v1/fs/cl/inodes/1/lookup?name=f&lease=1&session=x",
+        b"",
+        200,
+    );
+    assert_eq!(json(&b)["lease_ms"], 5000);
+    let addr = c
+        .meta_addrs()
+        .into_iter()
+        .find(|(id, _)| *id == leader)
+        .unwrap()
+        .1;
+
+    // A write waits until the holder gives its lease back.
+    let started = Instant::now();
+    let writer = thread::spawn(move || {
+        let (st, _) = api(
+            addr,
+            "PUT",
+            &format!("/v1/fs/cl/inodes/{ino}/data?offset=0"),
+            b"new",
+        );
+        (st, started.elapsed())
+    });
+    let (st, b) = api(
+        addr,
+        "GET",
+        "/v1/fs/cl/sessions/x/recalls?wait_ms=5000",
+        b"",
+    );
+    assert_eq!(st, 200);
+    assert_eq!(json(&b)["inos"], serde_json::json!([ino]));
+    thread::sleep(Duration::from_millis(200));
+    assert!(
+        !writer.is_finished(),
+        "the write did not wait for the recall"
+    );
+    let body = format!(r#"{{"inos":[{ino}]}}"#);
+    let (st, _) = api(
+        addr,
+        "POST",
+        "/v1/fs/cl/sessions/x/recalls/done",
+        body.as_bytes(),
+    );
+    assert_eq!(st, 204);
+    let (st, waited) = writer.join().unwrap();
+    assert_eq!(st, 200);
+    assert!(waited < Duration::from_secs(3), "{waited:?}");
+    // The holder's own changes are not held up by its lease.
+    c.on_leader(
+        "GET",
+        &format!("/v1/fs/cl/inodes/{ino}?lease=1&session=x"),
+        b"",
+        200,
+    );
+    let started = Instant::now();
+    c.on_leader(
+        "PUT",
+        &format!("/v1/fs/cl/inodes/{ino}/data?offset=0&session=x"),
+        b"own",
+        200,
+    );
+    assert!(started.elapsed() < Duration::from_secs(2));
+
+    // A new leader cannot know its predecessor's leases, so it holds changes back for one lease.
+    c.meta.insert(leader, None);
+    let started = Instant::now();
+    c.on_leader(
+        "PUT",
+        &format!("/v1/fs/cl/inodes/{ino}/data?offset=0"),
+        b"after",
+        200,
+    );
+    assert!(
+        started.elapsed() >= Duration::from_secs(4),
+        "{:?}",
+        started.elapsed()
+    );
 }

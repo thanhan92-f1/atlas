@@ -35,6 +35,7 @@ use crate::{
     tls::TlsIdentity,
 };
 
+mod cache_leases;
 mod fs_api;
 mod shards;
 
@@ -317,6 +318,8 @@ struct NodeShared {
 struct MetaGroup {
     raft: Arc<RaftServer>,
     engine: NativeEngine,
+    /// Cache leases this replica granted while leading the group.
+    leases: cache_leases::CacheLeases,
 }
 
 /// Group 0 keeps the directories of a node that predates groups.
@@ -491,6 +494,7 @@ impl NativeNode {
                     groups.push(MetaGroup {
                         raft: server,
                         engine,
+                        leases: Default::default(),
                     });
                 }
                 Some((m.repair_interval_secs, m.gc_interval_secs))
@@ -1196,6 +1200,20 @@ fn metrics(sh: &NodeShared) -> Response {
                 p.family(&name, "counter", help)
                     .sample(&name, &node, v.load(Ordering::Relaxed));
             }
+        }
+        let name = "atlas_native_cache_leases";
+        let fam = p.family(
+            name,
+            "gauge",
+            "Cache leases this node holds out as a group leader.",
+        );
+        for g in &sh.groups {
+            let group = g.raft.group().to_string();
+            fam.sample(
+                name,
+                &[("node", sh.id.as_str()), ("group", group.as_str())],
+                g.leases.held(),
+            );
         }
         let name = "atlas_native_client_sessions_expired_total";
         p.family(

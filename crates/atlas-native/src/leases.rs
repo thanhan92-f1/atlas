@@ -22,6 +22,17 @@ pub struct Session {
     pub ttl_ms: u64,
     /// Leader wall-clock time (ms since the epoch) after which the session may be expired.
     pub expires_ms: u64,
+    /// The client caches under cache leases, so a new leader must wait out its predecessor's.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub cache: bool,
+    /// Raft term the session was opened in: only a leader of that term or later granted it
+    /// cache leases.
+    #[serde(default)]
+    pub term: u64,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -79,6 +90,8 @@ pub enum LeaseOp {
         session: String,
         ttl_ms: u64,
         now_ms: u64,
+        #[serde(default)]
+        cache: bool,
     },
     /// Fails with `no_session` if the session was expired or closed.
     Renew { session: String, now_ms: u64 },
@@ -184,11 +197,19 @@ impl Leases {
         self.locks.retain(|_, l| !l.is_empty());
     }
 
-    /// Applies `op`, checking every input before changing anything. `file` says whether an inode
-    /// of the filesystem is a regular file (`Lock` refuses anything else).
+    /// Whether a caching session was opened before `term`, so it may hold cache leases a
+    /// leader of an earlier term granted.
+    pub fn caching_since_before(&self, term: u64) -> bool {
+        self.sessions.values().any(|s| s.cache && s.term < term)
+    }
+
+    /// Applies `op` (committed in `term`), checking every input before changing anything.
+    /// `file` says whether an inode of the filesystem is a regular file (`Lock` refuses anything
+    /// else).
     pub fn apply(
         &mut self,
         op: &LeaseOp,
+        term: u64,
         file: impl Fn(&str, u64) -> Result<(), MetaError>,
     ) -> Result<(), MetaError> {
         match op {
@@ -196,6 +217,7 @@ impl Leases {
                 session,
                 ttl_ms,
                 now_ms,
+                cache,
             } => {
                 check_holder_name(session)?;
                 if !(MIN_TTL_MS..=MAX_TTL_MS).contains(ttl_ms) {
@@ -208,11 +230,15 @@ impl Leases {
                         "more than {MAX_SESSIONS} sessions"
                     )));
                 }
+                // Reopening keeps the first term: leases from then may still be held.
+                let term = self.sessions.get(session).map_or(term, |s| s.term);
                 self.sessions.insert(
                     session.clone(),
                     Session {
                         ttl_ms: *ttl_ms,
                         expires_ms: now_ms.saturating_add(*ttl_ms),
+                        cache: *cache,
+                        term,
                     },
                 );
             }
@@ -381,7 +407,9 @@ mod tests {
                 session: s.into(),
                 ttl_ms: 10_000,
                 now_ms: now,
+                cache: false,
             },
+            1,
             any_file,
         )
         .unwrap();
@@ -407,6 +435,7 @@ mod tests {
                 pid: 1,
                 now_ms: 0,
             },
+            1,
             any_file,
         )
     }
@@ -486,7 +515,7 @@ mod tests {
             Err(MetaError::NoSession)
         ));
         assert_eq!(l.expired(10_000).collect::<Vec<_>>(), vec!["a"]);
-        l.apply(&LeaseOp::Expire { now_ms: 10_000 }, any_file)
+        l.apply(&LeaseOp::Expire { now_ms: 10_000 }, 1, any_file)
             .unwrap();
         assert!(!l.sessions.contains_key("a"));
         assert_eq!(l.lock_count(), 1);
@@ -496,6 +525,7 @@ mod tests {
                     session: "a".into(),
                     now_ms: 10_000
                 },
+                1,
                 any_file
             ),
             Err(MetaError::NoSession)
@@ -504,6 +534,7 @@ mod tests {
             &LeaseOp::Close {
                 session: "b".into(),
             },
+            1,
             any_file,
         )
         .unwrap();
@@ -513,8 +544,10 @@ mod tests {
                 &LeaseOp::Open {
                     session: "c".into(),
                     ttl_ms: 1,
-                    now_ms: 0
+                    now_ms: 0,
+                    cache: false,
                 },
+                1,
                 any_file
             ),
             Err(MetaError::Invalid(_))
@@ -534,6 +567,7 @@ mod tests {
                 session: "a".into(),
                 owner: 1,
             },
+            1,
             any_file,
         )
         .unwrap();

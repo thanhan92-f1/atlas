@@ -11,9 +11,8 @@ use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, sync::Arc};
 
 use crate::{
-    inodes::InodeTable,
+    inodes::{DirEntries, InodeTable},
     metadata::{Catalog, ExtentId, ExtentRef, MetaError, SnapshotId},
-    tracked::Tracked,
 };
 
 pub type FsId = String;
@@ -99,7 +98,7 @@ pub enum XattrMode {
 pub enum InodeKind {
     Dir {
         parent: u64,
-        entries: Tracked<String, u64>,
+        entries: DirEntries,
     },
     File {
         size: u64,
@@ -288,19 +287,10 @@ impl Inode {
         matches!(self.kind, InodeKind::Dir { .. })
     }
 
-    /// A directory's entries; other inodes have none.
-    pub fn entries(&self) -> &BTreeMap<String, u64> {
-        static NONE: BTreeMap<String, u64> = BTreeMap::new();
-        match &self.kind {
-            InodeKind::Dir { entries, .. } => entries,
-            _ => &NONE,
-        }
-    }
-
     /// File size; a directory reports its entry count and a symlink its target length.
     pub fn size(&self) -> u64 {
         match &self.kind {
-            InodeKind::Dir { entries, .. } => entries.len() as u64,
+            InodeKind::Dir { entries, .. } => entries.len(),
             InodeKind::File { size, .. } => *size,
             InodeKind::Symlink { target } => target.len() as u64,
             InodeKind::Special { .. } => 0,
@@ -338,14 +328,23 @@ impl FsMeta {
 
     /// The inode `name` in directory `dir` names, if any.
     pub fn entry(&self, dir: u64, name: &str) -> Result<Option<u64>, MetaError> {
-        Ok(self.dir(dir)?.entries().get(name).copied())
+        self.inodes.entry(&*self.dir(dir)?, name)
     }
 
-    fn entries_mut(&mut self, dir: u64) -> Result<&mut Tracked<String, u64>, MetaError> {
-        match &mut self.inode_mut(dir)?.kind {
-            InodeKind::Dir { entries, .. } => Ok(entries),
-            _ => Err(MetaError::NotDir(format!("inode {dir}"))),
-        }
+    /// Up to `limit` entries of directory `dir` named after `after`, in name order.
+    pub fn entries(
+        &self,
+        dir: u64,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<(String, u64)>, MetaError> {
+        self.inodes.entries(&*self.dir(dir)?, after, limit)
+    }
+
+    fn set_entry(&mut self, dir: u64, name: &str, ino: Option<u64>) -> Result<(), MetaError> {
+        self.dir(dir)?;
+        self.inodes.set_entry(dir, name, ino)?;
+        Ok(())
     }
 
     pub fn lookup(&self, dir: u64, name: &str) -> Result<u64, MetaError> {
@@ -553,7 +552,7 @@ impl Catalog {
                     ROOT_INO,
                     InodeKind::Dir {
                         parent: ROOT_INO,
-                        entries: Tracked::default(),
+                        entries: DirEntries::default(),
                     },
                     0o755,
                     0,
@@ -609,7 +608,7 @@ impl Catalog {
                     },
                     NodeType::Dir => InodeKind::Dir {
                         parent: *parent,
-                        entries: Tracked::default(),
+                        entries: DirEntries::default(),
                     },
                     NodeType::Symlink => {
                         let t = target
@@ -633,7 +632,7 @@ impl Catalog {
                 inode.op_id = op_id.clone();
                 let is_dir = inode.is_dir();
                 f.inodes.insert(inode);
-                f.entries_mut(*parent)?.insert(name.clone(), ino);
+                f.set_entry(*parent, name, Some(ino))?;
                 f.dir_changed(*parent, i64::from(is_dir), *now_ns)?;
             }
             FsOp::Link {
@@ -656,7 +655,7 @@ impl Catalog {
                     }
                     return Err(MetaError::Exists(format!("{name:?} in directory {parent}")));
                 }
-                f.entries_mut(*parent)?.insert(name.clone(), *ino);
+                f.set_entry(*parent, name, Some(*ino))?;
                 f.dir_changed(*parent, 0, *now_ns)?;
                 let i = f.inode_mut(*ino)?;
                 i.nlink += 1;
@@ -673,7 +672,7 @@ impl Catalog {
                 if f.inode(ino)?.is_dir() {
                     return Err(MetaError::IsDir(format!("{name:?} in directory {parent}")));
                 }
-                f.entries_mut(*parent)?.remove(name);
+                f.set_entry(*parent, name, None)?;
                 f.dir_changed(*parent, 0, *now_ns)?;
                 if let Some(gone) = f.drop_link(ino, *now_ns)? {
                     self.forget_usage(fs, &gone);
@@ -688,12 +687,12 @@ impl Catalog {
             } => {
                 let f = self.fs_mut(fs)?;
                 let ino = f.lookup(*parent, name)?;
-                if !f.dir(ino)?.entries().is_empty() {
+                if f.dir(ino)?.size() != 0 {
                     return Err(MetaError::NotEmpty(format!(
                         "{name:?} in directory {parent}"
                     )));
                 }
-                f.entries_mut(*parent)?.remove(name);
+                f.set_entry(*parent, name, None)?;
                 f.dir_changed(*parent, -1, *now_ns)?;
                 f.inodes.remove(ino)?;
             }
@@ -732,14 +731,14 @@ impl Catalog {
                                 "{new_name:?} in directory {new_parent}"
                             )))
                         }
-                        (true, true) if !f.dir(dst)?.entries().is_empty() => {
+                        (true, true) if f.dir(dst)?.size() != 0 => {
                             return Err(MetaError::NotEmpty(format!(
                                 "{new_name:?} in directory {new_parent}"
                             )))
                         }
                         _ => {}
                     }
-                    f.entries_mut(*new_parent)?.remove(new_name);
+                    f.set_entry(*new_parent, new_name, None)?;
                     if dst_dir {
                         f.inodes.remove(dst)?;
                         f.dir_changed(*new_parent, -1, *now_ns)?;
@@ -747,8 +746,8 @@ impl Catalog {
                         dropped = f.drop_link(dst, *now_ns)?;
                     }
                 }
-                f.entries_mut(*parent)?.remove(name);
-                f.entries_mut(*new_parent)?.insert(new_name.clone(), src);
+                f.set_entry(*parent, name, None)?;
+                f.set_entry(*new_parent, new_name, Some(src))?;
                 let moved = i64::from(src_dir && parent != new_parent);
                 f.dir_changed(*parent, -moved, *now_ns)?;
                 f.dir_changed(*new_parent, moved, *now_ns)?;

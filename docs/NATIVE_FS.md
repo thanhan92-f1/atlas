@@ -51,7 +51,7 @@ All routes need the API token (and client certificate where configured), like th
 | `GET /v1/fs/{fs}/inodes/{ino}` | Attributes: `{ino, kind, mode, uid, gid, nlink, size, blocks, rdev, atime_ns, mtime_ns, ctime_ns}`. |
 | `POST /v1/fs/{fs}/inodes/{ino}/attr` | Any of `{mode, uid, gid, size, atime_ns, mtime_ns}` → attributes. |
 | `GET /v1/fs/{fs}/inodes/{dir}/lookup?name=` | Attributes of the entry (`name` percent-encoded). |
-| `GET /v1/fs/{fs}/inodes/{dir}/entries` | `{"entries": [{name, ino, kind}]}`. |
+| `GET /v1/fs/{fs}/inodes/{dir}/entries` | `{"entries": [{name, ino, kind}]}` in name order. `?limit=N` returns at most N; `?after=<name>` (percent-encoded) starts after that name. Without `limit`, the whole directory. |
 | `POST /v1/fs/{fs}/inodes/{dir}/entries` | `{name, op_id, kind, mode, uid, gid, target?, rdev?}` (`kind`: `file`, `dir`, `symlink`, `fifo`, `socket`, `char_device`, `block_device`) → 201 attributes. |
 | `POST /v1/fs/{fs}/inodes/{dir}/unlink`, `/rmdir` | `{name}` → 204. |
 | `POST /v1/fs/{fs}/inodes/{ino}/links` | `{parent, name}`: a hard link → attributes. |
@@ -62,7 +62,9 @@ All routes need the API token (and client certificate where configured), like th
 | `DELETE /v1/fs/{fs}/inodes/{ino}/xattrs/{name}` | 204; 404 `no_attr` if unset. |
 | `GET /v1/fs/{fs}/inodes/{ino}/data?offset=N&len=M` | Raw bytes; short at end of file. |
 | `PUT /v1/fs/{fs}/inodes/{ino}/data?offset=N` | Raw body written at `offset` (extends the file) → attributes. |
-| `POST /v1/fs/{fs}/sessions` | `{"session", "ttl_ms"}` (1000–300000): opens a client session, or renews it with a new TTL → `{session, ttl_ms, expires_ms}`. Session ids are client-chosen (the mount uses a UUID). |
+| `POST /v1/fs/{fs}/sessions` | `{"session", "ttl_ms", "cache"?}` (TTL 1000–300000): opens a client session, or renews it with a new TTL → `{session, ttl_ms, expires_ms}`. Session ids are client-chosen (the mount uses a UUID). `cache: true` if the session will hold cache leases. |
+| `GET /v1/fs/{fs}/sessions/{id}/recalls?wait_ms=` | `{"inos": [...]}`: cache leases the session must give back, waiting up to `wait_ms` (at most 25 s) for one. Leader only. |
+| `POST /v1/fs/{fs}/sessions/{id}/recalls/done` | `{"inos": [...]}`: the session dropped what it cached under these leases → 204. |
 | `POST /v1/fs/{fs}/sessions/{id}/renew` | → `{session, ttl_ms, expires_ms}`; 410 `no_session` once it expired or was closed. |
 | `DELETE /v1/fs/{fs}/sessions/{id}` | 204; releases every lock the session holds. |
 | `POST /v1/fs/{fs}/inodes/{ino}/locks` | `{session, owner, kind, start?, end?, pid?}` (`kind`: `read`, `write`, `unlock`; `end` inclusive, default end of file) → 204, or 409 `locked` on another owner's conflicting lock. POSIX `F_SETLK` semantics per `(session, owner)`; renews the session. Regular files only. |
@@ -71,6 +73,12 @@ All routes need the API token (and client certificate where configured), like th
 | `GET /v1/fs/{fs}/locks` | `{"sessions": N, "locks": [...]}`: every lock held on the filesystem and the open sessions in its metadata group. |
 
 `{fs}` may be `<fs>@<snapshot>` for reads; any change to a snapshot gets 409 `read_only`.
+
+`?session=<id>` names the client session a request comes from. On `GET .../inodes/{ino}` and
+`GET .../lookup`, `&lease=1` also asks for a cache lease: the leader confirms its leadership (a
+read barrier), grants the session a lease on the inode (on a lookup, on the directory and the
+child) and adds `"lease_ms"` to the attributes; no `lease_ms` means none was granted (a change to
+the inode is in flight, a follower answered, or the tree is a snapshot).
 
 Errors are `{"error", "code", "leader"}`. `code` is stable and maps to an errno in the client:
 `not_found` (404, ENOENT), `exists` (EEXIST), `not_empty` (ENOTEMPTY), `not_dir` (ENOTDIR),
@@ -99,8 +107,8 @@ Options: `--identity-file` (client certificate + key PEM), `--ttl-ms` (attribute
 default 1000), `--writeback-bytes` (default 4 MiB), `--readahead-bytes` (default 4 MiB, 0 disables),
 `--max-io-bytes` (largest request, default 8 MiB; keep at or below the nodes' `max_request_bytes`),
 `--retry-secs` (default 30), `--read-only`, `--allow-other`, `--fuse-threads` (kernel request
-workers, each with its own `/dev/fuse` fd, default 4), `--session-ttl-ms` (lease of the session
-holding the mount's file locks, default 15000) and `--direct-reads` (below). It runs in the
+workers, each with its own `/dev/fuse` fd, default 4), `--session-ttl-ms` (lease of the mount's
+session, default 15000), `--cache-leases` (see Consistency) and `--direct-reads` (below). It runs in the
 foreground until `fusermount3 -u`; the mount uses `default_permissions`, so the kernel checks
 modes and ownership.
 
@@ -116,6 +124,9 @@ modes and ownership.
 - **Unlink while open**: removing a file another handle in the same mount still has open renames it
   to a hidden `.atlas_hidden_<ino>_<n>` entry (not listed by `readdir`) and removes it on the last
   close, or at unmount.
+- **Directory listings**: each open directory reads 1024 entries per request (`?after=&limit=`)
+  and keeps its place between the kernel's `readdir` calls, so listing a directory of any size
+  costs one request per page. Seeking back restarts the listing.
 - **Direct reads** (`--direct-reads`): the leader only answers
   `GET /v1/fs/<fs>/inodes/<ino>/layout?offset=&len=` (each extent's offset, length, SHA-256 and
   replicas with their data-node addresses, in the order a read should try them); the client then
@@ -154,6 +165,16 @@ modes and ownership.
   writer closes or fsyncs the file and the reader opens it after that; attributes and names may be
   cached for up to `--ttl-ms` (set 0 for no caching). Unlocked concurrent writers to the same
   file range see last-writer-wins at the extent level.
+- **Cache leases** (`--cache-leases`): attributes and names are cached for as long as the
+  cluster's lease on them lasts (5 s, re-taken on the next miss) instead of for `--ttl-ms`, and
+  never go stale: before any change to an inode commits, the leader recalls every other mount's
+  lease on it and waits until that mount has dropped its cache (its recall thread answers within
+  a round trip) or the lease ran out. A mount's own changes do not wait on its own leases. The
+  kernel gets a zero TTL, so every `stat` and lookup reaches the mount's cache. A new metadata
+  leader knows none of its predecessor's leases: while a caching session opened under an earlier
+  leader is open, it holds changes back for one lease period (5 s) after taking over. A mount
+  that stops answering recalls delays other mounts' changes to what it cached by up to 5 s. File
+  data is still close-to-open.
 - Unlink-while-open only protects handles in the same mount; a file removed by another client
   disappears for everyone.
 - **Extended attributes** in the `user.`, `trusted.` and `security.` namespaces are stored on the
@@ -170,8 +191,7 @@ modes and ownership.
   `--fuse-threads` − 1 waits run at once, more fail with ENOLCK, so waiters never take the
   kernel worker an unlock needs. A snapshot mount grants every lock locally (nothing writes
   there). Locks need every metadata node upgraded first: an older node cannot apply them.
-- Not implemented: POSIX ACLs, quotas, `O_DIRECT`, cache leases (attributes and names are still
-  cached for a fixed `--ttl-ms`).
+- Not implemented: POSIX ACLs, quotas, `O_DIRECT`.
 
 ## Atlas gateway
 
@@ -198,8 +218,10 @@ command checks its inputs before it changes anything, so a rejected one leaves t
 was (debug builds assert this on every apply), and the leader validates proposals against one
 running copy of the catalog plus its uncommitted entries. A create therefore costs the same at
 100k inodes as at 10k. Log compaction (every 1024 entries) checkpoints only the records changed
-since the last one to `catalog.redb` (`docs/NATIVE_METADATA.md`, "Catalog store"); the leader still
-holds two copies of the catalog in memory.
+since the last one to `catalog.redb` (`docs/NATIVE_METADATA.md`, "Catalog store"). Inodes and
+directory entries are paged from it, so memory holds what changed since the last checkpoint plus
+a bounded inode cache, not the namespace. The leader's applied and speculative catalogs share
+everything paged.
 
 Engine-level create rates without FUSE or HTTP (`crates/atlas-native/tests/metadata_bench.rs`, one
 host, tmpfs) are ~9k/s from one proposer and ~12k/s from eight on a 3-voter group at 20k files.
@@ -228,8 +250,11 @@ disk latency but stay flat with the inode count (same run shape, no retries):
 | 15k | 47 | 321 | 811 | 3.4 | 99 |
 | 25k | 42 | 346 | 1214 | 5.8 | 112 |
 
-The practical limit is now memory: about 6 KiB
-of leader RSS per inode, so plan on roughly 1M inodes per 8 GiB node.
+These runs predate the paged catalog, when leader memory grew about 6 KiB per inode. Memory now
+follows the inode cache rather than the inode count: `store::bench::memory_of_a_paged_catalog`
+(4096-inode cache, second lab host, 2026-10-05) peaks at ~76 MB for 400k files in one directory
+and ~78 MB spread over 1000, flat from 300k files on as redb's page cache fills (112–114 MB before
+directory entries were paged).
 
 Data path, FUSE mount, measured 2026-10-04: 3 nodes on one 12-core host (other tenants' load
 average around 25), node data on tmpfs so the shared HDDs don't mask software overhead, fio with
@@ -252,8 +277,7 @@ localhost data nodes.
 Known limits:
 
 - One filesystem never spans groups: its inodes all live in one group, behind one leader.
-- The catalog lives in memory (twice on the leader) and is written whole to disk at each log
-  compaction.
+- Filesystem snapshot trees are held in memory in full, and each is one record in the store.
 - A write that covers part of an extent reads, merges and rewrites the whole extent: up to the
   filesystem's `extent_bytes` (1 MiB by default). With the cluster on its default 4 MiB grid,
   random 4 KiB writes measured 24/s at a 4 MiB file grid, 28/s at 1 MiB, 35/s at 256 KiB and
@@ -275,7 +299,8 @@ Known limits:
 - `crates/atlas-native-fuse/tests/ops.rs`: the FUSE operations layer against a live in-process
   cluster, including a leader failure mid-workload, unlink-while-open, read-only snapshot mounts,
   clone isolation, concurrent creates, direct reads (across extents, after a rewrite) and their
-  fallback to the leader.
+  fallback to the leader; `crates/atlas-native-fuse/src/dirs.rs` unit tests page a 2500-entry
+  listing through small kernel buffers with one request per page, and rewind on a seek back.
 - `crates/atlas-native/tests/allocator.rs`: one write's concurrent extent placements reuse
   distinct free ranges (verified by reading back and scrubbing every replica).
 - `crates/atlas-driver-native/tests/nodes.rs` and `crates/atlas-gateway/tests/native_backend.rs`:

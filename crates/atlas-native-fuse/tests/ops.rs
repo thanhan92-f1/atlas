@@ -263,6 +263,18 @@ fn posix_operations_through_the_ops_layer() {
         .map(|e| e.name)
         .collect();
     assert_eq!(names, ["big.bin", "dir", "hard", "link", "moved.txt"]);
+    let mut paged = Vec::new();
+    let mut after = None;
+    loop {
+        let (page, next) = ops.readdir_page(ROOT_INO, after.as_deref(), 2).unwrap();
+        assert!(page.len() <= 2);
+        paged.extend(page.into_iter().map(|e| e.name));
+        match next {
+            Some(n) => after = Some(n),
+            None => break,
+        }
+    }
+    assert_eq!(paged, names);
 
     // A file unlinked while open stays readable through the handle until the last close.
     let o = ops
@@ -664,4 +676,74 @@ fn file_locks_are_seen_by_every_mount() {
     let snap = mount(&c, "lk@none", OpsConfig::default());
     assert_eq!(snap.getlk(f.ino, 1, 0, 9, wr), Ok(None));
     assert_eq!(snap.lock_sessions_lost(), 0);
+}
+
+#[test]
+fn cache_leases_are_recalled_before_another_mount_changes_anything() {
+    let c = Cluster::start();
+    create_fs(&c, "cl");
+    let leased = OpsConfig {
+        cache_leases: true,
+        writeback_bytes: 0,
+        ..OpsConfig::default()
+    };
+    let a = mount(&c, "cl", leased.clone());
+    let b = mount(&c, "cl", leased);
+    assert_eq!(a.kernel_ttl(), Duration::ZERO);
+    let f = a
+        .mknode(ROOT_INO, "f", NodeType::File, None, 0o644, 0, 0)
+        .unwrap();
+    assert_eq!(b.lookup(ROOT_INO, "f").unwrap().size, 0);
+    assert_eq!(b.getattr(f.ino).unwrap().size, 0);
+    let held: u64 = c
+        .endpoints()
+        .iter()
+        .map(|e| {
+            let mut cfg = ClientConfig::new(vec![e.clone()]);
+            cfg.token = Some(TOKEN.into());
+            let m = Client::new(cfg)
+                .unwrap()
+                .request(Method::GET, "/metrics", Body::Empty, Retry::Idempotent)
+                .unwrap();
+            String::from_utf8(m)
+                .unwrap()
+                .lines()
+                .filter(|l| l.starts_with("atlas_native_cache_leases{"))
+                .filter_map(|l| l.rsplit(' ').next()?.parse::<u64>().ok())
+                .sum::<u64>()
+        })
+        .sum();
+    assert!(held >= 2, "leases on the root and the file: {held}");
+
+    // Each change waits for b to drop what it cached, so b never sees the old state, and b's
+    // recall thread answers well within the lease.
+    let started = std::time::Instant::now();
+    a.write(f.ino, 0, b"hello").unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(b.getattr(f.ino).unwrap().size, 5);
+    a.rename(ROOT_INO, "f", ROOT_INO, "g").unwrap();
+    assert_eq!(b.lookup(ROOT_INO, "f"), Err(libc::ENOENT));
+    assert_eq!(b.lookup(ROOT_INO, "g").unwrap().ino, f.ino);
+    a.setattr(
+        f.ino,
+        SetAttr {
+            mode: Some(0o600),
+            ..SetAttr::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(b.getattr(f.ino).unwrap().mode & 0o777, 0o600);
+    a.unlink(ROOT_INO, "g").unwrap();
+    assert_eq!(b.lookup(ROOT_INO, "g"), Err(libc::ENOENT));
+    // A mount's own changes do not wait on its own leases and show at once.
+    let h = b
+        .mknode(ROOT_INO, "h", NodeType::File, None, 0o644, 0, 0)
+        .unwrap();
+    b.write(h.ino, 0, b"own").unwrap();
+    assert_eq!(b.getattr(h.ino).unwrap().size, 3);
+    assert_eq!(a.lookup(ROOT_INO, "h").unwrap().size, 3);
 }
