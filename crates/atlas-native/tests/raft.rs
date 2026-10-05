@@ -460,6 +460,78 @@ fn lagging_follower_catches_up_via_snapshot() {
 }
 
 #[test]
+fn a_large_snapshot_streams_in_chunks_and_survives_a_cut() {
+    use atlas_native::{FsOp, NodeType, ROOT_INO};
+
+    let mut c = Cluster::new(3, 4);
+    let l = c.elect();
+    let lagger = c.live_ids().into_iter().find(|id| *id != l).unwrap();
+    c.isolated.insert(lagger.clone());
+    let fs = |op| MetaCommand::Fs { op };
+    c.node_mut(&l)
+        .propose(fs(FsOp::CreateFs {
+            fs: "f".into(),
+            name: "f".into(),
+            now_ns: 1,
+            extent_bytes: None,
+        }))
+        .unwrap();
+    for i in 0..1300 {
+        c.node_mut(&l)
+            .propose(fs(FsOp::Mknode {
+                fs: "f".into(),
+                parent: ROOT_INO,
+                name: format!("file-{i}"),
+                op_id: format!("op-{i}"),
+                node_type: NodeType::File,
+                target: None,
+                rdev: 0,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                now_ns: 2,
+            }))
+            .unwrap();
+        if i % 32 == 31 {
+            c.tick();
+        }
+    }
+    c.run(5);
+    assert!(c.node(&l).snapshot_index() > c.node(&lagger).last_index());
+
+    // Let a few chunks through, then cut the follower off mid-transfer.
+    c.isolated.clear();
+    let before = c.snapshots_sent;
+    assert!(c.run_until(50, |c| c.snapshots_sent >= before + 2));
+    c.isolated.insert(lagger.clone());
+    c.run(30);
+    c.isolated.clear();
+
+    let leader = l.clone();
+    let caught_up = |c: &Cluster| {
+        let lead = c.leader().unwrap_or(leader.clone());
+        c.node(&lagger).applied_index() == c.node(&lead).applied_index()
+    };
+    assert!(c.run_until(500, caught_up));
+    // Header, two inode chunks and Done, at least.
+    assert!(
+        c.snapshots_sent >= before + 4,
+        "{}",
+        c.snapshots_sent - before
+    );
+    let lead = c.leader().unwrap();
+    let json = |c: &Cluster, id: &str| serde_json::to_value(c.node(id).catalog()).unwrap();
+    assert_eq!(json(&c, &lagger), json(&c, &lead));
+
+    c.crash(&lagger);
+    c.restart(&lagger);
+    assert_eq!(
+        json(&c, &lagger)["filesystems"],
+        json(&c, &lead)["filesystems"]
+    );
+}
+
+#[test]
 fn unanswered_snapshots_are_not_resent_on_every_append() {
     let mut c = Cluster::new(3, 4);
     let l = c.elect();

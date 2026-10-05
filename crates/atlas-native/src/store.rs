@@ -500,14 +500,31 @@ impl StoreSnapshot {
 
     /// Every inode number of `fs`, in order.
     pub(crate) fn inos(&self, fs: &str) -> io::Result<Vec<u64>> {
+        self.inos_from(fs, 0, usize::MAX, |_| false)
+    }
+
+    /// Up to `limit` inode numbers of `fs` from `from` on, in order, leaving out `skip`.
+    pub(crate) fn inos_from(
+        &self,
+        fs: &str,
+        from: u64,
+        limit: usize,
+        skip: impl Fn(u64) -> bool,
+    ) -> io::Result<Vec<u64>> {
         let t = match self.tx.open_table(INODES) {
             Ok(t) => t,
             Err(TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
             Err(e) => return Err(err(e)),
         };
         let mut out = Vec::new();
-        for row in t.range((fs, 0)..=(fs, u64::MAX)).map_err(err)? {
-            out.push(row.map_err(err)?.0.value().1);
+        for row in t.range((fs, from)..=(fs, u64::MAX)).map_err(err)? {
+            if out.len() >= limit {
+                break;
+            }
+            let ino = row.map_err(err)?.0.value().1;
+            if !skip(ino) {
+                out.push(ino);
+            }
         }
         Ok(out)
     }

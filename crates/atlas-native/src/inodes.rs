@@ -141,6 +141,29 @@ impl InodeTable {
         Ok(all.into_values().collect())
     }
 
+    /// Up to `limit` inodes numbered `from` or more, in inode order (bypassing the cache).
+    pub fn page(&self, from: u64, limit: usize) -> Result<Vec<Arc<Inode>>, MetaError> {
+        let mut out: BTreeMap<u64, Arc<Inode>> = self
+            .map
+            .range(from..)
+            .take(limit)
+            .map(|(k, v)| (*k, v.clone()))
+            .collect();
+        if let Some(p) = &self.paged {
+            let touched = self.map.touched();
+            for ino in p
+                .store
+                .inos_from(&p.fs, from, limit, |i| touched.contains(&i))
+                .map_err(store_err)?
+            {
+                if let Some(i) = p.store.peek(&p.fs, ino).map_err(store_err)? {
+                    out.insert(ino, i);
+                }
+            }
+        }
+        Ok(out.into_values().take(limit).collect())
+    }
+
     /// The same inodes in memory, apart from the store and with no changes recorded (a
     /// snapshot's frozen tree).
     pub fn detached(&self) -> Result<Self, MetaError> {
