@@ -680,6 +680,23 @@ fn http_file_api_on_a_three_node_cluster() {
         .map(|e| e["name"].as_str().unwrap().to_string())
         .collect::<Vec<_>>();
     assert_eq!(names, ["d", "ln"]);
+    let page = |q: &str| {
+        let (st, b) = call("GET", &format!("/v1/fs/f1/inodes/1/entries?{q}"), b"");
+        assert_eq!(st, 200, "{q}");
+        json(&b)["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["name"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(page("limit=1"), ["d"]);
+    assert_eq!(page("limit=1&after=d"), ["ln"]);
+    assert!(page("limit=5&after=ln").is_empty());
+    assert_eq!(
+        call("GET", "/v1/fs/f1/inodes/1/entries?limit=x", b"").0,
+        400
+    );
 
     // After a read barrier any replica serves a read that sees the latest write, at once.
     let (st, _) = call(

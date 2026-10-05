@@ -455,16 +455,40 @@ impl Ops {
         Ok(self.remember(a))
     }
 
+    /// Every visible entry of a directory.
     pub fn readdir(&self, ino: u64) -> Result<Vec<DirEntry>, Errno> {
-        let v = self.call(
-            Method::GET,
-            &format!("/inodes/{ino}/entries"),
-            Body::Empty,
-            Retry::Idempotent,
-        )?;
+        let mut all = Vec::new();
+        let mut after = None;
+        loop {
+            let (entries, next) = self.readdir_page(ino, after.as_deref(), crate::dirs::PAGE)?;
+            all.extend(entries);
+            match next {
+                Some(n) => after = Some(n),
+                None => return Ok(all),
+            }
+        }
+    }
+
+    /// Up to `limit` entries named after `after`: the visible ones, and the name to continue
+    /// after (`None` once the directory is done).
+    pub fn readdir_page(
+        &self,
+        ino: u64,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<crate::dirs::Page, Errno> {
+        let mut rest = format!("/inodes/{ino}/entries?limit={limit}");
+        if let Some(a) = after {
+            rest.push_str(&format!("&after={}", encode(a)));
+        }
+        let v = self.call(Method::GET, &rest, Body::Empty, Retry::Idempotent)?;
         let mut entries: Vec<DirEntry> = decode(v["entries"].clone())?;
+        let next = match entries.last() {
+            Some(e) if entries.len() >= limit => Some(e.name.clone()),
+            _ => None,
+        };
         entries.retain(|e| !e.name.starts_with(HIDDEN_PREFIX));
-        Ok(entries)
+        Ok((entries, next))
     }
 
     pub fn readlink(&self, ino: u64) -> Result<String, Errno> {

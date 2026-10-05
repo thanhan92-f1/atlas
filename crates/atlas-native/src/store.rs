@@ -11,6 +11,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fs, io,
+    ops::Bound,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard, PoisonError},
 };
@@ -22,7 +23,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     alloc::FreeList,
-    inodes::InodeTable,
+    inodes::{DirEntries, InodeTable},
     leases::Leases,
     membership::Membership,
     metadata::{Catalog, SnapshotId},
@@ -295,18 +296,24 @@ impl CatalogStore {
     }
 }
 
-/// An inode's record: a directory's entries are stored separately.
+/// An inode's record. A directory's entries have records of their own; its record holds their
+/// count in place of the entries (records written before entries were paged hold `{}`).
 fn inode_record(i: &Inode) -> io::Result<Vec<u8>> {
     match &i.kind {
-        InodeKind::Dir { parent, .. } => json(&Inode {
-            kind: InodeKind::Dir {
-                parent: *parent,
-                entries: Tracked::default(),
-            },
-            op_id: i.op_id.clone(),
-            xattrs: i.xattrs.clone(),
-            ..*i
-        }),
+        InodeKind::Dir { parent, entries } => {
+            let mut v = serde_json::to_value(Inode {
+                kind: InodeKind::Dir {
+                    parent: *parent,
+                    entries: DirEntries::default(),
+                },
+                op_id: i.op_id.clone(),
+                xattrs: i.xattrs.clone(),
+                ..*i
+            })
+            .map_err(io::Error::other)?;
+            v["kind"]["dir"]["entries"] = entries.len().into();
+            json(&v)
+        }
         _ => json(i),
     }
 }
@@ -436,22 +443,25 @@ fn write_filesystems(
                 .insert((fs, ino), inode_record(&i)?.as_slice())
                 .map_err(err)?;
             if let InodeKind::Dir { entries, .. } = &i.kind {
-                let names: Box<dyn Iterator<Item = &String>> = if fresh {
-                    Box::new(entries.keys())
+                if fresh {
+                    for (name, child) in f
+                        .inodes
+                        .entries(&i, None, usize::MAX)
+                        .map_err(io::Error::other)?
+                    {
+                        n += 1;
+                        dirents
+                            .insert((fs, ino, name.as_str()), child)
+                            .map_err(err)?;
+                    }
                 } else {
-                    Box::new(entries.touched().iter())
-                };
-                for name in names {
-                    n += 1;
-                    match entries.get(name) {
-                        Some(child) => {
-                            dirents
-                                .insert((fs, ino, name.as_str()), *child)
-                                .map_err(err)?;
+                    for (name, child) in entries.changes() {
+                        n += 1;
+                        match child {
+                            Some(child) => dirents.insert((fs, ino, name), child).map(drop),
+                            None => dirents.remove((fs, ino, name)).map(drop),
                         }
-                        None => {
-                            dirents.remove((fs, ino, name.as_str())).map_err(err)?;
-                        }
+                        .map_err(err)?;
                     }
                 }
             }
@@ -546,20 +556,57 @@ impl StoreSnapshot {
         };
         let mut inode: Inode = parse(v.value())?;
         if let InodeKind::Dir { entries, .. } = &mut inode.kind {
-            let mut names = BTreeMap::new();
-            match self.tx.open_table(DIR_ENTRIES) {
-                Ok(d) => {
-                    for row in d.range((fs, ino, "")..(fs, ino + 1, "")).map_err(err)? {
-                        let (k, v) = row.map_err(err)?;
-                        names.insert(k.value().2.to_string(), v.value());
-                    }
-                }
-                Err(TableError::TableDoesNotExist(_)) => {}
-                Err(e) => return Err(err(e)),
+            if !entries.is_stored() {
+                let n = self.entries(fs, ino, None, usize::MAX, |_| false)?.len();
+                *entries = DirEntries::stored(n as u64);
             }
-            *entries = names.into();
         }
         Ok(Some(inode))
+    }
+
+    /// The inode `name` names in directory `dir` of `fs`, if any.
+    pub(crate) fn entry(&self, fs: &str, dir: u64, name: &str) -> io::Result<Option<u64>> {
+        match self.tx.open_table(DIR_ENTRIES) {
+            Ok(t) => Ok(t.get((fs, dir, name)).map_err(err)?.map(|v| v.value())),
+            Err(TableError::TableDoesNotExist(_)) => Ok(None),
+            Err(e) => Err(err(e)),
+        }
+    }
+
+    /// Up to `limit` entries of directory `dir` of `fs` named after `after`, in name order,
+    /// leaving out the names `skip` picks.
+    pub(crate) fn entries(
+        &self,
+        fs: &str,
+        dir: u64,
+        after: Option<&str>,
+        limit: usize,
+        skip: impl Fn(&str) -> bool,
+    ) -> io::Result<Vec<(String, u64)>> {
+        let t = match self.tx.open_table(DIR_ENTRIES) {
+            Ok(t) => t,
+            Err(TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(err(e)),
+        };
+        let lower = match after {
+            Some(a) => Bound::Excluded((fs, dir, a)),
+            None => Bound::Included((fs, dir, "")),
+        };
+        let mut out = Vec::new();
+        for row in t
+            .range::<(&str, u64, &str)>((lower, Bound::Excluded((fs, dir + 1, ""))))
+            .map_err(err)?
+        {
+            if out.len() >= limit {
+                break;
+            }
+            let (k, v) = row.map_err(err)?;
+            let name = k.value().2;
+            if !skip(name) {
+                out.push((name.to_string(), v.value()));
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -814,6 +861,88 @@ mod tests {
         let written = h.store.checkpoint(&mut h.catalog).unwrap();
         assert_eq!(written, 5);
         h.check();
+    }
+
+    #[test]
+    fn a_large_directory_keeps_only_its_changes_in_memory_and_pages_by_name() {
+        let mut h = Harness::new();
+        h.fs(FsOp::CreateFs {
+            fs: "f".into(),
+            name: "f".into(),
+            now_ns: 1,
+            extent_bytes: None,
+        });
+        for i in 0..2000 {
+            h.mknode("f", ROOT_INO, &format!("file-{i:04}"), NodeType::File);
+        }
+        h.check();
+        let in_memory = |c: &Catalog| match &c.filesystems["f"].inode(ROOT_INO).unwrap().kind {
+            InodeKind::Dir { entries, .. } => (entries.is_stored(), entries.changes().count()),
+            _ => unreachable!(),
+        };
+        assert_eq!(in_memory(&h.catalog), (true, 0));
+
+        h.fs(FsOp::Unlink {
+            fs: "f".into(),
+            parent: ROOT_INO,
+            name: "file-0001".into(),
+            now_ns: 2,
+        });
+        h.mknode("f", ROOT_INO, "file-0001a", NodeType::File);
+        h.fs(FsOp::Rename {
+            fs: "f".into(),
+            parent: ROOT_INO,
+            name: "file-0005".into(),
+            new_parent: ROOT_INO,
+            new_name: "zzz".into(),
+            now_ns: 3,
+        });
+        assert_eq!(in_memory(&h.catalog), (true, 4));
+        let f = &h.catalog.filesystems["f"];
+        assert_eq!(f.inode(ROOT_INO).unwrap().size(), 2000);
+        assert_eq!(f.entry(ROOT_INO, "file-0001").unwrap(), None);
+        assert!(f.entry(ROOT_INO, "file-1999").unwrap().is_some());
+        let mut names = Vec::new();
+        let mut after: Option<String> = None;
+        loop {
+            let page = f.entries(ROOT_INO, after.as_deref(), 300).unwrap();
+            let Some((last, _)) = page.last() else { break };
+            after = Some(last.clone());
+            names.extend(page.into_iter().map(|(n, _)| n));
+        }
+        let mut want: Vec<String> = (0..2000)
+            .filter(|i| ![1, 5].contains(i))
+            .map(|i| format!("file-{i:04}"))
+            .chain(["file-0001a".to_string(), "zzz".to_string()])
+            .collect();
+        want.sort();
+        assert_eq!(names, want);
+        h.check();
+        assert_eq!(in_memory(&h.catalog), (true, 0));
+
+        // A record written before entries were paged holds `{}`: its entries are counted on read.
+        let root = h.catalog.filesystems["f"].inode(ROOT_INO).unwrap();
+        let legacy = json(&Inode {
+            kind: InodeKind::Dir {
+                parent: ROOT_INO,
+                entries: DirEntries::default(),
+            },
+            op_id: root.op_id.clone(),
+            xattrs: root.xattrs.clone(),
+            ..*root
+        })
+        .unwrap();
+        let tx = h.store.db.begin_write().unwrap();
+        tx.open_table(INODES)
+            .unwrap()
+            .insert(("f", ROOT_INO), legacy.as_slice())
+            .unwrap();
+        tx.commit().unwrap();
+        let loaded = h.store.load().unwrap().unwrap();
+        assert_eq!(
+            loaded.filesystems["f"].inode(ROOT_INO).unwrap().size(),
+            2000
+        );
     }
 
     #[test]

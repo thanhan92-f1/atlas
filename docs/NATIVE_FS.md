@@ -51,7 +51,7 @@ All routes need the API token (and client certificate where configured), like th
 | `GET /v1/fs/{fs}/inodes/{ino}` | Attributes: `{ino, kind, mode, uid, gid, nlink, size, blocks, rdev, atime_ns, mtime_ns, ctime_ns}`. |
 | `POST /v1/fs/{fs}/inodes/{ino}/attr` | Any of `{mode, uid, gid, size, atime_ns, mtime_ns}` → attributes. |
 | `GET /v1/fs/{fs}/inodes/{dir}/lookup?name=` | Attributes of the entry (`name` percent-encoded). |
-| `GET /v1/fs/{fs}/inodes/{dir}/entries` | `{"entries": [{name, ino, kind}]}`. |
+| `GET /v1/fs/{fs}/inodes/{dir}/entries` | `{"entries": [{name, ino, kind}]}` in name order. `?limit=N` returns at most N; `?after=<name>` (percent-encoded) starts after that name. Without `limit`, the whole directory. |
 | `POST /v1/fs/{fs}/inodes/{dir}/entries` | `{name, op_id, kind, mode, uid, gid, target?, rdev?}` (`kind`: `file`, `dir`, `symlink`, `fifo`, `socket`, `char_device`, `block_device`) → 201 attributes. |
 | `POST /v1/fs/{fs}/inodes/{dir}/unlink`, `/rmdir` | `{name}` → 204. |
 | `POST /v1/fs/{fs}/inodes/{ino}/links` | `{parent, name}`: a hard link → attributes. |
@@ -124,6 +124,9 @@ modes and ownership.
 - **Unlink while open**: removing a file another handle in the same mount still has open renames it
   to a hidden `.atlas_hidden_<ino>_<n>` entry (not listed by `readdir`) and removes it on the last
   close, or at unmount.
+- **Directory listings**: each open directory reads 1024 entries per request (`?after=&limit=`)
+  and keeps its place between the kernel's `readdir` calls, so listing a directory of any size
+  costs one request per page. Seeking back restarts the listing.
 - **Direct reads** (`--direct-reads`): the leader only answers
   `GET /v1/fs/<fs>/inodes/<ino>/layout?offset=&len=` (each extent's offset, length, SHA-256 and
   replicas with their data-node addresses, in the order a read should try them); the client then
@@ -215,8 +218,10 @@ command checks its inputs before it changes anything, so a rejected one leaves t
 was (debug builds assert this on every apply), and the leader validates proposals against one
 running copy of the catalog plus its uncommitted entries. A create therefore costs the same at
 100k inodes as at 10k. Log compaction (every 1024 entries) checkpoints only the records changed
-since the last one to `catalog.redb` (`docs/NATIVE_METADATA.md`, "Catalog store"); the leader still
-holds two copies of the catalog in memory.
+since the last one to `catalog.redb` (`docs/NATIVE_METADATA.md`, "Catalog store"). Inodes and
+directory entries are paged from it, so memory holds what changed since the last checkpoint plus
+a bounded inode cache, not the namespace. The leader's applied and speculative catalogs share
+everything paged.
 
 Engine-level create rates without FUSE or HTTP (`crates/atlas-native/tests/metadata_bench.rs`, one
 host, tmpfs) are ~9k/s from one proposer and ~12k/s from eight on a 3-voter group at 20k files.
@@ -245,8 +250,11 @@ disk latency but stay flat with the inode count (same run shape, no retries):
 | 15k | 47 | 321 | 811 | 3.4 | 99 |
 | 25k | 42 | 346 | 1214 | 5.8 | 112 |
 
-The practical limit is now memory: about 6 KiB
-of leader RSS per inode, so plan on roughly 1M inodes per 8 GiB node.
+These runs predate the paged catalog, when leader memory grew about 6 KiB per inode. Memory now
+follows the inode cache rather than the inode count: `store::bench::memory_of_a_paged_catalog`
+(4096-inode cache, second lab host, 2026-10-05) peaks at ~76 MB for 400k files in one directory
+and ~78 MB spread over 1000, flat from 300k files on as redb's page cache fills (112–114 MB before
+directory entries were paged).
 
 Data path, FUSE mount, measured 2026-10-04: 3 nodes on one 12-core host (other tenants' load
 average around 25), node data on tmpfs so the shared HDDs don't mask software overhead, fio with
@@ -269,8 +277,7 @@ localhost data nodes.
 Known limits:
 
 - One filesystem never spans groups: its inodes all live in one group, behind one leader.
-- The catalog lives in memory (twice on the leader) and is written whole to disk at each log
-  compaction.
+- Filesystem snapshot trees are held in memory in full, and each is one record in the store.
 - A write that covers part of an extent reads, merges and rewrites the whole extent: up to the
   filesystem's `extent_bytes` (1 MiB by default). With the cluster on its default 4 MiB grid,
   random 4 KiB writes measured 24/s at a 4 MiB file grid, 28/s at 1 MiB, 35/s at 256 KiB and
@@ -292,7 +299,8 @@ Known limits:
 - `crates/atlas-native-fuse/tests/ops.rs`: the FUSE operations layer against a live in-process
   cluster, including a leader failure mid-workload, unlink-while-open, read-only snapshot mounts,
   clone isolation, concurrent creates, direct reads (across extents, after a rewrite) and their
-  fallback to the leader.
+  fallback to the leader; `crates/atlas-native-fuse/src/dirs.rs` unit tests page a 2500-entry
+  listing through small kernel buffers with one request per page, and rewind on a seek back.
 - `crates/atlas-native/tests/allocator.rs`: one write's concurrent extent placements reuse
   distinct free ranges (verified by reading back and scrubbing every replica).
 - `crates/atlas-driver-native/tests/nodes.rs` and `crates/atlas-gateway/tests/native_backend.rs`:

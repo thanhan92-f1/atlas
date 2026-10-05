@@ -150,7 +150,7 @@ fn mount(args: &Args, ops: Ops) -> Result<(), String> {
     }
     cfg.n_threads = Some(args.fuse_threads.max(1));
     cfg.clone_fd = args.fuse_threads > 1;
-    let fs = atlas_native_fuse::fuse::AtlasFs { ops };
+    let fs = atlas_native_fuse::fuse::AtlasFs::new(ops);
     fuser::mount(fs, &args.mountpoint, &cfg).map_err(|e| format!("mount: {e}"))
 }
 

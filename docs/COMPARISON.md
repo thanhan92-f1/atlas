@@ -25,7 +25,7 @@ columns state only what has been measured or verified in this repository.
 | What it is | Control plane driving Ceph (RBD, CephFS, RGW) through Rook | Atlas's own replicated block and POSIX store | Parallel filesystem with its own client and data path |
 | Data path | Ceph's (librbd, kernel RBD, CephFS) | FUSE client; writes through the Raft leader, reads direct from data nodes over a binary protocol (optional); data nodes on files or raw devices (`O_DIRECT` via `io_uring`), striped across several devices | Kernel-bypass NVMe and network stack |
 | Measured performance | Ceph's; Atlas adds no data-path hop | Metadata engine ~9–12k creates/s on a 3-voter group; through FUSE ~270 creates/s, ~380 MiB/s write, up to ~540 MiB/s read, ~600 4 KiB random-read IOPS (one host, tmpfs, `docs/NATIVE_FS.md`); no NVMe numbers yet | Designed for very high IOPS and throughput at low latency |
-| Metadata | Ceph MDS (CephFS) | Raft groups sharded by volume/filesystem; inode tables paged from an embedded KV store | Distributed across the cluster |
+| Metadata | Ceph MDS (CephFS) | Raft groups sharded by volume/filesystem; inodes and directory entries paged from an embedded KV store | Distributed across the cluster |
 | Data protection | Ceph replication or erasure coding | 3 replicas, SHA-256 checksums | Distributed erasure coding |
 | Tiering to object storage | Not managed by Atlas | Not yet | Yes |
 | GPUDirect Storage | No | No | Yes |
@@ -68,9 +68,9 @@ The atlas-native roadmap, in order, each phase gated on a published benchmark:
 2. **Metadata scale:** namespace sharded across Raft groups, an on-disk catalog, client leases.
    Commits cost one fsync, Raft replication is pipelined (a 3-voter group sustains ~12–15k
    creates/s on one host), and checkpoints write only changed records to an embedded KV store.
-   Inode tables are paged from the store, volumes and filesystems shard across Raft groups,
-   client sessions hold cross-mount file locks, and cache leases let mounts cache metadata
-   without serving it stale. Paging directory entries is not done.
+   Inode tables and directory entries are paged from the store, volumes and filesystems shard
+   across Raft groups, client sessions hold cross-mount file locks, and cache leases let mounts
+   cache metadata without serving it stale. Filesystem snapshot trees are still held in memory.
 3. **Efficiency:** erasure coding with a rebuild controller; cold extents tiered to S3.
 4. **AI:** RDMA transport, a GPUDirect Storage path, a checkpoint fast path, a CSI driver;
    MLPerf Storage results.
