@@ -100,9 +100,12 @@ mounts them through FUSE with leader failover, TTL attribute/name caching, write
 read-ahead; close-to-open consistency across mounts. The gateway serves them as `filesystem`
 volumes `vol_native_fs_<id>` (create/snapshot/clone/restore/delete via `atlasctl create-volume
 --backend bkd_native --kind filesystem`). pjdfstest (12 suites, 8565 tests), git clone + fsck and
-snapshot/clone isolation verified over FUSE on the lab. Scaling limit: one Raft group and a
-in-memory catalog (commands apply in place; creates hold ~270/s locally from 10k to 100k inodes,
-memory ~6 KiB/inode on the leader — see the doc).
+snapshot/clone isolation verified over FUSE on the lab. Scaling limit: one Raft group whose
+catalog lives fully in memory (~6 KiB/inode on the leader). Commits cost one WAL fsync, Raft
+replication is pipelined, and checkpoints write only changed records to `catalog.redb` (redb;
+`tracked::Tracked` maps record changed keys; a legacy `catalog.json` migrates on open, one-way).
+`tests/metadata_bench.rs` (ignored): a 3-voter group does ~9k creates/s from one proposer and
+~12k/s from eight on one host; through FUSE creates are still ~270/s (per-op HTTP round trips).
 
 **Licensed** under the [Apache License 2.0](LICENSE) (`Apache-2.0`; relicensed from the Zyvor
 Production License v1.0 at the maintainer's explicit request — history in
@@ -132,12 +135,16 @@ integrations beyond the gRPC surface.
   attribution, histograms, workload accounting, RCA, fail-open leases; own HTTP API + `/metrics`,
   not embedded in `atlas-gateway` (see `docs/IO_EBPF.md`).
 - `crates/atlas-native` — native data plane (served to the gateway by `atlas-driver-native`): replicated
-  extent engine, metadata WAL + checkpoint/compaction, refcounted extents with free-list space reuse,
+  extent engine, metadata WAL + incremental checkpoints into a redb catalog store (`store`,
+  `tracked`), refcounted extents with free-list space reuse,
   and a Raft core for the metadata log (pre-vote, check-quorum, joint-consensus membership changes via
   `POST /v1/members`) with a std-only TCP server
   (`raft_server`), plus networked data nodes (`data_node`, term-fenced writes) so the engine can
   commit through Raft (`MetaBackend::Raft`) with replicas on other hosts. Per-node circuit breaker,
   write failover and scrub/repair (`repair_once`); both transports support optional mutual TLS.
+  Data nodes serve one or more devices (`data_node.devices`) with a `file`, `aligned` (`O_DSYNC`,
+  4 KiB-aligned) or `io_uring` (`O_DIRECT`, `io-uring` cargo feature, Linux) backend (`raw`,
+  `uring`); the engine stripes replicas across a node's devices.
   Bin `atlas-native-node` (`node` module) runs either role with an HTTP health/metrics/volume API
   (`deploy/native/smoke.sh`); `Dockerfile.native` + `deploy/k8s/atlas-native.yaml` (3-pod
   StatefulSet, verified live on the lab k3s incl. leader-pod failover) deployed by

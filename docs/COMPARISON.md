@@ -23,9 +23,9 @@ columns state only what has been measured or verified in this repository.
 | | **Atlas over Ceph** | **Atlas native** | **WEKA** |
 |---|---|---|---|
 | What it is | Control plane driving Ceph (RBD, CephFS, RGW) through Rook | Atlas's own replicated block and POSIX store | Parallel filesystem with its own client and data path |
-| Data path | Ceph's (librbd, kernel RBD, CephFS) | FUSE client; writes through the Raft leader, reads direct from data nodes over a binary protocol (optional) | Kernel-bypass NVMe and network stack |
-| Measured performance | Ceph's; Atlas adds no data-path hop | ~270 creates/s; FUSE ~380 MiB/s write, up to ~540 MiB/s read, ~600 4 KiB random-read IOPS (one host, tmpfs, `docs/NATIVE_FS.md`) | Designed for very high IOPS and throughput at low latency |
-| Metadata | Ceph MDS (CephFS) | One Raft group, in memory | Distributed across the cluster |
+| Data path | Ceph's (librbd, kernel RBD, CephFS) | FUSE client; writes through the Raft leader, reads direct from data nodes over a binary protocol (optional); data nodes on files or raw devices (`O_DIRECT` via `io_uring`), striped across several devices | Kernel-bypass NVMe and network stack |
+| Measured performance | Ceph's; Atlas adds no data-path hop | Metadata engine ~9–12k creates/s on a 3-voter group; through FUSE ~270 creates/s, ~380 MiB/s write, up to ~540 MiB/s read, ~600 4 KiB random-read IOPS (one host, tmpfs, `docs/NATIVE_FS.md`); no NVMe numbers yet | Designed for very high IOPS and throughput at low latency |
+| Metadata | Ceph MDS (CephFS) | One Raft group; in-memory catalog with incremental checkpoints to an embedded KV store | Distributed across the cluster |
 | Data protection | Ceph replication or erasure coding | 3 replicas, SHA-256 checksums | Distributed erasure coding |
 | Tiering to object storage | Not managed by Atlas | Not yet | Yes |
 | GPUDirect Storage | No | No | Yes |
