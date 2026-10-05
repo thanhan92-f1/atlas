@@ -176,8 +176,13 @@ The whole namespace lives in one Raft group's in-memory catalog. Commands apply 
 command checks its inputs before it changes anything, so a rejected one leaves the catalog as it
 was (debug builds assert this on every apply), and the leader validates proposals against one
 running copy of the catalog plus its uncommitted entries. A create therefore costs the same at
-100k inodes as at 10k; the catalog is still written whole at each log compaction (every 1024
-entries, amortised) and the leader holds two copies of it in memory.
+100k inodes as at 10k. Log compaction (every 1024 entries) checkpoints only the records changed
+since the last one to `catalog.redb` (`docs/NATIVE_METADATA.md`, "Catalog store"); the leader still
+holds two copies of the catalog in memory.
+
+Engine-level create rates without FUSE or HTTP (`crates/atlas-native/tests/metadata_bench.rs`, one
+host, tmpfs) are ~9k/s from one proposer and ~12k/s from eight on a 3-voter group at 20k files.
+The table below predates pipelined replication and the catalog store.
 
 Measured 2026-10-04, file creates through the node API with 16 concurrent clients on a 3-node
 cluster on one laptop (Apple SSD, release build, other load on the machine), all filesystems in

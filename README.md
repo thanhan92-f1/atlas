@@ -40,7 +40,7 @@ A gateway with an Apple Shop console for operators. Read the [full docs](https:/
 | **`atlas-io` eBPF I/O sensor** | Observe-first per-node agent: log2-µs histograms, cgroup/pid attribution, deterministic RCA, fail-open write-freeze leases; `atlasctl io …` ([docs](docs/IO_EBPF.md)) |
 | **Go client** | Stdlib-only Go client for the REST API, with a contract test ([`clients/go`](clients/go)) |
 | **DataBridge fixes** | MySQL `TIMESTAMP` columns through CDC, MySQL 8 auth, a capped Kafka Connect worker |
-| **Atlas Native (experimental)** | An append-only replicated extent engine with Raft, mutual TLS, a node API, Helm chart and a FUSE client — Phase 1, see [docs/NATIVE_STORAGE.md](docs/NATIVE_STORAGE.md) |
+| **Atlas Native (experimental)** | An append-only replicated extent engine with Raft, mutual TLS, a node API, Helm chart and a FUSE client; direct data-node reads, `io_uring` raw-device backends, an incremental on-disk catalog — roadmap status in [docs/NATIVE_STORAGE.md](docs/NATIVE_STORAGE.md) |
 
 Details: [CHANGELOG.md](CHANGELOG.md).
 
