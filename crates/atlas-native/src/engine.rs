@@ -58,9 +58,12 @@ impl Target<'_> {
     /// The extent currently at grid cell `cell`, if any.
     fn extent_at(&self, c: &Catalog, cell: u64) -> Result<Option<ExtentRef>, NativeError> {
         let id = match self {
-            Target::Volume(v) => c.volumes.get(*v).and_then(|v| v.extents.get(&cell)),
+            Target::Volume(v) => c
+                .volumes
+                .get(*v)
+                .and_then(|v| v.extents.get(&cell).cloned()),
             Target::File { fs, ino } => match &c.filesystem(fs)?.inode(*ino)?.kind {
-                InodeKind::File { extents, .. } => extents.get(&cell),
+                InodeKind::File { extents, .. } => extents.get(&cell).cloned(),
                 _ => {
                     return Err(
                         MetaError::IsDir(format!("inode {ino} is not a regular file")).into(),
@@ -69,7 +72,7 @@ impl Target<'_> {
             },
         };
         Ok(id
-            .and_then(|id| c.extents.get(id))
+            .and_then(|id| c.extents.get(&id))
             .map(|m| m.extent.clone()))
     }
 }
@@ -1327,7 +1330,6 @@ impl NativeEngine {
         }
         Err(NativeError::Checksum(ext.id.clone()))
     }
-
 }
 
 /// The checkpointed catalog plus every WAL record past it.

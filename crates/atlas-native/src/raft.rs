@@ -883,6 +883,7 @@ impl RaftNode {
     fn handle_snapshot(&mut self, mut snap: Catalog) -> Result<(), RaftError> {
         // The leader's catalog, whatever its own store holds: ours gets all of it.
         snap.in_store = false;
+        snap.fill_usage();
         let si = snap.applied_index;
         let st = snap.current_term;
         if si <= self.commit_index {

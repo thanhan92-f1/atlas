@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use super::{now_ns, NativeEngine, NativeError, Target};
 use crate::{
     metadata::{Catalog, MetaCommand, MetaError, SnapshotId},
-    namespace::{file_extents, FsId, FsMeta, FsOp, Inode, InodeKind, NodeType, SetAttr, XattrMode},
+    namespace::{FsId, FsMeta, FsOp, Inode, InodeKind, NodeType, SetAttr, XattrMode},
 };
 
 /// File extent grid for new filesystems: a 4 KiB write rewrites at most this much.
@@ -225,13 +225,8 @@ impl NativeEngine {
                 .map(|f| FsInfo {
                     id: f.id.clone(),
                     name: f.name.clone(),
-                    inodes: f.inodes.len(),
-                    bytes: f
-                        .inodes
-                        .values()
-                        .filter(|i| matches!(i.kind, InodeKind::File { .. }))
-                        .map(Inode::size)
-                        .sum(),
+                    inodes: f.inodes.len() as usize,
+                    bytes: f.usage.unwrap_or_default().file_bytes,
                     source_snapshot: f.source_snapshot.clone(),
                     extent_bytes: f.extent_bytes.unwrap_or(self.cfg.extent_bytes as u64),
                 })
@@ -242,33 +237,33 @@ impl NativeEngine {
     pub fn fs_statfs(&self, fs: &str) -> Result<FsStat, NativeError> {
         self.with_fs(fs, |c, f| {
             Ok(FsStat {
-                inodes: f.inodes.len() as u64,
-                used_bytes: file_extents(&f.inodes)
-                    .filter_map(|e| c.extents.get(e))
-                    .map(|m| m.extent.len as u64)
-                    .sum(),
+                inodes: f.inodes.len(),
+                used_bytes: f.usage.unwrap_or_default().used_bytes,
                 free_list_bytes: c.free.total_bytes(),
             })
         })
     }
 
     pub fn fs_getattr(&self, fs: &str, ino: u64) -> Result<Attr, NativeError> {
-        self.with_fs(fs, |c, f| Ok(attr(c, f.inode(ino)?)))
+        self.with_fs(fs, |c, f| Ok(attr(c, f.inode(ino)?.as_ref())))
     }
 
     pub fn fs_lookup(&self, fs: &str, parent: u64, name: &str) -> Result<Attr, NativeError> {
-        self.with_fs(fs, |c, f| Ok(attr(c, f.inode(f.lookup(parent, name)?)?)))
+        self.with_fs(fs, |c, f| {
+            Ok(attr(c, f.inode(f.lookup(parent, name)?)?.as_ref()))
+        })
     }
 
     pub fn fs_readdir(&self, fs: &str, dir: u64) -> Result<Vec<DirEntry>, NativeError> {
         self.with_fs(fs, |_, f| {
-            f.entries(dir)?
+            f.dir(dir)?
+                .entries()
                 .iter()
                 .map(|(name, ino)| {
                     Ok(DirEntry {
                         name: name.clone(),
                         ino: *ino,
-                        kind: kind_of(f.inode(*ino)?),
+                        kind: kind_of(f.inode(*ino)?.as_ref()),
                     })
                 })
                 .collect()
@@ -473,7 +468,8 @@ impl NativeEngine {
         len: usize,
     ) -> Result<Vec<u8>, NativeError> {
         let (extents, len) = self.with_fs(fs, |c, f| {
-            let InodeKind::File { size, extents } = &f.inode(ino)?.kind else {
+            let inode = f.inode(ino)?;
+            let InodeKind::File { size, extents } = &inode.kind else {
                 return Err(NativeError::Invalid(format!(
                     "inode {ino} is not a regular file"
                 )));
@@ -499,7 +495,8 @@ impl NativeEngine {
         len: usize,
     ) -> Result<FileLayout, NativeError> {
         let (extents, len, size) = self.with_fs(fs, |c, f| {
-            let InodeKind::File { size, extents } = &f.inode(ino)?.kind else {
+            let inode = f.inode(ino)?;
+            let InodeKind::File { size, extents } = &inode.kind else {
                 return Err(NativeError::Invalid(format!(
                     "inode {ino} is not a regular file"
                 )));
@@ -599,7 +596,7 @@ impl NativeEngine {
                     fs_id: s.fs_id.clone(),
                     name: s.name.clone(),
                     created_ns: s.created_ns,
-                    inodes: s.tree.inodes.len(),
+                    inodes: s.tree.inodes.len() as usize,
                 })
                 .collect()
         })

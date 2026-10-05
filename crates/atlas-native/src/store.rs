@@ -23,7 +23,7 @@ use crate::{
     alloc::FreeList,
     membership::Membership,
     metadata::{Catalog, SnapshotId},
-    namespace::{FsId, FsMeta, Inode, InodeKind},
+    namespace::{FsId, FsMeta, FsUsage, Inode, InodeKind},
     tracked::Tracked,
 };
 
@@ -65,6 +65,8 @@ struct FsHeader {
     next_ino: u64,
     source_snapshot: Option<SnapshotId>,
     extent_bytes: Option<u64>,
+    #[serde(default)]
+    usage: Option<FsUsage>,
 }
 
 fn err(e: impl Into<redb::Error>) -> io::Error {
@@ -86,15 +88,14 @@ const LEGACY_CATALOG: &str = "catalog.json";
 
 /// The checkpointed catalog: from the store, else from a legacy `catalog.json`, else empty.
 pub fn load_checkpoint(root: &Path, store: &CatalogStore) -> io::Result<Catalog> {
-    if let Some(c) = store.load()? {
-        return Ok(c);
-    }
     let legacy = root.join(LEGACY_CATALOG);
-    if legacy.exists() {
-        parse(&fs::read(&legacy)?)
-    } else {
-        Ok(Catalog::default())
-    }
+    let mut c = match store.load()? {
+        Some(c) => c,
+        None if legacy.exists() => parse(&fs::read(&legacy)?)?,
+        None => Catalog::default(),
+    };
+    c.fill_usage();
+    Ok(c)
 }
 
 /// Drops a legacy `catalog.json` once the store holds a checkpoint, so it can never be read
@@ -210,12 +211,17 @@ impl CatalogStore {
             .into_values()
             .map(|h| {
                 let fs = FsMeta {
-                    inodes: inodes.remove(&h.id).unwrap_or_default().into(),
+                    inodes: inodes
+                        .remove(&h.id)
+                        .unwrap_or_default()
+                        .into_values()
+                        .collect(),
                     id: h.id.clone(),
                     name: h.name,
                     next_ino: h.next_ino,
                     source_snapshot: h.source_snapshot,
                     extent_bytes: h.extent_bytes,
+                    usage: h.usage,
                 };
                 (h.id, fs)
             })
@@ -256,13 +262,8 @@ impl CatalogStore {
         c.snapshots.clear_changes();
         c.extents.clear_changes();
         c.fs_snapshots.clear_changes();
-        c.filesystems.clear_changes_with(|f| {
-            f.inodes.clear_changes_with(|i| {
-                if let InodeKind::Dir { entries, .. } = &mut i.kind {
-                    entries.clear_changes();
-                }
-            })
-        });
+        c.filesystems
+            .clear_changes_with(|f| f.inodes.clear_changes());
         c.in_store = true;
         Ok(records)
     }
@@ -380,28 +381,29 @@ fn write_filesystems(
             next_ino: f.next_ino,
             source_snapshot: f.source_snapshot.clone(),
             extent_bytes: f.extent_bytes,
+            usage: f.usage,
         })?;
         headers.insert(fs, header.as_slice()).map_err(err)?;
-        let changed: Box<dyn Iterator<Item = &u64>> = if rewrite {
-            Box::new(f.inodes.keys())
+        let changed: Box<dyn Iterator<Item = u64>> = if rewrite {
+            Box::new(f.inodes.values().map(|i| i.ino))
         } else {
-            Box::new(f.inodes.touched().iter())
+            Box::new(f.inodes.touched())
         };
-        for &ino in changed {
+        for ino in changed {
             n += 1;
             // An inode inserted or removed (not just edited) keeps none of its old entries.
-            let fresh = rewrite || f.inodes.replaced().contains(&ino);
+            let fresh = rewrite || f.inodes.replaced(ino);
             if fresh && !rewrite {
                 dirents
                     .retain_in((fs, ino, "")..(fs, ino + 1, ""), |_, _| false)
                     .map_err(err)?;
             }
-            let Some(i) = f.inodes.get(&ino) else {
+            let Some(i) = f.inodes.get(ino) else {
                 inodes.remove((fs, ino)).map_err(err)?;
                 continue;
             };
             inodes
-                .insert((fs, ino), inode_record(i)?.as_slice())
+                .insert((fs, ino), inode_record(&i)?.as_slice())
                 .map_err(err)?;
             if let InodeKind::Dir { entries, .. } = &i.kind {
                 let names: Box<dyn Iterator<Item = &String>> = if fresh {
@@ -481,7 +483,7 @@ mod tests {
         }
 
         fn ino(&self, fs: &str, name: &str) -> u64 {
-            self.catalog.filesystems[fs].entries(ROOT_INO).unwrap()[name]
+            self.catalog.filesystems[fs].lookup(ROOT_INO, name).unwrap()
         }
 
         /// Checkpoints, then reads the store back and compares it with memory.
@@ -548,7 +550,7 @@ mod tests {
             now_ns: 6,
         });
         h.check();
-        assert!(!h.catalog.filesystems["f"].inodes.contains_key(&a));
+        assert!(!h.catalog.filesystems["f"].inodes.contains(a));
 
         // Renames across directories and an rmdir move and drop entry records.
         h.mknode("f", ROOT_INO, "gone", NodeType::Dir);
@@ -620,6 +622,39 @@ mod tests {
         let written = h.store.checkpoint(&mut h.catalog).unwrap();
         assert_eq!(written, 5);
         h.check();
+    }
+
+    #[test]
+    fn usage_missing_from_an_older_checkpoint_is_counted_on_load() {
+        let mut h = Harness::new();
+        h.fs(FsOp::CreateFs {
+            fs: "f".into(),
+            name: "f".into(),
+            now_ns: 1,
+            extent_bytes: None,
+        });
+        h.mknode("f", ROOT_INO, "a", NodeType::File);
+        let a = h.ino("f", "a");
+        h.fs(FsOp::InstallFileExtent {
+            fs: "f".into(),
+            ino: a,
+            logical_offset: 0,
+            extent: extent("e1", 0),
+            size: 4000,
+            now_ns: 3,
+        });
+        let kept = h.catalog.filesystems["f"].usage;
+        assert_eq!(
+            kept,
+            Some(FsUsage {
+                file_bytes: 4000,
+                used_bytes: 4096
+            })
+        );
+        h.catalog.filesystems.get_mut("f").unwrap().usage = None;
+        h.store.checkpoint(&mut h.catalog).unwrap();
+        let loaded = load_checkpoint(h._td.path(), &h.store).unwrap();
+        assert_eq!(loaded.filesystems["f"].usage, kept);
     }
 
     #[test]
