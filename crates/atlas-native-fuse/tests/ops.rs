@@ -617,3 +617,51 @@ fn extended_attributes_round_trip_and_follow_snapshots() {
         Err(libc::EROFS)
     );
 }
+
+#[test]
+fn file_locks_are_seen_by_every_mount() {
+    let c = Cluster::start();
+    create_fs(&c, "lk");
+    let a = mount(&c, "lk", OpsConfig::default());
+    let b = mount(&c, "lk", OpsConfig::default());
+    let f = a
+        .mknode(ROOT_INO, "f", NodeType::File, None, 0o644, 0, 0)
+        .unwrap();
+    use atlas_native_fuse::locks::{F_RDLCK as rd, F_UNLCK as un, F_WRLCK as wr};
+    assert_eq!(a.lock_session(), None, "no session before the first lock");
+    a.setlk(f.ino, 1, 0, 99, wr, 11, false).unwrap();
+    assert!(a.lock_session().is_some());
+    // Same lock owner number, other mount: still another owner.
+    assert_eq!(b.setlk(f.ino, 1, 50, 50, rd, 22, false), Err(libc::EAGAIN));
+    let conflict = b.getlk(f.ino, 1, 0, u64::MAX, rd).unwrap().unwrap();
+    assert_eq!(
+        (conflict.start, conflict.end, conflict.typ, conflict.pid),
+        (0, 99, wr, 11)
+    );
+    assert_eq!(b.getlk(f.ino, 1, 100, 200, wr).unwrap(), None);
+    b.setlk(f.ino, 1, 100, u64::MAX, rd, 22, false).unwrap();
+
+    // A blocking request waits until the holder lets go (here: closes the file).
+    let waiter = std::thread::scope(|s| {
+        let t = s.spawn(|| b.setlk(f.ino, 2, 0, 9, wr, 22, true));
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!t.is_finished());
+        a.release_locks(f.ino, 1).unwrap();
+        t.join().unwrap()
+    });
+    waiter.unwrap();
+    assert_eq!(a.setlk(f.ino, 1, 0, 0, rd, 11, false), Err(libc::EAGAIN));
+    b.setlk(f.ino, 2, 0, u64::MAX, un, 22, false).unwrap();
+    a.setlk(f.ino, 1, 0, 0, rd, 11, false).unwrap();
+
+    // Unmounting closes the session and releases what it held.
+    a.close_session();
+    drop(a);
+    b.setlk(f.ino, 3, 0, u64::MAX, wr, 22, false).unwrap_err();
+    b.setlk(f.ino, 1, 0, u64::MAX, wr, 22, false).unwrap();
+
+    // A snapshot mount never conflicts: nothing writes there.
+    let snap = mount(&c, "lk@none", OpsConfig::default());
+    assert_eq!(snap.getlk(f.ino, 1, 0, 9, wr), Ok(None));
+    assert_eq!(snap.lock_sessions_lost(), 0);
+}

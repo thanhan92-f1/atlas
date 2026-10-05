@@ -11,8 +11,9 @@ use serde_json::json;
 
 use super::{body_json, client_id, query_u64, read_range, MetaGroup, NodeShared};
 use crate::{
-    engine::{NativeEngine, NativeError, NewNode, ObjectKind},
+    engine::{LockRequest, NativeEngine, NativeError, NewNode, ObjectKind},
     http::{Request, Response},
+    leases::{LockKind, Session},
     namespace::{SetAttr, XattrMode},
 };
 
@@ -141,6 +142,20 @@ fn fs_route(
             Ok(Response::text(204, ""))
         }
         ("GET", ["v1", "fs", fs, "statfs"]) => Ok(Response::json(200, &json!(e.fs_statfs(fs)?))),
+        ("POST", ["v1", "fs", fs, "sessions"]) => {
+            let body = parse(req)?;
+            let id = str_field(&body, "session")?;
+            let s = e.open_session(fs, id, u64_field(&body, "ttl_ms")?)?;
+            Ok(session_json(id, s))
+        }
+        ("POST", ["v1", "fs", _, "sessions", id, "renew"]) => {
+            Ok(session_json(id, e.renew_session(id)?))
+        }
+        ("DELETE", ["v1", "fs", _, "sessions", id]) => {
+            e.close_session(id)?;
+            Ok(Response::text(204, ""))
+        }
+        ("GET", ["v1", "fs", fs, "locks"]) => Ok(Response::json(200, &json!(e.fs_locks(fs)?))),
         ("POST", ["v1", "fs", fs, "rename"]) => {
             let body = parse(req)?;
             e.fs_rename(
@@ -246,6 +261,52 @@ fn inode_route(
             e.fs_removexattr(fs, ino, &pct_decode(name)?)?;
             Ok(Response::text(204, ""))
         }
+        ("POST", ["locks"]) => {
+            let body = parse(req)?;
+            let kind = match str_field(&body, "kind")? {
+                "unlock" => None,
+                k => Some(lock_kind(k)?),
+            };
+            let (start, end) = lock_range(|k| body[k].as_u64())?;
+            e.set_lock(
+                fs,
+                ino,
+                LockRequest {
+                    session: str_field(&body, "session")?.into(),
+                    owner: u64_field(&body, "owner")?,
+                    kind,
+                    start,
+                    end,
+                    pid: body["pid"].as_u64().unwrap_or(0) as u32,
+                },
+            )?;
+            Ok(Response::text(204, ""))
+        }
+        ("GET", ["locks"]) => {
+            let q = |k: &str| req.query.get(k);
+            let num = |k: &str| q(k).and_then(|v| v.parse::<u64>().ok());
+            let session = q("session").ok_or_else(|| {
+                NativeError::Invalid("query parameter session is required".into())
+            })?;
+            let owner = num("owner")
+                .ok_or_else(|| NativeError::Invalid("query parameter owner is required".into()))?;
+            let kind = lock_kind(q("kind").map_or("write", String::as_str))?;
+            let (start, end) = lock_range(num)?;
+            Ok(Response::json(
+                200,
+                &json!({ "conflict": e.test_lock(fs, ino, session, owner, kind, start, end)? }),
+            ))
+        }
+        ("POST", ["locks", "release"]) => {
+            let body = parse(req)?;
+            e.release_lock_owner(
+                fs,
+                ino,
+                str_field(&body, "session")?,
+                u64_field(&body, "owner")?,
+            )?;
+            Ok(Response::text(204, ""))
+        }
         ("GET", ["target"]) => Ok(Response::json(
             200,
             &json!({ "target": e.fs_readlink(fs, ino)? }),
@@ -276,6 +337,31 @@ fn inode_route(
         }
         _ => Ok(Response::text(404, "no such route")),
     }
+}
+
+fn session_json(id: &str, s: Session) -> Response {
+    Response::json(
+        200,
+        &json!({ "session": id, "ttl_ms": s.ttl_ms, "expires_ms": s.expires_ms }),
+    )
+}
+
+fn lock_kind(k: &str) -> Result<LockKind, NativeError> {
+    match k {
+        "read" => Ok(LockKind::Read),
+        "write" => Ok(LockKind::Write),
+        _ => Err(NativeError::Invalid(format!(
+            "lock kind must be read, write or unlock, not {k:?}"
+        ))),
+    }
+}
+
+/// `start` (default 0) and inclusive `end` (default end of file).
+fn lock_range(field: impl Fn(&str) -> Option<u64>) -> Result<(u64, u64), NativeError> {
+    Ok((
+        field("start").unwrap_or(0),
+        field("end").unwrap_or(u64::MAX),
+    ))
 }
 
 fn bad(r: Response) -> NativeError {

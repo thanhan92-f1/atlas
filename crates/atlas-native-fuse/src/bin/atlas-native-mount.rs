@@ -67,9 +67,14 @@ struct Args {
     /// `--identity-file` must hold a certificate signed by the cluster CA in `--ca-file`.
     #[arg(long)]
     direct_reads: bool,
-    /// Kernel request worker threads (Linux; each gets its own /dev/fuse fd).
+    /// Kernel request worker threads (Linux; each gets its own /dev/fuse fd). At most one fewer
+    /// blocking lock requests (`F_SETLKW`) wait at once; more fail with ENOLCK.
     #[arg(long, default_value_t = 4)]
     fuse_threads: usize,
+    /// Lease of the session holding this mount's file locks: if the mount stops renewing it
+    /// (crash, partition), the cluster releases its locks this long after the last renewal.
+    #[arg(long, default_value_t = 15_000)]
+    session_ttl_ms: u64,
 }
 
 fn read(path: &Option<PathBuf>, what: &str) -> Result<Option<Vec<u8>>, String> {
@@ -113,6 +118,8 @@ fn ops(args: &Args) -> Result<Ops, String> {
             readahead_bytes: args.readahead_bytes,
             max_io_bytes: args.max_io_bytes,
             direct_reads,
+            session_ttl: Duration::from_millis(args.session_ttl_ms),
+            lock_waiters: args.fuse_threads.saturating_sub(1),
         },
     );
     // Fail fast on a wrong endpoint, token or filesystem id instead of at first access.

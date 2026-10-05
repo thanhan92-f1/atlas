@@ -204,6 +204,27 @@ redirect, and leader shutdown, failover and rejoin from disk. `tests/raft_groups
 groups on each node's one listener: they replicate independently, and one group failing over (its
 leader's server stopped, the listener kept) leaves the other groups' leaders and terms alone.
 
+### Client sessions and file locks (`leases` module)
+
+`MetaCommand::Lease` carries session and lock changes: `Open` (create or renew with a TTL),
+`Renew`, `Close`, `Expire{now_ms}`, `Lock` (POSIX `F_SETLK` over an inclusive byte range for one
+`(session, owner)`: the owner's overlapping locks are split or replaced, same-kind neighbours
+merged; another owner's overlapping lock, where either side is a write lock, rejects it with
+`locked`) and `ReleaseOwner`. Every time is the proposing leader's wall clock, carried in the
+command, so replicas agree. The leader validates a lock against its speculative catalog, so a
+conflicting lock is refused without appending anything.
+
+Sessions and locks live in `Catalog::leases`, which is written whole into the store's state
+record at each checkpoint and shipped in a Raft snapshot's header; deleting a filesystem drops
+its locks. Each metadata group leader proposes `Expire` once a second when a session's
+`expires_ms` has passed. A new leader first waits out the longest TTL of any open session from
+when it took over: every live session has then been renewed against its own clock, so a clock
+that runs ahead of the previous leader's cannot expire a live client. Limits: TTL 1–300 s,
+65 536 sessions per group, 4 096 locks per session.
+
+Not covered: lease recall. Attributes and names are cached by clients for a fixed TTL rather
+than under a revocable lease.
+
 ### Namespace sharding (`node::shards`)
 
 A node with `metadata.groups > 1` runs one engine per group (each with its own catalog, WAL, free

@@ -120,7 +120,7 @@ silently landing on device 0. Requests for device 0 are unchanged on the wire.
 | --- | --- | --- |
 | `GET /healthz` | no | Process is up. |
 | `GET /readyz` | no | 200 once every metadata group has a known leader (metadata role; a non-voter waiting to be added counts as ready) or the data node is serving; 503 otherwise, including after a fatal storage error. |
-| `GET /metrics` | no | Prometheus text: Raft/transport, engine, data node, and `atlas_native_{repair,gc}_{runs,errors}_total`. |
+| `GET /metrics` | no | Prometheus text: Raft/transport, engine (including `atlas_native_client_sessions` and `atlas_native_file_locks`), data node, `atlas_native_{repair,gc}_{runs,errors}_total` and `atlas_native_client_sessions_expired_total`. |
 | `GET /v1/status` | yes | Raft role/term/leader/indexes and voter flag (`metadata`, group 0; `metadata_groups` lists `{group, leader, ...}` for every group), `layout` (`extent_bytes`, `replicas`), per-data-node health, last repair result, data-node fence. |
 | `GET /v1/volumes` | yes | Volumes in the applied catalog. |
 | `POST /v1/volumes` | yes | `{"name": "...", "size_bytes": N, "id"?: "..."}` → 201 `{"id": "..."}`. An optional client-chosen `id` (1–64 of `[A-Za-z0-9-]`) makes the create idempotent: repeating it with the same parameters is a no-op, different parameters get 409. |

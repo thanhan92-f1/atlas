@@ -72,6 +72,8 @@ impl Error {
                 "no_attr" => libc::ENODATA,
                 "too_big" => libc::E2BIG,
                 "unsupported" => libc::EOPNOTSUPP,
+                "locked" => libc::EAGAIN,
+                "no_session" => libc::ENOLCK,
                 _ if *status == 413 => libc::EFBIG,
                 _ => libc::EIO,
             },

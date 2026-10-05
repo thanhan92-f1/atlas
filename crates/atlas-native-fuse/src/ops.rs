@@ -23,6 +23,7 @@ use serde_json::json;
 use crate::{
     cache::TtlCache,
     client::{encode, Body, Client, Error, Retry},
+    locks::{Conflict, Locks},
     writeback::{Dirty, WriteBack},
 };
 
@@ -44,6 +45,11 @@ pub struct OpsConfig {
     pub readahead_bytes: usize,
     /// Read file data straight from the data nodes instead of through the metadata leader.
     pub direct_reads: Option<DirectReads>,
+    /// Lease of the session holding this mount's file locks; renewed every third of it.
+    pub session_ttl: Duration,
+    /// Blocking lock requests (`F_SETLKW`) allowed to wait at once; keep it below the kernel
+    /// worker threads so waiters never block the unlock they wait for.
+    pub lock_waiters: usize,
 }
 
 impl Default for OpsConfig {
@@ -54,6 +60,8 @@ impl Default for OpsConfig {
             max_io_bytes: 8 << 20,
             readahead_bytes: 4 << 20,
             direct_reads: None,
+            session_ttl: Duration::from_secs(15),
+            lock_waiters: 3,
         }
     }
 }
@@ -73,7 +81,7 @@ pub struct DirectReads {
 const DIRECT_PARALLELISM: usize = 8;
 
 pub struct Ops {
-    client: Client,
+    client: Arc<Client>,
     /// `<fs>` or `<fs>@<snapshot>` (read-only).
     fs: String,
     pub cfg: OpsConfig,
@@ -91,6 +99,7 @@ pub struct Ops {
     /// Data-node clients for direct reads, by `(node id, endpoint, device)`.
     data_nodes: Mutex<HashMap<(String, String, usize), Arc<RemoteDevice>>>,
     direct_fallbacks: std::sync::atomic::AtomicU64,
+    locks: Locks,
 }
 
 /// Prefix of the names open-but-unlinked files are parked under; hidden from listings.
@@ -121,9 +130,12 @@ fn check_name(name: &str) -> Result<(), Errno> {
 
 impl Ops {
     pub fn new(client: Client, fs: impl Into<String>, cfg: OpsConfig) -> Self {
+        let client = Arc::new(client);
+        let fs = fs.into();
         Self {
+            locks: Locks::new(client.clone(), &fs, cfg.session_ttl, cfg.lock_waiters),
             client,
-            fs: fs.into(),
+            fs,
             attrs: Mutex::new(TtlCache::new(cfg.ttl)),
             names: Mutex::new(TtlCache::new(cfg.ttl)),
             dirty: Mutex::new(WriteBack::new(cfg.writeback_bytes)),
@@ -145,6 +157,59 @@ impl Ops {
     pub fn direct_fallbacks(&self) -> u64 {
         self.direct_fallbacks
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// `F_GETLK`. A snapshot mount has no writers, so nothing ever conflicts there.
+    pub fn getlk(
+        &self,
+        ino: u64,
+        owner: u64,
+        start: u64,
+        end: u64,
+        typ: i32,
+    ) -> Result<Option<Conflict>, Errno> {
+        if self.read_only() {
+            return Ok(None);
+        }
+        self.locks.getlk(ino, owner, start, end, typ)
+    }
+
+    /// `F_SETLK`/`F_SETLKW` (`wait`), seen by every mount of the filesystem.
+    #[allow(clippy::too_many_arguments)]
+    pub fn setlk(
+        &self,
+        ino: u64,
+        owner: u64,
+        start: u64,
+        end: u64,
+        typ: i32,
+        pid: u32,
+        wait: bool,
+    ) -> Result<(), Errno> {
+        if self.read_only() {
+            return Ok(());
+        }
+        self.locks.setlk(ino, owner, start, end, typ, pid, wait)
+    }
+
+    /// Drops the owner's locks on `ino`: POSIX locks go on any close by their process.
+    pub fn release_locks(&self, ino: u64, owner: u64) -> Result<(), Errno> {
+        self.locks.release(ino, owner)
+    }
+
+    /// Closes the lock session at unmount, releasing every lock this mount holds.
+    pub fn close_session(&self) {
+        self.locks.close();
+    }
+
+    /// The lock session's id, once this mount took a lock.
+    pub fn lock_session(&self) -> Option<String> {
+        self.locks.session_id()
+    }
+
+    /// Times the lock session expired under this mount (its locks were lost).
+    pub fn lock_sessions_lost(&self) -> usize {
+        self.locks.sessions_lost()
     }
 
     /// The mounted filesystem: `<fs>` or `<fs>@<snapshot>`.

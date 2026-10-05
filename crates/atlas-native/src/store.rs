@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     alloc::FreeList,
     inodes::InodeTable,
+    leases::Leases,
     membership::Membership,
     metadata::{Catalog, SnapshotId},
     namespace::{FsId, FsMeta, FsUsage, Inode, InodeKind},
@@ -48,6 +49,7 @@ struct StateRef<'a> {
     free: &'a FreeList,
     membership: &'a Option<Membership>,
     raft_addrs: &'a BTreeMap<String, String>,
+    leases: &'a Leases,
 }
 
 #[derive(Deserialize)]
@@ -57,6 +59,8 @@ struct State {
     free: FreeList,
     membership: Option<Membership>,
     raft_addrs: BTreeMap<String, String>,
+    #[serde(default)]
+    leases: Leases,
 }
 
 /// A filesystem without its inodes, which have records of their own.
@@ -206,6 +210,7 @@ impl CatalogStore {
             free: state.free,
             membership: state.membership,
             raft_addrs: state.raft_addrs,
+            leases: state.leases,
             ..Catalog::default()
         };
         c.volumes = read_table(&tx, VOLUMES)?;
@@ -330,6 +335,7 @@ fn write_state(tx: &WriteTransaction, c: &Catalog) -> io::Result<()> {
         free: &c.free,
         membership: &c.membership,
         raft_addrs: &c.raft_addrs,
+        leases: &c.leases,
     })?;
     tx.open_table(STATE)
         .map_err(err)?
@@ -951,6 +957,47 @@ mod tests {
         h.store.checkpoint(&mut h.catalog).unwrap();
         let loaded = load_checkpoint(h._td.path(), &h.store).unwrap();
         assert_eq!(loaded.filesystems["f"].usage, kept);
+    }
+
+    #[test]
+    fn sessions_and_locks_survive_a_checkpoint_and_go_with_their_filesystem() {
+        use crate::leases::{LeaseOp, LockKind};
+        let mut h = Harness::new();
+        h.fs(FsOp::CreateFs {
+            fs: "f".into(),
+            name: "f".into(),
+            now_ns: 1,
+            extent_bytes: None,
+        });
+        h.mknode("f", ROOT_INO, "a", NodeType::File);
+        let ino = h.ino("f", "a");
+        h.apply(MetaCommand::Lease {
+            op: LeaseOp::Open {
+                session: "s".into(),
+                ttl_ms: 5_000,
+                now_ms: 10,
+            },
+        });
+        h.apply(MetaCommand::Lease {
+            op: LeaseOp::Lock {
+                fs: "f".into(),
+                ino,
+                session: "s".into(),
+                owner: 3,
+                kind: Some(LockKind::Write),
+                start: 0,
+                end: u64::MAX,
+                pid: 1,
+                now_ms: 20,
+            },
+        });
+        h.check();
+        let loaded = h.store.load().unwrap().unwrap();
+        assert_eq!(loaded.leases.sessions["s"].expires_ms, 5_020);
+        assert_eq!(loaded.leases.lock_count(), 1);
+        h.fs(FsOp::DeleteFs { fs: "f".into() });
+        h.check();
+        assert_eq!(h.store.load().unwrap().unwrap().leases.lock_count(), 0);
     }
 
     #[test]

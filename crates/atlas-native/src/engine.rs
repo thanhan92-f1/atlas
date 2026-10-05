@@ -32,10 +32,12 @@ use crate::{
 };
 
 mod files;
+mod leases;
 pub use files::{
     Attr, DirEntry, FileLayout, FsInfo, FsSnapshotInfo, FsStat, LayoutExtent, LayoutReplica,
     NewNode,
 };
+pub use leases::{now_ms, LockRequest, LockTable};
 
 /// Extents fetched concurrently by one read.
 const READ_PARALLELISM: usize = 8;
@@ -932,8 +934,8 @@ impl NativeEngine {
     /// Prometheus text exposition for I/O counters, metadata and free space.
     pub fn render_metrics(&self) -> Result<String, NativeError> {
         let t = self.telemetry.snapshot();
-        let (applied, volumes, snapshots, extents, free_bytes, free_ranges) =
-            self.with_catalog(|c| {
+        let (applied, volumes, snapshots, extents, free_bytes, free_ranges, sessions, locks) = self
+            .with_catalog(|c| {
                 (
                     c.applied_index,
                     c.volumes.len(),
@@ -941,6 +943,8 @@ impl NativeEngine {
                     c.extents.len(),
                     c.free.total_bytes(),
                     c.free.ranges().len(),
+                    c.leases.sessions.len(),
+                    c.leases.lock_count(),
                 )
             })?;
         let wal_records = self.wal_records()?;
@@ -1015,6 +1019,18 @@ impl NativeEngine {
             "gauge",
             "Live physical extents.",
             extents,
+        );
+        p.single(
+            "atlas_native_client_sessions",
+            "gauge",
+            "Open client sessions (leases).",
+            sessions,
+        );
+        p.single(
+            "atlas_native_file_locks",
+            "gauge",
+            "File locks held by client sessions.",
+            locks,
         );
         p.single(
             "atlas_native_allocator_free_bytes",

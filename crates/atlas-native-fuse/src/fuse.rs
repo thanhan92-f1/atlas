@@ -15,12 +15,12 @@ use atlas_native::{
 };
 use fuser::{
     AccessFlags, BsdFileFlags, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags,
-    Generation, INodeNo, KernelConfig, LockOwner, OpenAccMode, OpenFlags, RenameFlags, ReplyAttr,
-    ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs,
-    ReplyWrite, ReplyXattr, Request, TimeOrNow, WriteFlags,
+    Generation, INodeNo, InitFlags, KernelConfig, LockOwner, OpenAccMode, OpenFlags, RenameFlags,
+    ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyLock,
+    ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request, TimeOrNow, WriteFlags,
 };
 
-use crate::ops::Ops;
+use crate::{locks::F_UNLCK, ops::Ops};
 
 pub struct AtlasFs {
     pub ops: Ops,
@@ -131,12 +131,61 @@ impl Filesystem for AtlasFs {
         if let Err(max) = config.set_max_readahead(16 << 20) {
             let _ = config.set_max_readahead(max);
         }
+        // Send fcntl and flock locks here so every mount sees them; a kernel without these
+        // keeps them local to the mount.
+        for cap in [InitFlags::FUSE_POSIX_LOCKS, InitFlags::FUSE_FLOCK_LOCKS] {
+            if config.add_capabilities(cap).is_err() {
+                tracing::warn!(?cap, "kernel lacks the capability; those locks stay local");
+            }
+        }
         Ok(())
     }
 
     fn destroy(&mut self) {
         if let Err(e) = self.ops.flush_all() {
             tracing::error!(errno = e, "buffered writes lost at unmount");
+        }
+        self.ops.close_session();
+    }
+
+    fn getlk(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        lock_owner: LockOwner,
+        start: u64,
+        end: u64,
+        typ: i32,
+        pid: u32,
+        reply: ReplyLock,
+    ) {
+        match self.ops.getlk(ino.0, lock_owner.0, start, end, typ) {
+            Ok(Some(c)) => reply.locked(c.start, c.end, c.typ, c.pid),
+            Ok(None) => reply.locked(start, end, F_UNLCK, pid),
+            Err(e) => reply.error(err(e)),
+        }
+    }
+
+    fn setlk(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        lock_owner: LockOwner,
+        start: u64,
+        end: u64,
+        typ: i32,
+        pid: u32,
+        sleep: bool,
+        reply: ReplyEmpty,
+    ) {
+        match self
+            .ops
+            .setlk(ino.0, lock_owner.0, start, end, typ, pid, sleep)
+        {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(err(e)),
         }
     }
 
@@ -454,9 +503,13 @@ impl Filesystem for AtlasFs {
         _req: &Request,
         ino: INodeNo,
         _fh: FileHandle,
-        _lock_owner: LockOwner,
+        lock_owner: LockOwner,
         reply: ReplyEmpty,
     ) {
+        // A process's POSIX locks on a file go with any close of it.
+        if let Err(e) = self.ops.release_locks(ino.0, lock_owner.0) {
+            tracing::warn!(errno = e, "releasing locks at close failed");
+        }
         match self.ops.flush(ino.0) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(err(e)),
@@ -469,10 +522,16 @@ impl Filesystem for AtlasFs {
         ino: INodeNo,
         _fh: FileHandle,
         _flags: OpenFlags,
-        _lock_owner: Option<LockOwner>,
+        lock_owner: Option<LockOwner>,
         _flush: bool,
         reply: ReplyEmpty,
     ) {
+        // A flock lock goes with the last close of its open file.
+        if let Some(owner) = lock_owner {
+            if let Err(e) = self.ops.release_locks(ino.0, owner.0) {
+                tracing::warn!(errno = e, "releasing locks at close failed");
+            }
+        }
         match self.ops.released(ino.0) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(err(e)),

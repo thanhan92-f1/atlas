@@ -94,6 +94,7 @@ impl Outgoing {
                 })
                 .collect(),
             fs_snapshots: catalog.fs_snapshots.clone(),
+            leases: catalog.leases.clone(),
             in_store: false,
         };
         Self {

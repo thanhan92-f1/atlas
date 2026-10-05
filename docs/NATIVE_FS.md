@@ -62,13 +62,21 @@ All routes need the API token (and client certificate where configured), like th
 | `DELETE /v1/fs/{fs}/inodes/{ino}/xattrs/{name}` | 204; 404 `no_attr` if unset. |
 | `GET /v1/fs/{fs}/inodes/{ino}/data?offset=N&len=M` | Raw bytes; short at end of file. |
 | `PUT /v1/fs/{fs}/inodes/{ino}/data?offset=N` | Raw body written at `offset` (extends the file) → attributes. |
+| `POST /v1/fs/{fs}/sessions` | `{"session", "ttl_ms"}` (1000–300000): opens a client session, or renews it with a new TTL → `{session, ttl_ms, expires_ms}`. Session ids are client-chosen (the mount uses a UUID). |
+| `POST /v1/fs/{fs}/sessions/{id}/renew` | → `{session, ttl_ms, expires_ms}`; 410 `no_session` once it expired or was closed. |
+| `DELETE /v1/fs/{fs}/sessions/{id}` | 204; releases every lock the session holds. |
+| `POST /v1/fs/{fs}/inodes/{ino}/locks` | `{session, owner, kind, start?, end?, pid?}` (`kind`: `read`, `write`, `unlock`; `end` inclusive, default end of file) → 204, or 409 `locked` on another owner's conflicting lock. POSIX `F_SETLK` semantics per `(session, owner)`; renews the session. Regular files only. |
+| `GET /v1/fs/{fs}/inodes/{ino}/locks?session=&owner=&kind=&start=&end=` | `{"conflict": {ino, session, owner, kind, start, end, pid} \| null}`: the first lock that would block the request (`F_GETLK`). |
+| `POST /v1/fs/{fs}/inodes/{ino}/locks/release` | `{session, owner}`: drops the owner's locks on the inode (a close) → 204. |
+| `GET /v1/fs/{fs}/locks` | `{"sessions": N, "locks": [...]}`: every lock held on the filesystem and the open sessions in its metadata group. |
 
 `{fs}` may be `<fs>@<snapshot>` for reads; any change to a snapshot gets 409 `read_only`.
 
 Errors are `{"error", "code", "leader"}`. `code` is stable and maps to an errno in the client:
 `not_found` (404, ENOENT), `exists` (EEXIST), `not_empty` (ENOTEMPTY), `not_dir` (ENOTDIR),
 `is_dir` (EISDIR), `invalid` (EINVAL), `read_only` (EROFS), `busy` (EBUSY), `no_attr` (404,
-ENODATA), `too_big` (E2BIG), `unsupported` (EOPNOTSUPP) — all 409 except where noted — plus
+ENODATA), `too_big` (E2BIG), `unsupported` (EOPNOTSUPP), `locked` (EAGAIN), `no_session` (410,
+ENOLCK) — all 409 except where noted — plus
 `not_leader` (421), `unavailable` (503) and `internal` (500).
 
 Reads are served by the leader once it has applied its log as of the request, so a client always
@@ -91,7 +99,8 @@ Options: `--identity-file` (client certificate + key PEM), `--ttl-ms` (attribute
 default 1000), `--writeback-bytes` (default 4 MiB), `--readahead-bytes` (default 4 MiB, 0 disables),
 `--max-io-bytes` (largest request, default 8 MiB; keep at or below the nodes' `max_request_bytes`),
 `--retry-secs` (default 30), `--read-only`, `--allow-other`, `--fuse-threads` (kernel request
-workers, each with its own `/dev/fuse` fd, default 4) and `--direct-reads` (below). It runs in the
+workers, each with its own `/dev/fuse` fd, default 4), `--session-ttl-ms` (lease of the session
+holding the mount's file locks, default 15000) and `--direct-reads` (below). It runs in the
 foreground until `fusermount3 -u`; the mount uses `default_permissions`, so the kernel checks
 modes and ownership.
 
@@ -143,17 +152,26 @@ modes and ownership.
   only after its command is committed and applied.
 - Across mounts it is **close-to-open**: data written on one client is visible to another after the
   writer closes or fsyncs the file and the reader opens it after that; attributes and names may be
-  cached for up to `--ttl-ms` (set 0 for no caching). There are no leases or byte-range locks, so
-  concurrent writers to the same file range see last-writer-wins at the extent level.
+  cached for up to `--ttl-ms` (set 0 for no caching). Unlocked concurrent writers to the same
+  file range see last-writer-wins at the extent level.
 - Unlink-while-open only protects handles in the same mount; a file removed by another client
   disappears for everyone.
 - **Extended attributes** in the `user.`, `trusted.` and `security.` namespaces are stored on the
   inode (replicated, copied by snapshots and clones): at most 64 KiB per value and 256 KiB per
   inode. `system.*` (POSIX ACLs) is refused with EOPNOTSUPP rather than stored unenforced.
-- **Locks**: `flock` and `fcntl` locks are enforced by the kernel within one mount (the client
-  does not take them over), so processes sharing a mount exclude each other; locks are not seen
-  by other mounts.
-- Not implemented: POSIX ACLs, cross-mount locks, quotas, `O_DIRECT`.
+- **Locks**: `fcntl` byte-range locks and `flock` locks are held in the cluster, so every mount
+  of the filesystem sees them. A mount opens a session on its first lock and renews it every
+  third of `--session-ttl-ms`; the session holds its locks. Closing a file drops its process's
+  locks on it, unmounting closes the session, and a mount that dies (or loses the cluster for a
+  whole TTL) has its session expired by the metadata leader and its locks released. A mount whose
+  session expired under it logs the loss and starts a new session on its next lock. `flock`
+  reaches the cluster as a whole-file lock, as on Linux NFS, so it conflicts with `fcntl` locks
+  on the same file. `F_SETLKW` polls the leader (10–250 ms backoff) while it waits; at most
+  `--fuse-threads` − 1 waits run at once, more fail with ENOLCK, so waiters never take the
+  kernel worker an unlock needs. A snapshot mount grants every lock locally (nothing writes
+  there). Locks need every metadata node upgraded first: an older node cannot apply them.
+- Not implemented: POSIX ACLs, quotas, `O_DIRECT`, cache leases (attributes and names are still
+  cached for a fixed `--ttl-ms`).
 
 ## Atlas gateway
 

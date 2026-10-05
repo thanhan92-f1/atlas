@@ -576,6 +576,7 @@ impl Catalog {
             FsOp::DeleteFs { fs } => {
                 let all = self.filesystem(fs)?.inodes.scan()?;
                 self.filesystems.remove(fs);
+                self.leases.forget_fs(fs);
                 for inode in &all {
                     self.drop_inode(inode, gc)?;
                 }

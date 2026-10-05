@@ -309,6 +309,8 @@ struct NodeShared {
     repair: TaskStats,
     gc: TaskStats,
     last_repair: Mutex<Option<RepairStats>>,
+    /// Client sessions this node expired as a group leader.
+    sessions_expired: AtomicU64,
 }
 
 /// One metadata Raft group on this node and the engine committing through it.
@@ -513,6 +515,7 @@ impl NativeNode {
             repair: TaskStats::default(),
             gc: TaskStats::default(),
             last_repair: Mutex::new(None),
+            sessions_expired: AtomicU64::new(0),
         });
 
         let mut loops = Vec::new();
@@ -533,6 +536,10 @@ impl NativeNode {
                         |sh| &sh.repair,
                     )
                 }));
+            }
+            {
+                let sh = shared.clone();
+                loops.push(thread::spawn(move || expire_leases(&sh)));
             }
             if gc_secs > 0 {
                 let sh = shared.clone();
@@ -637,6 +644,46 @@ fn maintenance(
     }
 }
 
+/// How often a leader looks for client sessions to expire.
+const LEASE_TICK: Duration = Duration::from_secs(1);
+
+/// Expires client sessions in each group this replica leads. A new leader first waits out the
+/// longest session TTL, so every live session (last renewed against the old leader, whose clock
+/// may differ) has been renewed against this one before anything is expired.
+fn expire_leases(sh: &NodeShared) {
+    let mut since: Vec<Option<(u64, Instant)>> = vec![None; sh.groups.len()];
+    let mut next = Instant::now();
+    while !sh.stop.load(Ordering::SeqCst) {
+        if Instant::now() < next {
+            thread::sleep(Duration::from_millis(50));
+            continue;
+        }
+        next = Instant::now() + LEASE_TICK;
+        for (g, tenure) in sh.groups.iter().zip(&mut since) {
+            let term = match g.raft.status() {
+                Ok(s) if s.role == Role::Leader => s.term,
+                _ => {
+                    *tenure = None;
+                    continue;
+                }
+            };
+            let start = match *tenure {
+                Some((t, at)) if t == term => at,
+                _ => tenure.insert((term, Instant::now())).1,
+            };
+            let Ok(ttl) = g.engine.max_session_ttl_ms() else {
+                continue;
+            };
+            if ttl == 0 || start.elapsed() < Duration::from_millis(ttl) {
+                continue;
+            }
+            if let Ok(n) = g.engine.expire_sessions() {
+                sh.sessions_expired.fetch_add(n as u64, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
 /// Replaces `${NAME}` with `lookup(NAME)`. `$` not followed by `{` is left alone.
 fn expand_env(raw: &str, lookup: impl Fn(&str) -> Option<String>) -> Result<String, NativeError> {
     let mut out = String::with_capacity(raw.len());
@@ -679,6 +726,7 @@ fn error_response(e: NativeError) -> Response {
             (404, "not_found", None)
         }
         (_, Some(MetaError::NoAttr(_))) => (404, "no_attr", None),
+        (_, Some(MetaError::NoSession(_))) => (410, "no_session", None),
         (_, Some(m)) => (
             409,
             match m {
@@ -688,6 +736,7 @@ fn error_response(e: NativeError) -> Response {
                 MetaError::IsDir(_) => "is_dir",
                 MetaError::TooBig(_) => "too_big",
                 MetaError::Unsupported(_) => "unsupported",
+                MetaError::Locked(_) => "locked",
                 _ => "invalid",
             },
             None,
@@ -1148,6 +1197,13 @@ fn metrics(sh: &NodeShared) -> Response {
                     .sample(&name, &node, v.load(Ordering::Relaxed));
             }
         }
+        let name = "atlas_native_client_sessions_expired_total";
+        p.family(
+            name,
+            "counter",
+            "Client sessions expired for not renewing their lease.",
+        )
+        .sample(name, &node, sh.sessions_expired.load(Ordering::Relaxed));
         parts.push(p.finish());
     }
     if let Ok(d) = sh.data.lock() {

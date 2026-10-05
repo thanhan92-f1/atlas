@@ -1015,3 +1015,91 @@ fn http_members_change_reaches_every_raft_group() {
         c.on_leader("POST", "/v1/volumes", body.as_bytes(), 201);
     }
 }
+
+#[test]
+fn http_sessions_and_file_locks_survive_failover_and_expire() {
+    let mut c = Cluster::start(3, 3, 0);
+    c.on_leader("POST", "/v1/fs", br#"{"id":"lk","name":"locks"}"#, 201);
+    let (_, b) = c.on_leader(
+        "POST",
+        "/v1/fs/lk/inodes/1/entries",
+        br#"{"name":"f","op_id":"o1","kind":"file","mode":420}"#,
+        201,
+    );
+    let ino = json(&b)["ino"].as_u64().unwrap();
+    let locks = format!("/v1/fs/lk/inodes/{ino}/locks");
+    let lock = |session: &str, kind: &str, start: u64, end: u64| {
+        format!(
+            r#"{{"session":"{session}","owner":1,"kind":"{kind}","start":{start},"end":{end},"pid":7}}"#
+        )
+    };
+    for s in ["a", "b"] {
+        let body = format!(r#"{{"session":"{s}","ttl_ms":60000}}"#);
+        let (_, b) = c.on_leader("POST", "/v1/fs/lk/sessions", body.as_bytes(), 200);
+        assert_eq!(json(&b)["ttl_ms"], 60000);
+    }
+
+    let (leader, _) = c.on_leader("POST", &locks, lock("a", "write", 0, 99).as_bytes(), 204);
+    let (st, b) = c.on_leader_any("POST", &locks, lock("b", "write", 50, 60).as_bytes());
+    assert_eq!((st, json(&b)["code"].as_str()), (409, Some("locked")));
+    c.on_leader("POST", &locks, lock("b", "read", 100, 199).as_bytes(), 204);
+    let (st, b) = c.on_leader_any("POST", &locks, lock("zz", "read", 0, 0).as_bytes());
+    assert_eq!((st, json(&b)["code"].as_str()), (410, Some("no_session")));
+    let (st, b) = c.on_leader_any(
+        "POST",
+        "/v1/fs/lk/inodes/1/locks",
+        lock("a", "read", 0, 0).as_bytes(),
+    );
+    assert_eq!(st, 409, "a directory: {}", String::from_utf8_lossy(&b));
+    let test = format!("{locks}?session=b&owner=1&kind=write&start=0&end=10");
+    let (_, b) = c.on_leader("GET", &test, b"", 200);
+    let conflict = &json(&b)["conflict"];
+    assert_eq!(
+        (&conflict["session"], &conflict["pid"]),
+        (&serde_json::json!("a"), &serde_json::json!(7))
+    );
+
+    // Locks are replicated: a new leader enforces them.
+    c.meta.insert(leader, None);
+    let (st, _) = c.on_leader_any("POST", &locks, lock("b", "write", 50, 60).as_bytes());
+    assert_eq!(st, 409);
+    // Closing a session releases its locks.
+    c.on_leader("DELETE", "/v1/fs/lk/sessions/a", b"", 204);
+    c.on_leader("POST", &locks, lock("b", "write", 50, 60).as_bytes(), 204);
+    c.on_leader("DELETE", "/v1/fs/lk/sessions/b", b"", 204);
+
+    // A session that stops renewing is expired with its locks.
+    c.on_leader(
+        "POST",
+        "/v1/fs/lk/sessions",
+        br#"{"session":"c","ttl_ms":1000}"#,
+        200,
+    );
+    c.on_leader("POST", &locks, lock("c", "write", 0, 9).as_bytes(), 204);
+    let (_, b) = c.on_leader("GET", "/v1/fs/lk/locks", b"", 200);
+    assert_eq!(json(&b)["locks"].as_array().unwrap().len(), 1);
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let (_, b) = c.on_leader("GET", "/v1/fs/lk/locks", b"", 200);
+        if json(&b)["locks"].as_array().unwrap().is_empty() {
+            assert_eq!(json(&b)["sessions"], 0);
+            break;
+        }
+        assert!(Instant::now() < deadline, "session c never expired");
+        thread::sleep(Duration::from_millis(100));
+    }
+    let (st, _) = c.on_leader_any("POST", "/v1/fs/lk/sessions/c/renew", b"");
+    assert_eq!(st, 410);
+    let expired: u64 = c
+        .meta_addrs()
+        .into_iter()
+        .map(|(_, addr)| {
+            let m = String::from_utf8(api(addr, "GET", "/metrics", b"").1).unwrap();
+            m.lines()
+                .find(|l| l.starts_with("atlas_native_client_sessions_expired_total"))
+                .and_then(|l| l.rsplit(' ').next()?.parse().ok())
+                .unwrap_or(0)
+        })
+        .sum();
+    assert_eq!(expired, 1);
+}
