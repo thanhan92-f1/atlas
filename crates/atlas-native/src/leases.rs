@@ -110,7 +110,7 @@ pub enum LeaseOp {
     },
 }
 
-fn check_session_id(session: &str) -> Result<(), MetaError> {
+fn check_holder_name(session: &str) -> Result<(), MetaError> {
     if session.is_empty() || session.len() > MAX_SESSION_ID_BYTES {
         return Err(MetaError::Invalid(format!(
             "session ids are 1 to {MAX_SESSION_ID_BYTES} bytes"
@@ -197,7 +197,7 @@ impl Leases {
                 ttl_ms,
                 now_ms,
             } => {
-                check_session_id(session)?;
+                check_holder_name(session)?;
                 if !(MIN_TTL_MS..=MAX_TTL_MS).contains(ttl_ms) {
                     return Err(MetaError::Invalid(format!(
                         "session ttl_ms must be between {MIN_TTL_MS} and {MAX_TTL_MS}"
