@@ -136,7 +136,46 @@ fn stale_fence_is_rejected_and_survives_restart() {
     assert!(dn
         .render_metrics()
         .unwrap()
-        .contains("atlas_native_data_fence{node=\"n1\"} 5"));
+        .contains("atlas_native_data_fence{node=\"n1\",group=\"0\"} 5"));
+}
+
+#[test]
+fn each_metadata_group_is_fenced_on_its_own_term() {
+    let td = tempfile::tempdir().unwrap();
+    let mut dn = DataNodeServer::start("n1", td.path(), bind()).unwrap();
+    let g0 = RemoteDevice::new(dn.local_addr(), IO_TIMEOUT);
+    let g1 = RemoteDevice::new(dn.local_addr(), IO_TIMEOUT).in_group(1);
+
+    g0.append(9, &[1u8; 8]).unwrap();
+    // Group 1 is at a lower term than group 0 and still writes.
+    g1.append(2, &[2u8; 8]).unwrap();
+    g1.write_at(3, 8, &[3u8; 8]).unwrap();
+    assert!(matches!(
+        g1.append(2, &[9u8; 8]),
+        Err(NativeError::Fenced { current: 3 })
+    ));
+    assert!(matches!(
+        g0.write_at(8, 0, &[9u8; 8]),
+        Err(NativeError::Fenced { current: 9 })
+    ));
+    assert_eq!((dn.group_fence(0), dn.group_fence(1)), (9, 3));
+    let m = dn.render_metrics().unwrap();
+    assert!(
+        m.contains("atlas_native_data_fence{node=\"n1\",group=\"1\"} 3"),
+        "{m}"
+    );
+
+    dn.shutdown();
+    drop(dn);
+    let dn = DataNodeServer::start("n1", td.path(), bind()).unwrap();
+    assert_eq!((dn.group_fence(0), dn.group_fence(1)), (9, 0));
+    let g1 = RemoteDevice::new(dn.local_addr(), IO_TIMEOUT).in_group(1);
+    assert!(matches!(
+        g1.write_at(2, 8, &[9u8; 8]),
+        Err(NativeError::Fenced { current: 3 })
+    ));
+    assert_eq!(dn.group_fence(1), 3);
+    assert_eq!(g1.read_exact_at(8, 8).unwrap(), vec![3u8; 8]);
 }
 
 #[test]

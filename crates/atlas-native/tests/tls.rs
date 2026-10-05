@@ -158,8 +158,9 @@ fn mtls_raft_cluster_elects_and_replicates() {
     }
     for (id, s) in &servers {
         let m = s.render_metrics().unwrap();
-        let prefix =
-            format!("atlas_native_transport_tls_handshake_failures_total{{node=\"{id}\"}} ");
+        let prefix = format!(
+            "atlas_native_transport_tls_handshake_failures_total{{node=\"{id}\",group=\"0\"}} "
+        );
         assert_eq!(counter(&m, &prefix), 0, "{id}:\n{m}");
     }
 }
@@ -189,7 +190,9 @@ fn mtls_raft_isolates_untrusted_and_impersonating_peers() {
         .map(|id| {
             counter(
                 &servers[*id].render_metrics().unwrap(),
-                &format!("atlas_native_transport_rejected_frames_total{{node=\"{id}\"}} "),
+                &format!(
+                    "atlas_native_transport_rejected_frames_total{{node=\"{id}\",group=\"0\"}} "
+                ),
             )
         })
         .sum();
@@ -211,7 +214,7 @@ fn mtls_raft_isolates_untrusted_and_impersonating_peers() {
     assert!(servers["m3"].catalog().unwrap().volumes.is_empty());
     let failures = counter(
         &servers["m1"].render_metrics().unwrap(),
-        "atlas_native_transport_tls_handshake_failures_total{node=\"m1\"} ",
+        "atlas_native_transport_tls_handshake_failures_total{node=\"m1\",group=\"0\"} ",
     );
     assert!(failures > 0, "m1 accepted a rogue-CA peer");
 }

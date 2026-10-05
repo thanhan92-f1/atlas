@@ -11,9 +11,10 @@
 //! [`TlsIdentity`] connections are mutual TLS against the cluster CA: clients must present a
 //! CA-signed certificate, and verify the node's certificate against its node id.
 //!
-//! Every write carries a fence (the writer's Raft term). The node durably records the highest
-//! fence it has accepted and rejects lower ones, so a deposed leader that has not noticed yet
-//! cannot overwrite a range the new leader has reallocated.
+//! Every write carries a fence (the writer's Raft term) and the metadata group it writes for.
+//! The node durably records the highest fence it has accepted from each group and rejects lower
+//! ones, so a deposed leader that has not noticed yet cannot overwrite a range the new leader of
+//! its group has reallocated. Groups have independent terms and never share a range.
 
 use std::{
     collections::BTreeMap,
@@ -55,6 +56,8 @@ enum Request {
         len: u64,
         #[serde(default, skip_serializing_if = "is_zero")]
         device: usize,
+        #[serde(default, skip_serializing_if = "is_zero_group")]
+        group: u32,
     },
     WriteAt {
         fence: u64,
@@ -62,6 +65,8 @@ enum Request {
         len: u64,
         #[serde(default, skip_serializing_if = "is_zero")]
         device: usize,
+        #[serde(default, skip_serializing_if = "is_zero_group")]
+        group: u32,
     },
     Read {
         offset: u64,
@@ -76,22 +81,45 @@ enum Request {
     /// How many devices the node serves. Older nodes don't know this op and drop the connection,
     /// which is how a client avoids sending a device index they would silently ignore.
     Devices,
+    /// The highest fence accepted from each metadata group. Older nodes drop the connection,
+    /// which is how a client avoids sending a group they would silently treat as group 0.
+    Fences,
 }
 
 fn is_zero(v: &usize) -> bool {
     *v == 0
 }
 
+fn is_zero_group(v: &u32) -> bool {
+    *v == 0
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 enum Response {
-    Appended { offset: u64 },
+    Appended {
+        offset: u64,
+    },
     Written,
-    Data { len: u64 },
-    Len { len: u64 },
-    Devices { count: usize },
-    Fenced { current: u64 },
-    Error { message: String },
+    Data {
+        len: u64,
+    },
+    Len {
+        len: u64,
+    },
+    Devices {
+        count: usize,
+    },
+    /// `(group, fence)` pairs.
+    Fences {
+        fences: Vec<(u32, u64)>,
+    },
+    Fenced {
+        current: u64,
+    },
+    Error {
+        message: String,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -106,10 +134,16 @@ struct Stats {
     tls_handshake_failures: AtomicU64,
 }
 
+/// One metadata group's highest accepted fence.
+struct Fence {
+    current: RwLock<u64>,
+    path: PathBuf,
+}
+
 struct Shared {
     devices: Vec<Arc<dyn BlockStore>>,
-    fence: RwLock<u64>,
-    fence_path: PathBuf,
+    root: PathBuf,
+    fences: Mutex<BTreeMap<u32, Arc<Fence>>>,
     tls: Option<Arc<ServerConfig>>,
     stop: AtomicBool,
     stats: Stats,
@@ -118,21 +152,80 @@ struct Shared {
     handlers: Mutex<Vec<JoinHandle<()>>>,
 }
 
+fn fence_path(root: &Path, group: u32) -> PathBuf {
+    if group == 0 {
+        root.join("fence")
+    } else {
+        root.join(format!("fence.g{group}"))
+    }
+}
+
+fn read_fence(path: &Path) -> Result<u64, NativeError> {
+    match fs::read_to_string(path) {
+        Ok(s) => s
+            .trim()
+            .parse()
+            .map_err(|e| NativeError::Invalid(format!("corrupt fence file: {e}"))),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(0),
+        Err(e) => Err(e.into()),
+    }
+}
+
 impl Shared {
-    /// Runs `write` only if `fence` is not below the highest accepted fence. Writes at the
-    /// current fence hold the fence lock shared, so they run concurrently; raising the fence
-    /// takes it exclusively, so it waits for writes in flight and none can slip in between.
+    /// `group`'s fence, read from its file the first time the group writes.
+    fn fence(&self, group: u32) -> Result<Arc<Fence>, NativeError> {
+        let mut fences = self
+            .fences
+            .lock()
+            .map_err(|_| NativeError::Poisoned("fences"))?;
+        if let Some(f) = fences.get(&group) {
+            return Ok(f.clone());
+        }
+        let path = fence_path(&self.root, group);
+        let f = Arc::new(Fence {
+            current: RwLock::new(read_fence(&path)?),
+            path,
+        });
+        fences.insert(group, f.clone());
+        Ok(f)
+    }
+
+    fn fence_values(&self) -> BTreeMap<u32, u64> {
+        self.fences
+            .lock()
+            .map(|f| {
+                f.iter()
+                    .map(|(g, f)| (*g, f.current.read().map(|c| *c).unwrap_or(0)))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Runs `write` only if `fence` is not below the highest fence accepted from `group`.
+    /// Writes at the current fence hold the fence lock shared, so they run concurrently;
+    /// raising the fence takes it exclusively, so it waits for writes in flight and none can
+    /// slip in between.
     fn fenced(
         &self,
+        group: u32,
         fence: u64,
         write: impl FnOnce() -> Result<Response, NativeError>,
     ) -> Response {
         let poisoned = || Response::Error {
             message: "fence lock poisoned".into(),
         };
+        let f = match self.fence(group) {
+            Ok(f) => f,
+            Err(e) => {
+                self.stats.errors.fetch_add(1, Ordering::Relaxed);
+                return Response::Error {
+                    message: e.to_string(),
+                };
+            }
+        };
         loop {
             {
-                let Ok(current) = self.fence.read() else {
+                let Ok(current) = f.current.read() else {
                     return poisoned();
                 };
                 if fence < *current {
@@ -148,13 +241,11 @@ impl Shared {
                     });
                 }
             }
-            let Ok(mut current) = self.fence.write() else {
+            let Ok(mut current) = f.current.write() else {
                 return poisoned();
             };
             if fence > *current {
-                if let Err(e) =
-                    durable::write_atomic(&self.fence_path, fence.to_string().as_bytes())
-                {
+                if let Err(e) = durable::write_atomic(&f.path, fence.to_string().as_bytes()) {
                     self.stats.errors.fetch_add(1, Ordering::Relaxed);
                     return Response::Error {
                         message: format!("persist fence: {e}"),
@@ -184,7 +275,8 @@ pub struct DataNodeServer {
 
 impl DataNodeServer {
     /// Serves `root/nvme0.data` on an already-bound `listener` without TLS. The highest
-    /// accepted fence is kept in `root/fence`.
+    /// fence accepted from metadata group 0 is kept in `root/fence`, from group `g` in
+    /// `root/fence.g<g>`.
     pub fn start(
         id: impl Into<String>,
         root: impl AsRef<Path>,
@@ -205,7 +297,7 @@ impl DataNodeServer {
         Self::start_devices(id, root, vec![device], listener, tls)
     }
 
-    /// Serves `devices` (index = position; at least one); `root` holds the fence file.
+    /// Serves `devices` (index = position; at least one); `root` holds the fence files.
     pub fn start_devices(
         id: impl Into<String>,
         root: impl AsRef<Path>,
@@ -221,21 +313,19 @@ impl DataNodeServer {
         let tls = tls.map(|t| t.server_config()).transpose()?;
         let root = root.as_ref();
         fs::create_dir_all(root)?;
-        let fence_path = root.join("fence");
-        let fence = match fs::read_to_string(&fence_path) {
-            Ok(s) => s
-                .trim()
-                .parse()
-                .map_err(|e| NativeError::Invalid(format!("corrupt fence file: {e}")))?,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => 0,
-            Err(e) => return Err(e.into()),
-        };
+        let fence = read_fence(&fence_path(root, 0))?;
         let addr = listener.local_addr()?;
         listener.set_nonblocking(true)?;
         let shared = Arc::new(Shared {
             devices,
-            fence: RwLock::new(fence),
-            fence_path,
+            root: root.to_path_buf(),
+            fences: Mutex::new(BTreeMap::from([(
+                0,
+                Arc::new(Fence {
+                    current: RwLock::new(fence),
+                    path: fence_path(root, 0),
+                }),
+            )])),
             tls,
             stop: AtomicBool::new(false),
             stats: Stats::default(),
@@ -259,9 +349,14 @@ impl DataNodeServer {
         self.addr
     }
 
-    /// Highest fence accepted so far.
+    /// Highest fence accepted from metadata group 0.
     pub fn fence(&self) -> u64 {
-        self.shared.fence.read().map(|f| *f).unwrap_or(0)
+        self.group_fence(0)
+    }
+
+    /// Highest fence accepted from metadata group `group` (0 if it never wrote here).
+    pub fn group_fence(&self, group: u32) -> u64 {
+        self.shared.fence_values().get(&group).copied().unwrap_or(0)
     }
 
     /// Prometheus text exposition for this node's request counters and device size.
@@ -318,9 +413,16 @@ impl DataNodeServer {
         p.family(
             "atlas_native_data_fence",
             "gauge",
-            "Highest write fence (Raft term) accepted.",
-        )
-        .sample("atlas_native_data_fence", &node, self.fence());
+            "Highest write fence (Raft term) accepted from each metadata group.",
+        );
+        for (group, fence) in self.shared.fence_values() {
+            let group = group.to_string();
+            p.sample(
+                "atlas_native_data_fence",
+                &[("node", self.id.as_str()), ("group", group.as_str())],
+                fence,
+            );
+        }
         p.family(
             "atlas_native_data_device_bytes",
             "gauge",
@@ -412,24 +514,28 @@ fn accept_loop(listener: TcpListener, shared: &Arc<Shared>) {
 fn serve(mut stream: Conn, sh: &Shared) {
     while let Ok(req) = read_header::<Request>(&mut stream) {
         let result = match req {
-            Request::Append { fence, len, device } => {
-                read_payload(&mut stream, len).and_then(|data| {
-                    let resp = sh.fenced(fence, || {
-                        let offset = sh.device(device)?.append(fence, &data)?;
-                        sh.stats.appends.fetch_add(1, Ordering::Relaxed);
-                        sh.stats.bytes_written.fetch_add(len, Ordering::Relaxed);
-                        Ok(Response::Appended { offset })
-                    });
-                    write_message(&mut stream, &resp, &[])
-                })
-            }
+            Request::Append {
+                fence,
+                len,
+                device,
+                group,
+            } => read_payload(&mut stream, len).and_then(|data| {
+                let resp = sh.fenced(group, fence, || {
+                    let offset = sh.device(device)?.append(fence, &data)?;
+                    sh.stats.appends.fetch_add(1, Ordering::Relaxed);
+                    sh.stats.bytes_written.fetch_add(len, Ordering::Relaxed);
+                    Ok(Response::Appended { offset })
+                });
+                write_message(&mut stream, &resp, &[])
+            }),
             Request::WriteAt {
                 fence,
                 offset,
                 len,
                 device,
+                group,
             } => read_payload(&mut stream, len).and_then(|data| {
-                let resp = sh.fenced(fence, || {
+                let resp = sh.fenced(group, fence, || {
                     sh.device(device)?.write_at(fence, offset, &data)?;
                     sh.stats.writes.fetch_add(1, Ordering::Relaxed);
                     sh.stats.bytes_written.fetch_add(len, Ordering::Relaxed);
@@ -481,6 +587,13 @@ fn serve(mut stream: Conn, sh: &Shared) {
                 },
                 &[],
             ),
+            Request::Fences => write_message(
+                &mut stream,
+                &Response::Fences {
+                    fences: sh.fence_values().into_iter().collect(),
+                },
+                &[],
+            ),
         };
         if result.is_err() {
             return;
@@ -502,6 +615,10 @@ pub struct RemoteDevice {
     device: usize,
     /// For `device > 0`: the node has confirmed it serves that many devices.
     device_checked: AtomicBool,
+    /// The metadata group whose fence this client's writes carry.
+    group: u32,
+    /// For `group > 0`: the node has confirmed it keeps a fence per group.
+    group_checked: AtomicBool,
 }
 
 impl std::fmt::Debug for RemoteDevice {
@@ -509,6 +626,7 @@ impl std::fmt::Debug for RemoteDevice {
         f.debug_struct("RemoteDevice")
             .field("target", &self.target)
             .field("device", &self.device)
+            .field("group", &self.group)
             .field("tls", &self.tls.as_ref().map(|(_, n)| n))
             .finish()
     }
@@ -525,6 +643,8 @@ impl RemoteDevice {
             idle: Mutex::new(Vec::new()),
             device: 0,
             device_checked: AtomicBool::new(false),
+            group: 0,
+            group_checked: AtomicBool::new(false),
         }
     }
 
@@ -542,6 +662,8 @@ impl RemoteDevice {
             idle: Mutex::new(Vec::new()),
             device: 0,
             device_checked: AtomicBool::new(false),
+            group: 0,
+            group_checked: AtomicBool::new(false),
         })
     }
 
@@ -549,6 +671,31 @@ impl RemoteDevice {
     pub fn on_device(mut self, index: usize) -> Self {
         self.device = index;
         self
+    }
+
+    /// Fences this client's writes as metadata group `group` instead of group 0.
+    pub fn in_group(mut self, group: u32) -> Self {
+        self.group = group;
+        self
+    }
+
+    /// Before the first write for a group other than 0, confirms the node keeps a fence per
+    /// group: one that predates groups would fence every group's writes against one term.
+    fn check_group(&self) -> Result<(), NativeError> {
+        if self.group == 0 || self.group_checked.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        match self.exchange_pooled(&Request::Fences, &[]) {
+            Ok((Response::Fences { .. }, _)) => {
+                self.group_checked.store(true, Ordering::Release);
+                Ok(())
+            }
+            Ok((other, _)) => Err(unexpected(other)),
+            Err(e) => Err(NativeError::Remote(format!(
+                "data node {} does not keep per-group fences (older version?): {e}",
+                self.target
+            ))),
+        }
     }
 
     /// Before the first request to a device other than 0, confirms the node serves it: a node
@@ -645,10 +792,12 @@ fn unexpected(resp: Response) -> NativeError {
 
 impl BlockStore for RemoteDevice {
     fn append(&self, fence: u64, data: &[u8]) -> Result<u64, NativeError> {
+        self.check_group()?;
         let req = Request::Append {
             fence,
             len: data.len() as u64,
             device: self.device,
+            group: self.group,
         };
         match self.call(&req, data)?.0 {
             Response::Appended { offset } => Ok(offset),
@@ -657,11 +806,13 @@ impl BlockStore for RemoteDevice {
     }
 
     fn write_at(&self, fence: u64, offset: u64, data: &[u8]) -> Result<(), NativeError> {
+        self.check_group()?;
         let req = Request::WriteAt {
             fence,
             offset,
             len: data.len() as u64,
             device: self.device,
+            group: self.group,
         };
         match self.call(&req, data)?.0 {
             Response::Written => Ok(()),
@@ -765,6 +916,7 @@ mod tests {
                 fence: 7,
                 offset: 9,
                 len: 3,
+                group: 4,
             },
             b"abc",
         )
@@ -776,16 +928,25 @@ mod tests {
                 fence,
                 offset,
                 len,
+                group,
             } => {
-                assert_eq!((device, fence, offset, len), (2, 7, 9, 3));
+                assert_eq!((device, fence, offset, len, group), (2, 7, 9, 3, 4));
                 assert_eq!(read_payload(&mut r, len).unwrap(), b"abc");
             }
             other => panic!("unexpected {other:?}"),
         }
 
-        // Device 0 stays off the wire, so older data nodes parse requests unchanged.
+        // Device 0 and group 0 stay off the wire, so older data nodes parse requests unchanged.
         let legacy = serde_json::to_string(&Request::Len { device: 0 }).unwrap();
         assert!(!legacy.contains("device"), "{legacy}");
+        let legacy = serde_json::to_string(&Request::Append {
+            fence: 1,
+            len: 1,
+            device: 0,
+            group: 0,
+        })
+        .unwrap();
+        assert!(!legacy.contains("group"), "{legacy}");
 
         let mut huge = ((MAX_HEADER + 1) as u32).to_be_bytes().to_vec();
         huge.extend_from_slice(b"{}");
