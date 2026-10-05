@@ -35,7 +35,9 @@ use crate::{
     durable,
     membership::Membership,
     metadata::{Catalog, MetaCommand, MetaError},
-    store::{load_checkpoint, remove_legacy_catalog, CatalogStore, CATALOG_STORE},
+    store::{
+        load_checkpoint, remove_legacy_catalog, CatalogStore, CATALOG_STORE, DEFAULT_CACHE_INODES,
+    },
     wal::{Wal, WalError, WalRecord},
 };
 
@@ -88,6 +90,8 @@ pub struct RaftConfig {
     /// keeping the newest `compact_after` so a follower that is a little behind catches up through
     /// AppendEntries rather than a full snapshot (0 disables compaction).
     pub compact_after: u64,
+    /// Unchanged inodes the catalog keeps in memory; the rest stay in the catalog store.
+    pub catalog_cache_inodes: usize,
 }
 
 impl RaftConfig {
@@ -101,6 +105,7 @@ impl RaftConfig {
             heartbeat_ticks: 3,
             max_batch: 64,
             compact_after: 1024,
+            catalog_cache_inodes: DEFAULT_CACHE_INODES,
         }
     }
 }
@@ -305,7 +310,8 @@ impl RaftNode {
         } else {
             HardState::default()
         };
-        let store = CatalogStore::open(cfg.root.join(CATALOG_STORE))?;
+        let store = CatalogStore::open(cfg.root.join(CATALOG_STORE))?
+            .with_cache_inodes(cfg.catalog_cache_inodes);
         let mut catalog = load_checkpoint(&cfg.root, &store)?;
         if !catalog.in_store {
             store.checkpoint(&mut catalog)?;
@@ -883,6 +889,7 @@ impl RaftNode {
     fn handle_snapshot(&mut self, mut snap: Catalog) -> Result<(), RaftError> {
         // The leader's catalog, whatever its own store holds: ours gets all of it.
         snap.in_store = false;
+        snap.fill_usage().map_err(std::io::Error::other)?;
         let si = snap.applied_index;
         let st = snap.current_term;
         if si <= self.commit_index {

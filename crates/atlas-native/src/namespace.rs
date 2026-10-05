@@ -8,9 +8,10 @@
 //! every replica applying the same log reaches byte-identical state.
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 
 use crate::{
+    inodes::InodeTable,
     metadata::{Catalog, ExtentId, ExtentRef, MetaError, SnapshotId},
     tracked::Tracked,
 };
@@ -29,13 +30,25 @@ pub struct FsMeta {
     pub id: FsId,
     pub name: String,
     pub next_ino: u64,
-    pub inodes: Tracked<u64, Inode>,
+    pub inodes: InodeTable,
     /// The snapshot this filesystem was cloned from, if any.
     #[serde(default)]
     pub source_snapshot: Option<SnapshotId>,
     /// File extent grid; `None` (filesystems created before it was recorded) uses the cluster's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extent_bytes: Option<u64>,
+    /// Kept by every change, so stat needn't walk the inodes. `None` in a catalog written before
+    /// it was kept, until [`Catalog::fill_usage`] counts it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<FsUsage>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FsUsage {
+    /// Sum of file sizes.
+    pub file_bytes: u64,
+    /// Sum of the lengths of the extents files reference.
+    pub used_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -275,6 +288,15 @@ impl Inode {
         matches!(self.kind, InodeKind::Dir { .. })
     }
 
+    /// A directory's entries; other inodes have none.
+    pub fn entries(&self) -> &BTreeMap<String, u64> {
+        static NONE: BTreeMap<String, u64> = BTreeMap::new();
+        match &self.kind {
+            InodeKind::Dir { entries, .. } => entries,
+            _ => &NONE,
+        }
+    }
+
     /// File size; a directory reports its entry count and a symlink its target length.
     pub fn size(&self) -> u64 {
         match &self.kind {
@@ -292,24 +314,31 @@ impl Inode {
 }
 
 impl FsMeta {
-    pub fn inode(&self, ino: u64) -> Result<&Inode, MetaError> {
+    pub fn inode(&self, ino: u64) -> Result<Arc<Inode>, MetaError> {
         self.inodes
-            .get(&ino)
+            .get(ino)?
             .ok_or_else(|| MetaError::NotFound(format!("inode {ino} in filesystem {}", self.id)))
     }
 
     fn inode_mut(&mut self, ino: u64) -> Result<&mut Inode, MetaError> {
         let id = &self.id;
         self.inodes
-            .get_mut(&ino)
+            .get_mut(ino)?
             .ok_or_else(|| MetaError::NotFound(format!("inode {ino} in filesystem {id}")))
     }
 
-    pub fn entries(&self, dir: u64) -> Result<&BTreeMap<String, u64>, MetaError> {
-        match &self.inode(dir)?.kind {
-            InodeKind::Dir { entries, .. } => Ok(entries),
-            _ => Err(MetaError::NotDir(format!("inode {dir}"))),
+    /// A directory inode.
+    pub fn dir(&self, dir: u64) -> Result<Arc<Inode>, MetaError> {
+        let i = self.inode(dir)?;
+        if !i.is_dir() {
+            return Err(MetaError::NotDir(format!("inode {dir}")));
         }
+        Ok(i)
+    }
+
+    /// The inode `name` in directory `dir` names, if any.
+    pub fn entry(&self, dir: u64, name: &str) -> Result<Option<u64>, MetaError> {
+        Ok(self.dir(dir)?.entries().get(name).copied())
     }
 
     fn entries_mut(&mut self, dir: u64) -> Result<&mut Tracked<String, u64>, MetaError> {
@@ -320,9 +349,7 @@ impl FsMeta {
     }
 
     pub fn lookup(&self, dir: u64, name: &str) -> Result<u64, MetaError> {
-        self.entries(dir)?
-            .get(name)
-            .copied()
+        self.entry(dir, name)?
             .ok_or_else(|| MetaError::NotFound(format!("{name:?} in directory {dir}")))
     }
 
@@ -340,7 +367,7 @@ impl FsMeta {
         i.nlink = i.nlink.saturating_sub(1);
         i.ctime_ns = now_ns;
         if i.nlink == 0 {
-            return Ok(self.inodes.remove(&ino));
+            return self.inodes.remove(ino);
         }
         Ok(None)
     }
@@ -360,9 +387,10 @@ impl FsMeta {
 }
 
 /// Every extent referenced by a table of inodes (hard links count once: they share an inode).
-pub fn file_extents(inodes: &BTreeMap<u64, Inode>) -> impl Iterator<Item = &ExtentId> {
+pub fn file_extents<'a>(
+    inodes: impl Iterator<Item = &'a Inode>,
+) -> impl Iterator<Item = &'a ExtentId> {
     inodes
-        .values()
         .flat_map(|i| match &i.kind {
             InodeKind::File { extents, .. } => Some(extents.values()),
             _ => None,
@@ -423,8 +451,8 @@ impl Catalog {
             .ok_or_else(|| MetaError::NotFound(format!("filesystem {fs}")))
     }
 
-    fn drop_inode(&mut self, inode: Inode, gc: &mut Vec<ExtentId>) -> Result<(), MetaError> {
-        if let InodeKind::File { extents, .. } = inode.kind {
+    fn drop_inode(&mut self, inode: &Inode, gc: &mut Vec<ExtentId>) -> Result<(), MetaError> {
+        if let InodeKind::File { extents, .. } = &inode.kind {
             for eid in extents.values() {
                 self.dec_ref(eid, gc)?;
             }
@@ -432,12 +460,74 @@ impl Catalog {
         Ok(())
     }
 
-    fn share_extents(&mut self, inodes: &BTreeMap<u64, Inode>) -> Result<(), MetaError> {
-        for eid in file_extents(inodes) {
+    fn share_extents(&mut self, inodes: &InodeTable) -> Result<(), MetaError> {
+        let all = inodes.scan()?;
+        for eid in file_extents(all.iter().map(|i| &**i)) {
             self.extents
                 .get_mut(eid)
                 .ok_or_else(|| MetaError::NotFound(eid.clone()))?
                 .refs += 1;
+        }
+        Ok(())
+    }
+
+    fn extent_len(&self, eid: &ExtentId) -> u64 {
+        self.extents.get(eid).map_or(0, |m| m.extent.len as u64)
+    }
+
+    /// A filesystem's usage counters, if it keeps them.
+    fn usage_mut(&mut self, fs: &str) -> Option<&mut FsUsage> {
+        self.filesystems.get_mut(fs)?.usage.as_mut()
+    }
+
+    /// Takes a file about to be dropped out of its filesystem's usage.
+    fn forget_usage(&mut self, fs: &str, inode: &Inode) {
+        let InodeKind::File { size, extents } = &inode.kind else {
+            return;
+        };
+        let used: u64 = extents.values().map(|e| self.extent_len(e)).sum();
+        if let Some(u) = self.usage_mut(fs) {
+            u.file_bytes = u.file_bytes.saturating_sub(*size);
+            u.used_bytes = u.used_bytes.saturating_sub(used);
+        }
+    }
+
+    /// Counts the usage of every filesystem and snapshot tree that doesn't keep it yet.
+    pub fn fill_usage(&mut self) -> Result<(), MetaError> {
+        let count = |c: &Catalog, f: &FsMeta| -> Result<FsUsage, MetaError> {
+            let all = f.inodes.scan()?;
+            Ok(FsUsage {
+                file_bytes: all
+                    .iter()
+                    .filter(|i| matches!(i.kind, InodeKind::File { .. }))
+                    .map(|i| i.size())
+                    .sum(),
+                used_bytes: file_extents(all.iter().map(|i| &**i))
+                    .map(|e| c.extent_len(e))
+                    .sum(),
+            })
+        };
+        let fs: Vec<(FsId, FsUsage)> = self
+            .filesystems
+            .values()
+            .filter(|f| f.usage.is_none())
+            .map(|f| Ok((f.id.clone(), count(self, f)?)))
+            .collect::<Result<_, MetaError>>()?;
+        for (id, u) in fs {
+            if let Some(f) = self.filesystems.get_mut(&id) {
+                f.usage = Some(u);
+            }
+        }
+        let snaps: Vec<(SnapshotId, FsUsage)> = self
+            .fs_snapshots
+            .values()
+            .filter(|s| s.tree.usage.is_none())
+            .map(|s| Ok((s.id.clone(), count(self, &s.tree)?)))
+            .collect::<Result<_, MetaError>>()?;
+        for (id, u) in snaps {
+            if let Some(s) = self.fs_snapshots.get_mut(&id) {
+                s.tree.usage = Some(u);
+            }
         }
         Ok(())
     }
@@ -476,18 +566,17 @@ impl Catalog {
                         id: fs.clone(),
                         name: name.clone(),
                         next_ino: ROOT_INO + 1,
-                        inodes: BTreeMap::from([(ROOT_INO, root)]).into(),
+                        inodes: [root].into_iter().collect(),
                         source_snapshot: None,
                         extent_bytes: *extent_bytes,
+                        usage: Some(FsUsage::default()),
                     },
                 );
             }
             FsOp::DeleteFs { fs } => {
-                let f = self
-                    .filesystems
-                    .remove(fs)
-                    .ok_or_else(|| MetaError::NotFound(format!("filesystem {fs}")))?;
-                for inode in f.inodes.into_values() {
+                let all = self.filesystem(fs)?.inodes.scan()?;
+                self.filesystems.remove(fs);
+                for inode in &all {
                     self.drop_inode(inode, gc)?;
                 }
             }
@@ -506,7 +595,7 @@ impl Catalog {
             } => {
                 check_name(name)?;
                 let f = self.fs_mut(fs)?;
-                if let Some(&existing) = f.entries(*parent)?.get(name) {
+                if let Some(existing) = f.entry(*parent, name)? {
                     if !op_id.is_empty() && f.inode(existing)?.op_id == *op_id {
                         return Ok(());
                     }
@@ -542,7 +631,7 @@ impl Catalog {
                 let mut inode = Inode::new(ino, kind, *mode, *uid, *gid, *now_ns);
                 inode.op_id = op_id.clone();
                 let is_dir = inode.is_dir();
-                f.inodes.insert(ino, inode);
+                f.inodes.insert(inode);
                 f.entries_mut(*parent)?.insert(name.clone(), ino);
                 f.dir_changed(*parent, i64::from(is_dir), *now_ns)?;
             }
@@ -560,7 +649,7 @@ impl Catalog {
                         "inode {ino}: directories cannot be hard-linked"
                     )));
                 }
-                if let Some(&existing) = f.entries(*parent)?.get(name) {
+                if let Some(existing) = f.entry(*parent, name)? {
                     if existing == *ino {
                         return Ok(());
                     }
@@ -586,7 +675,8 @@ impl Catalog {
                 f.entries_mut(*parent)?.remove(name);
                 f.dir_changed(*parent, 0, *now_ns)?;
                 if let Some(gone) = f.drop_link(ino, *now_ns)? {
-                    self.drop_inode(gone, gc)?;
+                    self.forget_usage(fs, &gone);
+                    self.drop_inode(&gone, gc)?;
                 }
             }
             FsOp::Rmdir {
@@ -597,14 +687,14 @@ impl Catalog {
             } => {
                 let f = self.fs_mut(fs)?;
                 let ino = f.lookup(*parent, name)?;
-                if !f.entries(ino)?.is_empty() {
+                if !f.dir(ino)?.entries().is_empty() {
                     return Err(MetaError::NotEmpty(format!(
                         "{name:?} in directory {parent}"
                     )));
                 }
                 f.entries_mut(*parent)?.remove(name);
                 f.dir_changed(*parent, -1, *now_ns)?;
-                f.inodes.remove(&ino);
+                f.inodes.remove(ino)?;
             }
             FsOp::Rename {
                 fs,
@@ -617,7 +707,7 @@ impl Catalog {
                 check_name(new_name)?;
                 let f = self.fs_mut(fs)?;
                 let src = f.lookup(*parent, name)?;
-                let dst = f.entries(*new_parent)?.get(new_name).copied();
+                let dst = f.entry(*new_parent, new_name)?;
                 if dst == Some(src) {
                     return Ok(());
                 }
@@ -641,7 +731,7 @@ impl Catalog {
                                 "{new_name:?} in directory {new_parent}"
                             )))
                         }
-                        (true, true) if !f.entries(dst)?.is_empty() => {
+                        (true, true) if !f.dir(dst)?.entries().is_empty() => {
                             return Err(MetaError::NotEmpty(format!(
                                 "{new_name:?} in directory {new_parent}"
                             )))
@@ -650,7 +740,7 @@ impl Catalog {
                     }
                     f.entries_mut(*new_parent)?.remove(new_name);
                     if dst_dir {
-                        f.inodes.remove(&dst);
+                        f.inodes.remove(dst)?;
                         f.dir_changed(*new_parent, -1, *now_ns)?;
                     } else {
                         dropped = f.drop_link(dst, *now_ns)?;
@@ -667,7 +757,8 @@ impl Catalog {
                     *p = *new_parent;
                 }
                 if let Some(gone) = dropped {
-                    self.drop_inode(gone, gc)?;
+                    self.forget_usage(fs, &gone);
+                    self.drop_inode(&gone, gc)?;
                 }
             }
             FsOp::SetAttr {
@@ -678,6 +769,7 @@ impl Catalog {
             } => {
                 let i = self.fs_mut(fs)?.inode_mut(*ino)?;
                 let mut cut = BTreeMap::new();
+                let mut resized = None;
                 if let Some(new_size) = attr.size {
                     let InodeKind::File { size, extents } = &mut i.kind else {
                         return Err(MetaError::IsDir(format!(
@@ -688,6 +780,7 @@ impl Catalog {
                         cut = extents.split_off(&new_size);
                     }
                     if new_size != *size {
+                        resized = Some((*size, new_size));
                         *size = new_size;
                         i.mtime_ns = *now_ns;
                     }
@@ -708,6 +801,13 @@ impl Catalog {
                     i.mtime_ns = t;
                 }
                 i.ctime_ns = *now_ns;
+                let cut_bytes: u64 = cut.values().map(|e| self.extent_len(e)).sum();
+                if let Some(u) = self.usage_mut(fs) {
+                    if let Some((old, new)) = resized {
+                        u.file_bytes = u.file_bytes.saturating_sub(old).saturating_add(new);
+                    }
+                    u.used_bytes = u.used_bytes.saturating_sub(cut_bytes);
+                }
                 for eid in cut.values() {
                     self.dec_ref(eid, gc)?;
                 }
@@ -778,9 +878,16 @@ impl Catalog {
                     )));
                 };
                 let old = extents.insert(*logical_offset, extent.id.clone());
+                let old_size = *size;
                 *size = (*size).max(*at_least);
+                let grown = *size - old_size;
                 i.touch(*now_ns);
                 self.add_extent_ref(extent);
+                let old_len = old.as_ref().map_or(0, |o| self.extent_len(o));
+                if let Some(u) = self.usage_mut(fs) {
+                    u.file_bytes = u.file_bytes.saturating_add(grown);
+                    u.used_bytes = (u.used_bytes + extent.len as u64).saturating_sub(old_len);
+                }
                 if let Some(old) = old {
                     self.dec_ref(&old, gc)?;
                 }
@@ -802,10 +909,18 @@ impl Catalog {
                     .iter()
                     .filter_map(|e| extents.insert(e.logical_offset, e.id.clone()))
                     .collect();
+                let old_size = *size;
                 *size = (*size).max(*at_least);
+                let grown = *size - old_size;
                 i.touch(*now_ns);
                 for e in new {
                     self.add_extent_ref(e);
+                }
+                let old_len: u64 = old.iter().map(|o| self.extent_len(o)).sum();
+                let new_len: u64 = new.iter().map(|e| e.len as u64).sum();
+                if let Some(u) = self.usage_mut(fs) {
+                    u.file_bytes = u.file_bytes.saturating_add(grown);
+                    u.used_bytes = (u.used_bytes + new_len).saturating_sub(old_len);
                 }
                 for o in old {
                     self.dec_ref(&o, gc)?;
@@ -823,7 +938,11 @@ impl Catalog {
                     }
                     return Err(MetaError::Exists(format!("filesystem snapshot {id}")));
                 }
-                let tree = self.filesystem(fs)?.clone();
+                let f = self.filesystem(fs)?;
+                let tree = FsMeta {
+                    inodes: f.inodes.detached()?,
+                    ..f.clone()
+                };
                 self.share_extents(&tree.inodes)?;
                 self.fs_snapshots.insert(
                     id.clone(),
@@ -841,8 +960,8 @@ impl Catalog {
                     .fs_snapshots
                     .remove(id)
                     .ok_or_else(|| MetaError::NotFound(format!("filesystem snapshot {id}")))?;
-                for inode in s.tree.inodes.into_values() {
-                    self.drop_inode(inode, gc)?;
+                for inode in s.tree.inodes.scan()? {
+                    self.drop_inode(&inode, gc)?;
                 }
             }
             FsOp::CloneFs {
@@ -898,8 +1017,26 @@ mod tests {
 
         fn run(&mut self, op: FsOp) -> Result<Vec<ExtentId>, MetaError> {
             self.index += 1;
-            self.c
-                .apply_committed(1, self.index, &MetaCommand::Fs { op })
+            let r = self
+                .c
+                .apply_committed(1, self.index, &MetaCommand::Fs { op });
+            // The usage every op keeps matches a fresh count.
+            let mut counted = self.c.clone();
+            let ids: Vec<FsId> = counted.filesystems.keys().cloned().collect();
+            for id in ids {
+                counted.filesystems.get_mut(&id).unwrap().usage = None;
+            }
+            let ids: Vec<SnapshotId> = counted.fs_snapshots.keys().cloned().collect();
+            for id in ids {
+                counted.fs_snapshots.get_mut(&id).unwrap().tree.usage = None;
+            }
+            counted.fill_usage().unwrap();
+            assert_eq!(
+                serde_json::to_value(&counted).unwrap(),
+                serde_json::to_value(&self.c).unwrap(),
+                "usage drifted from a fresh count"
+            );
+            r
         }
 
         fn ok(&mut self, op: FsOp) -> Vec<ExtentId> {

@@ -24,7 +24,9 @@ use crate::{
     placement::{select_replicas, Node, PlacementPolicy},
     raft::RaftError,
     raft_server::RaftServer,
-    store::{load_checkpoint, remove_legacy_catalog, CatalogStore, CATALOG_STORE},
+    store::{
+        load_checkpoint, remove_legacy_catalog, CatalogStore, CATALOG_STORE, DEFAULT_CACHE_INODES,
+    },
     telemetry::NativeIoCounters,
     wal::{Wal, WalError, WalRecord},
 };
@@ -58,9 +60,12 @@ impl Target<'_> {
     /// The extent currently at grid cell `cell`, if any.
     fn extent_at(&self, c: &Catalog, cell: u64) -> Result<Option<ExtentRef>, NativeError> {
         let id = match self {
-            Target::Volume(v) => c.volumes.get(*v).and_then(|v| v.extents.get(&cell)),
+            Target::Volume(v) => c
+                .volumes
+                .get(*v)
+                .and_then(|v| v.extents.get(&cell).cloned()),
             Target::File { fs, ino } => match &c.filesystem(fs)?.inode(*ino)?.kind {
-                InodeKind::File { extents, .. } => extents.get(&cell),
+                InodeKind::File { extents, .. } => extents.get(&cell).cloned(),
                 _ => {
                     return Err(
                         MetaError::IsDir(format!("inode {ino} is not a regular file")).into(),
@@ -69,7 +74,7 @@ impl Target<'_> {
             },
         };
         Ok(id
-            .and_then(|id| c.extents.get(id))
+            .and_then(|id| c.extents.get(&id))
             .map(|m| m.extent.clone()))
     }
 }
@@ -133,6 +138,8 @@ pub struct EngineConfig {
     /// After an I/O failure a node is skipped for placement (and tried last for reads) for this
     /// long, then given another chance.
     pub node_retry_after: Duration,
+    /// Unchanged inodes the catalog keeps in memory; the rest stay in the catalog store.
+    pub catalog_cache_inodes: usize,
 }
 
 impl EngineConfig {
@@ -143,6 +150,7 @@ impl EngineConfig {
             placement: PlacementPolicy::default(),
             wal_compact_after: 1024,
             node_retry_after: Duration::from_secs(5),
+            catalog_cache_inodes: DEFAULT_CACHE_INODES,
         }
     }
 }
@@ -285,7 +293,8 @@ impl NativeEngine {
             .collect();
         let meta = match meta {
             MetaBackend::Local => {
-                let store = CatalogStore::open(cfg.root.join(CATALOG_STORE))?;
+                let store = CatalogStore::open(cfg.root.join(CATALOG_STORE))?
+                    .with_cache_inodes(cfg.catalog_cache_inodes);
                 let (catalog, wal) = load_local(&cfg.root, &store)?;
                 Meta::Local {
                     store,
@@ -1327,7 +1336,6 @@ impl NativeEngine {
         }
         Err(NativeError::Checksum(ext.id.clone()))
     }
-
 }
 
 /// The checkpointed catalog plus every WAL record past it.

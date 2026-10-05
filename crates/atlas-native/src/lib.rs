@@ -19,6 +19,7 @@ mod durable;
 pub mod engine;
 pub mod gc;
 pub mod http;
+pub mod inodes;
 pub mod membership;
 pub mod metadata;
 pub mod metrics;
@@ -30,8 +31,8 @@ pub mod raft_server;
 pub mod raw;
 pub mod store;
 pub mod telemetry;
-pub mod tracked;
 pub mod tls;
+pub mod tracked;
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
 pub mod uring;
 pub mod wal;

@@ -3,7 +3,8 @@
 
 //! File creates per second through the local-WAL engine and a 3-voter Raft group on localhost,
 //! from one thread and from several, and whether the rate holds as the namespace grows.
-//! `BENCH_WAL_COMPACT_AFTER` overrides the local engine's checkpoint interval (0: never).
+//! `BENCH_WAL_COMPACT_AFTER` overrides the local engine's checkpoint interval (0: never) and
+//! `BENCH_CACHE_INODES` its catalog cache.
 //! `BENCH_FILES=20000 cargo test --release -p atlas-native --test metadata_bench -- --ignored --nocapture`
 
 use std::{
@@ -145,6 +146,12 @@ fn file_creates_per_second() {
     {
         cfg.wal_compact_after = n;
     }
+    if let Some(n) = std::env::var("BENCH_CACHE_INODES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        cfg.catalog_cache_inodes = n;
+    }
     let e = NativeEngine::open(cfg, nodes).unwrap();
     e.create_fs_as("f".into(), "fs").unwrap();
 
@@ -166,4 +173,17 @@ fn file_creates_per_second() {
         rates.last().copied().unwrap_or(total),
     );
     run("local", &e, files..2 * files, 8);
+    if let Some(peak) = std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("VmHWM:"))
+                .map(str::to_owned)
+        })
+    {
+        println!(
+            "local: peak RSS {}",
+            peak.trim_start_matches("VmHWM:").trim()
+        );
+    }
 }

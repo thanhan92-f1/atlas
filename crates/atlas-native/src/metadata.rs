@@ -175,10 +175,28 @@ pub enum MetaError {
     TooBig(String),
     #[error("not supported: {0}")]
     Unsupported(String),
+    /// The catalog store could not be read: not a property of the command.
+    #[error("catalog store: {0}")]
+    Store(String),
 }
 
 impl Catalog {
     pub fn apply(
+        &mut self,
+        term: u64,
+        index: u64,
+        cmd: &MetaCommand,
+    ) -> Result<Vec<ExtentId>, MetaError> {
+        let result = self.apply_inner(term, index, cmd);
+        if let Err(MetaError::Store(e)) = &result {
+            // The command may be half applied, and a replica that could read its store would
+            // not reject it: only a restart (checkpoint plus log replay) recovers this state.
+            panic!("catalog store unreadable while applying index {index}: {e}");
+        }
+        result
+    }
+
+    fn apply_inner(
         &mut self,
         term: u64,
         index: u64,

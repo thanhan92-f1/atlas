@@ -65,6 +65,16 @@ impl<K: Ord + Clone, V> Tracked<K, V> {
         self.map.values_mut()
     }
 
+    /// Adds a value the store already holds as it is (an inode paged in), recording no change.
+    pub(crate) fn insert_quietly(&mut self, k: K, v: V) {
+        self.map.insert(k, v);
+    }
+
+    /// Every value, for edits that aren't part of the record (attaching a cache).
+    pub(crate) fn values_mut_quietly(&mut self) -> impl Iterator<Item = &mut V> {
+        self.map.values_mut()
+    }
+
     pub fn into_values(self) -> impl Iterator<Item = V> {
         self.map.into_values()
     }

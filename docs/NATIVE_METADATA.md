@@ -47,9 +47,33 @@ new inode, directory inode, new entry). `NativeEngine::checkpoint` and Raft comp
 redb transaction; `store::bench` (ignored) measures it at ~4–5 ms per 1024 creates from 8k to 65k
 inodes on tmpfs, growing only with the B-tree's depth.
 
-Limits: the working catalog still lives in memory in full; the store makes checkpoints
-incremental, but it doesn't page the catalog out yet. Checkpoints run on the commit path, under
-the catalog lock.
+### Paged inode tables
+
+Inodes are the bulk of a catalog, and once the store holds a filesystem they are paged
+(`inodes::InodeTable`). Memory keeps the inodes changed since the last checkpoint, plus a bounded
+LRU cache of unchanged ones (`EngineConfig::catalog_cache_inodes` / `RaftConfig::catalog_cache_inodes`,
+default 262,144). Everything else is read on demand from a redb read snapshot taken at the
+checkpoint. A checkpoint hands the changed inodes to the next snapshot's cache, which keeps every
+still-valid entry of the last one. A catalog cloned before a checkpoint keeps reading the
+snapshot it was cloned on, so a Raft snapshot in flight or the leader's speculative catalog sees
+one consistent state. Inodes are shared (`Arc`): reads take no copy, an edit copies only an inode
+someone else still holds, and a filesystem snapshot or clone shares the inodes of the tree it
+copies. Each filesystem keeps `file_bytes` and `used_bytes` counters in every command, so `statfs`
+and the filesystem list never walk the inodes. Catalogs written before the counters existed are
+counted once on load.
+
+A store read error while applying a command panics: the command may be half applied, and a
+replica that could read its store would accept it. A restart recovers from the checkpoint and the
+log. A read error on a read path is returned to the caller.
+
+`metadata_bench` (local engine, second lab host): ~100k creates/s from one thread at 40k files
+with either a 4096-inode or a 262,144-inode cache. `store::bench::memory_of_a_paged_catalog`
+(4096-inode cache, 400k files, one directory or 1000) peaks at ~112 MB, growing ~9 MB per 100k
+files at the end as redb's 64 MiB page cache fills.
+
+Limits: filesystem snapshot trees are still held in memory in full (one `fs_snapshots` record
+each), and a directory's entries are paged in with it as a whole. Checkpoints run on the commit
+path, under the catalog lock.
 
 ## Checkpoint and WAL compaction
 
