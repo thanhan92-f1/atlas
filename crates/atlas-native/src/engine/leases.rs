@@ -46,18 +46,21 @@ impl NativeEngine {
             .map_err(NativeError::from)
     }
 
-    /// Opens (or renews, with a new TTL) a session for clients of `fs`.
+    /// Opens (or renews, with a new TTL) a session for clients of `fs`; `cache` if it will hold
+    /// cache leases.
     pub fn open_session(
         &self,
         fs: &str,
         session: &str,
         ttl_ms: u64,
+        cache: bool,
     ) -> Result<Session, NativeError> {
         self.live_fs(fs)?;
         self.lease_commit(LeaseOp::Open {
             session: session.into(),
             ttl_ms,
             now_ms: now_ms(),
+            cache,
         })?;
         self.session(session)
     }
@@ -144,6 +147,11 @@ impl NativeEngine {
             sessions: c.leases.sessions.len(),
             locks: c.leases.locks.get(fs).cloned().unwrap_or_default(),
         })
+    }
+
+    /// Whether a caching session was opened before `term` (see [`crate::leases::Leases`]).
+    pub fn caching_since_before(&self, term: u64) -> Result<bool, NativeError> {
+        self.with_catalog(|c| c.leases.caching_since_before(term))
     }
 
     /// The longest TTL of any open session (0 with none).

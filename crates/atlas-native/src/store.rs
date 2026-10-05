@@ -976,6 +976,7 @@ mod tests {
                 session: "s".into(),
                 ttl_ms: 5_000,
                 now_ms: 10,
+                cache: true,
             },
         });
         h.apply(MetaCommand::Lease {

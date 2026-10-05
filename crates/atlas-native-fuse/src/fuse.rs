@@ -97,7 +97,7 @@ fn xattr_reply(reply: ReplyXattr, value: &[u8], size: u32) {
 
 impl AtlasFs {
     fn ttl(&self) -> Duration {
-        self.ops.cfg.ttl
+        self.ops.kernel_ttl()
     }
 
     fn entry(&self, r: Result<Attr, i32>, reply: ReplyEntry) {

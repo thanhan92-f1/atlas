@@ -3,13 +3,14 @@
 
 //! Filesystem operations against one native filesystem, independent of the kernel interface:
 //! every call returns a value or an errno. Attributes and name lookups are cached for a short
-//! TTL; writes are buffered per inode and sent on fsync, close, a non-sequential write, or once
-//! a run reaches the flush size.
+//! TTL, or with cache leases for as long as the cluster's lease on them lasts (a change by
+//! another client recalls it first); writes are buffered per inode and sent on fsync, close, a
+//! non-sequential write, or once a run reaches the flush size.
 
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use atlas_native::{
@@ -23,7 +24,7 @@ use serde_json::json;
 use crate::{
     cache::TtlCache,
     client::{encode, Body, Client, Error, Retry},
-    locks::{Conflict, Locks},
+    locks::{Conflict, Locks, Recall},
     writeback::{Dirty, WriteBack},
 };
 
@@ -50,6 +51,9 @@ pub struct OpsConfig {
     /// Blocking lock requests (`F_SETLKW`) allowed to wait at once; keep it below the kernel
     /// worker threads so waiters never block the unlock they wait for.
     pub lock_waiters: usize,
+    /// Cache attributes and names under cache leases instead of for `ttl`: nothing cached is
+    /// ever stale, and the kernel is given a zero TTL so every lookup reaches this cache.
+    pub cache_leases: bool,
 }
 
 impl Default for OpsConfig {
@@ -62,6 +66,7 @@ impl Default for OpsConfig {
             direct_reads: None,
             session_ttl: Duration::from_secs(15),
             lock_waiters: 3,
+            cache_leases: false,
         }
     }
 }
@@ -85,8 +90,11 @@ pub struct Ops {
     /// `<fs>` or `<fs>@<snapshot>` (read-only).
     fs: String,
     pub cfg: OpsConfig,
-    attrs: Mutex<TtlCache<u64, Attr>>,
-    names: Mutex<TtlCache<(u64, String), u64>>,
+    attrs: Arc<Mutex<TtlCache<u64, Attr>>>,
+    names: Arc<Mutex<TtlCache<(u64, String), u64>>>,
+    /// When each inode's cache lease was last recalled: a leased reply to a request sent
+    /// before that is not cached.
+    recalled: Arc<Mutex<HashMap<u64, Instant>>>,
     dirty: Mutex<WriteBack>,
     readahead: Mutex<TtlCache<u64, Window>>,
     /// Where each inode's last read ended: only a read that continues there reads ahead.
@@ -132,12 +140,48 @@ impl Ops {
     pub fn new(client: Client, fs: impl Into<String>, cfg: OpsConfig) -> Self {
         let client = Arc::new(client);
         let fs = fs.into();
+        // Under cache leases only leased replies are cached.
+        let ttl = if cfg.cache_leases {
+            Duration::ZERO
+        } else {
+            cfg.ttl
+        };
+        let attrs = Arc::new(Mutex::new(TtlCache::new(ttl)));
+        let names = Arc::new(Mutex::new(TtlCache::new(ttl)));
+        let recalled = Arc::new(Mutex::new(HashMap::new()));
+        let recall: Option<Recall> = cfg.cache_leases.then(|| {
+            let (attrs, names, recalled) = (attrs.clone(), names.clone(), recalled.clone());
+            Arc::new(move |inos: &[u64]| {
+                let now = Instant::now();
+                if let Ok(mut r) = recalled.lock() {
+                    if r.len() >= 65_536 {
+                        r.retain(|_, at| now.duration_since(*at) < Duration::from_secs(60));
+                    }
+                    r.extend(inos.iter().map(|i| (*i, now)));
+                }
+                if let Ok(mut a) = attrs.lock() {
+                    for i in inos {
+                        a.remove(i);
+                    }
+                }
+                if let Ok(mut n) = names.lock() {
+                    n.retain(|(parent, _), _| !inos.contains(parent));
+                }
+            }) as Recall
+        });
         Self {
-            locks: Locks::new(client.clone(), &fs, cfg.session_ttl, cfg.lock_waiters),
+            locks: Locks::new(
+                client.clone(),
+                &fs,
+                cfg.session_ttl,
+                cfg.lock_waiters,
+                recall,
+            ),
             client,
             fs,
-            attrs: Mutex::new(TtlCache::new(cfg.ttl)),
-            names: Mutex::new(TtlCache::new(cfg.ttl)),
+            attrs,
+            names,
+            recalled,
             dirty: Mutex::new(WriteBack::new(cfg.writeback_bytes)),
             readahead: Mutex::new(TtlCache::new(if cfg.readahead_bytes > 0 {
                 cfg.ttl
@@ -221,8 +265,56 @@ impl Ops {
         self.fs.contains('@')
     }
 
+    /// The TTL the kernel may cache attributes and names for.
+    pub fn kernel_ttl(&self) -> Duration {
+        if self.cfg.cache_leases {
+            Duration::ZERO
+        } else {
+            self.cfg.ttl
+        }
+    }
+
+    /// Requests name the mount's session (once it has one), so the cluster does not recall the
+    /// mount's own cache leases for its own changes.
     fn path(&self, rest: &str) -> String {
-        format!("/v1/fs/{}{rest}", self.fs)
+        match self.locks.session_id() {
+            Some(s) => {
+                let sep = if rest.contains('?') { '&' } else { '?' };
+                format!("/v1/fs/{}{rest}{sep}session={s}", self.fs)
+            }
+            None => format!("/v1/fs/{}{rest}", self.fs),
+        }
+    }
+
+    /// Whether to ask for cache leases: enabled, writable, and the session is open.
+    fn leasing(&self) -> bool {
+        self.cfg.cache_leases && !self.read_only() && self.locks.session().is_ok()
+    }
+
+    /// GET `rest` asking for a cache lease: the attributes, when the request was sent, and
+    /// until when the lease lasts (if one was granted).
+    fn leased_get(&self, rest: &str) -> Result<(Attr, Instant, Option<Instant>), Errno> {
+        let sep = if rest.contains('?') { '&' } else { '?' };
+        let sent = Instant::now();
+        let v = self.call(
+            Method::GET,
+            &format!("{rest}{sep}lease=1"),
+            Body::Empty,
+            Retry::Idempotent,
+        )?;
+        // Counted from the send, with a margin for clock rate differences.
+        let until = v["lease_ms"]
+            .as_u64()
+            .map(|ms| sent + Duration::from_millis(ms) * 9 / 10);
+        Ok((decode(v)?, sent, until))
+    }
+
+    /// Whether `ino`'s lease was not recalled since `sent`: a reply to a request sent before a
+    /// recall may predate the change the recall was for.
+    fn unrecalled(&self, ino: u64, sent: Instant) -> bool {
+        self.recalled
+            .lock()
+            .is_ok_and(|r| r.get(&ino).is_none_or(|at| *at < sent))
     }
 
     fn call(
@@ -245,10 +337,15 @@ impl Ops {
     }
 
     /// Caches `a` and returns it with any buffered bytes counted in its size.
-    fn remember(&self, mut a: Attr) -> Attr {
+    fn remember(&self, a: Attr) -> Attr {
         if let Ok(mut c) = self.attrs.lock() {
             c.put(a.ino, a.clone());
         }
+        self.adjust(a)
+    }
+
+    /// `a` with this mount's buffered bytes and parked unlinks applied.
+    fn adjust(&self, mut a: Attr) -> Attr {
         if let Some(end) = self.dirty.lock().ok().and_then(|d| d.end(a.ino)) {
             a.size = a.size.max(end);
         }
@@ -304,16 +401,24 @@ impl Ops {
     }
 
     pub fn getattr(&self, ino: u64) -> Result<Attr, Errno> {
-        let cached = self.attrs.lock().ok().and_then(|mut c| c.get(&ino));
-        let a = match cached {
-            Some(a) => a,
-            None => decode(self.call(
-                Method::GET,
-                &format!("/inodes/{ino}"),
-                Body::Empty,
-                Retry::Idempotent,
-            )?)?,
-        };
+        if let Some(a) = self.attrs.lock().ok().and_then(|mut c| c.get(&ino)) {
+            return Ok(self.adjust(a));
+        }
+        if self.leasing() {
+            let (a, sent, until) = self.leased_get(&format!("/inodes/{ino}"))?;
+            if let Some(until) = until.filter(|_| self.unrecalled(ino, sent)) {
+                if let Ok(mut c) = self.attrs.lock() {
+                    c.put_until(ino, a.clone(), until);
+                }
+            }
+            return Ok(self.adjust(a));
+        }
+        let a = decode(self.call(
+            Method::GET,
+            &format!("/inodes/{ino}"),
+            Body::Empty,
+            Retry::Idempotent,
+        )?)?;
         Ok(self.remember(a))
     }
 
@@ -325,12 +430,25 @@ impl Ops {
                 return Ok(a);
             }
         }
-        let a: Attr = decode(self.call(
-            Method::GET,
-            &format!("/inodes/{parent}/lookup?name={}", encode(name)),
-            Body::Empty,
-            Retry::Idempotent,
-        )?)?;
+        let rest = format!("/inodes/{parent}/lookup?name={}", encode(name));
+        if self.leasing() {
+            // One lease covers the name (the directory's), one the child's attributes.
+            let (a, sent, until) = self.leased_get(&rest)?;
+            if let Some(until) = until {
+                if self.unrecalled(parent, sent) {
+                    if let Ok(mut n) = self.names.lock() {
+                        n.put_until(key, a.ino, until);
+                    }
+                }
+                if self.unrecalled(a.ino, sent) {
+                    if let Ok(mut c) = self.attrs.lock() {
+                        c.put_until(a.ino, a.clone(), until);
+                    }
+                }
+            }
+            return Ok(self.adjust(a));
+        }
+        let a: Attr = decode(self.call(Method::GET, &rest, Body::Empty, Retry::Idempotent)?)?;
         if let Ok(mut n) = self.names.lock() {
             n.put(key, a.ino);
         }
@@ -395,6 +513,7 @@ impl Ops {
             (false, true) => "replace",
             (false, false) => "set",
         };
+        self.forget_attr(ino);
         self.void(
             Method::PUT,
             &format!("/inodes/{ino}/xattrs/{}?mode={mode}", encode(name)),
@@ -404,6 +523,7 @@ impl Ops {
     }
 
     pub fn removexattr(&self, ino: u64, name: &str) -> Result<(), Errno> {
+        self.forget_attr(ino);
         self.void(
             Method::DELETE,
             &format!("/inodes/{ino}/xattrs/{}", encode(name)),

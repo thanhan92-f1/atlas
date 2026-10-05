@@ -222,8 +222,15 @@ when it took over: every live session has then been renewed against its own cloc
 that runs ahead of the previous leader's cannot expire a live client. Limits: TTL 1–300 s,
 65 536 sessions per group, 4 096 locks per session.
 
-Not covered: lease recall. Attributes and names are cached by clients for a fixed TTL rather
-than under a revocable lease.
+Cache leases (`node::cache_leases`) are not replicated: the leader keeps them in memory. A
+leased read first confirms leadership with a read barrier, then registers the lease, then reads
+what it returns. A change first marks its inodes (no lease is granted on them until it commits),
+recalls every other session's unexpired lease on them and waits for each to be given back or run
+out. A lease from an earlier term is covered by the grace period instead: a new leader, while a
+caching session opened before its term is open (`Session::term`), holds changes back for one
+lease (5 s) from when it first serves a lease operation. Because the old leader confirmed its
+leadership after the client sent its request, the client's lease (counted from the send) ends
+before that grace does.
 
 ### Namespace sharding (`node::shards`)
 

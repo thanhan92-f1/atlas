@@ -68,8 +68,9 @@ The atlas-native roadmap, in order, each phase gated on a published benchmark:
 2. **Metadata scale:** namespace sharded across Raft groups, an on-disk catalog, client leases.
    Commits cost one fsync, Raft replication is pipelined (a 3-voter group sustains ~12–15k
    creates/s on one host), and checkpoints write only changed records to an embedded KV store.
-   Inode tables are paged from the store, volumes and filesystems shard across Raft groups, and
-   client sessions hold cross-mount file locks; cache leases are not done.
+   Inode tables are paged from the store, volumes and filesystems shard across Raft groups,
+   client sessions hold cross-mount file locks, and cache leases let mounts cache metadata
+   without serving it stale. Paging directory entries is not done.
 3. **Efficiency:** erasure coding with a rebuild controller; cold extents tiered to S3.
 4. **AI:** RDMA transport, a GPUDirect Storage path, a checkpoint fast path, a CSI driver;
    MLPerf Storage results.

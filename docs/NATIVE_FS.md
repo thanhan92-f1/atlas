@@ -62,7 +62,9 @@ All routes need the API token (and client certificate where configured), like th
 | `DELETE /v1/fs/{fs}/inodes/{ino}/xattrs/{name}` | 204; 404 `no_attr` if unset. |
 | `GET /v1/fs/{fs}/inodes/{ino}/data?offset=N&len=M` | Raw bytes; short at end of file. |
 | `PUT /v1/fs/{fs}/inodes/{ino}/data?offset=N` | Raw body written at `offset` (extends the file) → attributes. |
-| `POST /v1/fs/{fs}/sessions` | `{"session", "ttl_ms"}` (1000–300000): opens a client session, or renews it with a new TTL → `{session, ttl_ms, expires_ms}`. Session ids are client-chosen (the mount uses a UUID). |
+| `POST /v1/fs/{fs}/sessions` | `{"session", "ttl_ms", "cache"?}` (TTL 1000–300000): opens a client session, or renews it with a new TTL → `{session, ttl_ms, expires_ms}`. Session ids are client-chosen (the mount uses a UUID). `cache: true` if the session will hold cache leases. |
+| `GET /v1/fs/{fs}/sessions/{id}/recalls?wait_ms=` | `{"inos": [...]}`: cache leases the session must give back, waiting up to `wait_ms` (at most 25 s) for one. Leader only. |
+| `POST /v1/fs/{fs}/sessions/{id}/recalls/done` | `{"inos": [...]}`: the session dropped what it cached under these leases → 204. |
 | `POST /v1/fs/{fs}/sessions/{id}/renew` | → `{session, ttl_ms, expires_ms}`; 410 `no_session` once it expired or was closed. |
 | `DELETE /v1/fs/{fs}/sessions/{id}` | 204; releases every lock the session holds. |
 | `POST /v1/fs/{fs}/inodes/{ino}/locks` | `{session, owner, kind, start?, end?, pid?}` (`kind`: `read`, `write`, `unlock`; `end` inclusive, default end of file) → 204, or 409 `locked` on another owner's conflicting lock. POSIX `F_SETLK` semantics per `(session, owner)`; renews the session. Regular files only. |
@@ -71,6 +73,12 @@ All routes need the API token (and client certificate where configured), like th
 | `GET /v1/fs/{fs}/locks` | `{"sessions": N, "locks": [...]}`: every lock held on the filesystem and the open sessions in its metadata group. |
 
 `{fs}` may be `<fs>@<snapshot>` for reads; any change to a snapshot gets 409 `read_only`.
+
+`?session=<id>` names the client session a request comes from. On `GET .../inodes/{ino}` and
+`GET .../lookup`, `&lease=1` also asks for a cache lease: the leader confirms its leadership (a
+read barrier), grants the session a lease on the inode (on a lookup, on the directory and the
+child) and adds `"lease_ms"` to the attributes; no `lease_ms` means none was granted (a change to
+the inode is in flight, a follower answered, or the tree is a snapshot).
 
 Errors are `{"error", "code", "leader"}`. `code` is stable and maps to an errno in the client:
 `not_found` (404, ENOENT), `exists` (EEXIST), `not_empty` (ENOTEMPTY), `not_dir` (ENOTDIR),
@@ -99,8 +107,8 @@ Options: `--identity-file` (client certificate + key PEM), `--ttl-ms` (attribute
 default 1000), `--writeback-bytes` (default 4 MiB), `--readahead-bytes` (default 4 MiB, 0 disables),
 `--max-io-bytes` (largest request, default 8 MiB; keep at or below the nodes' `max_request_bytes`),
 `--retry-secs` (default 30), `--read-only`, `--allow-other`, `--fuse-threads` (kernel request
-workers, each with its own `/dev/fuse` fd, default 4), `--session-ttl-ms` (lease of the session
-holding the mount's file locks, default 15000) and `--direct-reads` (below). It runs in the
+workers, each with its own `/dev/fuse` fd, default 4), `--session-ttl-ms` (lease of the mount's
+session, default 15000), `--cache-leases` (see Consistency) and `--direct-reads` (below). It runs in the
 foreground until `fusermount3 -u`; the mount uses `default_permissions`, so the kernel checks
 modes and ownership.
 
@@ -154,6 +162,16 @@ modes and ownership.
   writer closes or fsyncs the file and the reader opens it after that; attributes and names may be
   cached for up to `--ttl-ms` (set 0 for no caching). Unlocked concurrent writers to the same
   file range see last-writer-wins at the extent level.
+- **Cache leases** (`--cache-leases`): attributes and names are cached for as long as the
+  cluster's lease on them lasts (5 s, re-taken on the next miss) instead of for `--ttl-ms`, and
+  never go stale: before any change to an inode commits, the leader recalls every other mount's
+  lease on it and waits until that mount has dropped its cache (its recall thread answers within
+  a round trip) or the lease ran out. A mount's own changes do not wait on its own leases. The
+  kernel gets a zero TTL, so every `stat` and lookup reaches the mount's cache. A new metadata
+  leader knows none of its predecessor's leases: while a caching session opened under an earlier
+  leader is open, it holds changes back for one lease period (5 s) after taking over. A mount
+  that stops answering recalls delays other mounts' changes to what it cached by up to 5 s. File
+  data is still close-to-open.
 - Unlink-while-open only protects handles in the same mount; a file removed by another client
   disappears for everyone.
 - **Extended attributes** in the `user.`, `trusted.` and `security.` namespaces are stored on the
@@ -170,8 +188,7 @@ modes and ownership.
   `--fuse-threads` − 1 waits run at once, more fail with ENOLCK, so waiters never take the
   kernel worker an unlock needs. A snapshot mount grants every lock locally (nothing writes
   there). Locks need every metadata node upgraded first: an older node cannot apply them.
-- Not implemented: POSIX ACLs, quotas, `O_DIRECT`, cache leases (attributes and names are still
-  cached for a fixed `--ttl-ms`).
+- Not implemented: POSIX ACLs, quotas, `O_DIRECT`.
 
 ## Atlas gateway
 

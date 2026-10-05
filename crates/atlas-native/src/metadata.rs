@@ -473,7 +473,7 @@ impl Catalog {
             MetaCommand::Fs { op } => self.apply_fs(op, &mut gc_candidates)?,
             MetaCommand::Lease { op } => {
                 let filesystems = &self.filesystems;
-                self.leases.apply(op, |fs, ino| {
+                self.leases.apply(op, term, |fs, ino| {
                     let f = filesystems
                         .get(fs)
                         .ok_or_else(|| MetaError::NotFound(format!("filesystem {fs}")))?;

@@ -75,6 +75,10 @@ struct Args {
     /// (crash, partition), the cluster releases its locks this long after the last renewal.
     #[arg(long, default_value_t = 15_000)]
     session_ttl_ms: u64,
+    /// Cache attributes and names under cache leases from the cluster instead of for `--ttl-ms`:
+    /// a change by another client recalls them first, so nothing cached is stale.
+    #[arg(long)]
+    cache_leases: bool,
 }
 
 fn read(path: &Option<PathBuf>, what: &str) -> Result<Option<Vec<u8>>, String> {
@@ -120,6 +124,7 @@ fn ops(args: &Args) -> Result<Ops, String> {
             direct_reads,
             session_ttl: Duration::from_millis(args.session_ttl_ms),
             lock_waiters: args.fuse_threads.saturating_sub(1),
+            cache_leases: args.cache_leases,
         },
     );
     // Fail fast on a wrong endpoint, token or filesystem id instead of at first access.
