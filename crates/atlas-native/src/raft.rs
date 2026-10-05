@@ -35,6 +35,7 @@ use crate::{
     durable,
     membership::Membership,
     metadata::{Catalog, MetaCommand, MetaError},
+    raft_snapshot::{remove_staging, Incoming, Outgoing, SnapshotChunk},
     store::{
         load_checkpoint, remove_legacy_catalog, CatalogStore, CATALOG_STORE, DEFAULT_CACHE_INODES,
     },
@@ -157,18 +158,23 @@ pub enum Message {
         success: bool,
         match_index: u64,
     },
-    /// Carries the leader's applied catalog; its `applied_index`/`current_term` are the
-    /// snapshot's last included index/term.
+    /// Chunk `seq` of the leader's applied catalog as of `index` (see [`crate::raft_snapshot`]);
+    /// the header's `applied_index`/`current_term` are the snapshot's last included index/term.
     InstallSnapshot {
         term: u64,
-        #[serde(with = "catalog_json")]
-        snapshot: Box<Catalog>,
+        index: u64,
+        seq: u64,
+        #[serde(with = "embedded_json")]
+        chunk: Box<SnapshotChunk>,
     },
     /// `match_index` is the follower's commit index: committed entries are the only ones
-    /// guaranteed to match the leader (a kept log suffix may still hold stale entries).
+    /// guaranteed to match the leader (a kept log suffix may still hold stale entries). `ack` is
+    /// the chunk staged; `None` asks the leader to start the transfer over.
     InstallSnapshotResponse {
         term: u64,
         match_index: u64,
+        #[serde(default)]
+        ack: Option<u64>,
     },
 }
 
@@ -199,28 +205,23 @@ impl Message {
 }
 
 /// `Message` is internally tagged, so serde buffers each variant before decoding it, and buffered
-/// integer map keys (`VolumeMeta::extents`) do not decode. The catalog therefore travels as an
-/// embedded JSON string; the inline form is still accepted from older senders.
-mod catalog_json {
-    use serde::{de::Error as _, ser::Error as _, Deserialize, Deserializer, Serializer};
+/// integer map keys (`VolumeMeta::extents`) do not decode. Snapshot chunks therefore travel as an
+/// embedded JSON string.
+mod embedded_json {
+    use serde::{
+        de::{DeserializeOwned, Error as _},
+        ser::Error as _,
+        Deserialize, Deserializer, Serialize, Serializer,
+    };
 
-    use crate::metadata::Catalog;
-
-    pub fn serialize<S: Serializer>(c: &Catalog, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(&serde_json::to_string(c).map_err(S::Error::custom)?)
+    pub fn serialize<T: Serialize, S: Serializer>(v: &T, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&serde_json::to_string(v).map_err(S::Error::custom)?)
     }
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Box<Catalog>, D::Error> {
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum Wire {
-            Json(String),
-            Inline(Box<Catalog>),
-        }
-        match Wire::deserialize(d)? {
-            Wire::Json(j) => serde_json::from_str(&j).map_err(D::Error::custom),
-            Wire::Inline(c) => Ok(c),
-        }
+    pub fn deserialize<'de, T: DeserializeOwned, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<T, D::Error> {
+        serde_json::from_str(&String::deserialize(d)?).map_err(D::Error::custom)
     }
 }
 
@@ -281,9 +282,11 @@ pub struct RaftNode {
     heartbeat_elapsed: u64,
     /// Ticks since start; times snapshot sends.
     ticks: u64,
-    /// Peers sent an InstallSnapshot, with the tick it went out: one at a time per peer, re-sent
-    /// only after an election timeout without an answer.
-    snapshot_sent: BTreeMap<NodeId, u64>,
+    /// Leader only: snapshot transfers in progress. A chunk in flight is re-sent only after an
+    /// election timeout without an answer.
+    outgoing: BTreeMap<NodeId, Outgoing>,
+    /// Follower only: a snapshot transfer being staged.
+    incoming: Option<Incoming>,
     rng: u64,
     outbox: Vec<Envelope>,
 }
@@ -317,6 +320,7 @@ impl RaftNode {
             store.checkpoint(&mut catalog)?;
         }
         remove_legacy_catalog(&cfg.root)?;
+        remove_staging(&cfg.root)?;
         let applied = catalog.applied_index;
 
         let mut wal = Wal::open(cfg.root.join("wal"))?;
@@ -377,7 +381,8 @@ impl RaftNode {
             election_timeout: 0,
             heartbeat_elapsed: 0,
             ticks: 0,
-            snapshot_sent: BTreeMap::new(),
+            outgoing: BTreeMap::new(),
+            incoming: None,
             rng: rng | 1,
             outbox: Vec::new(),
             cfg,
@@ -788,24 +793,35 @@ impl RaftNode {
                     self.send_append(&from);
                 }
             }
-            Message::InstallSnapshot { term, snapshot } => {
+            Message::InstallSnapshot {
+                term,
+                index,
+                seq,
+                chunk,
+            } => {
+                let mut ack = None;
                 if term >= self.hard.term {
                     if self.role != Role::Follower {
                         self.become_follower(term, Some(from.clone()))?;
                     }
                     self.leader = Some(from.clone());
                     self.reset_election_timer();
-                    self.handle_snapshot(*snapshot)?;
+                    ack = self.handle_snapshot_chunk(index, seq, *chunk)?;
                 }
                 self.send(
                     from,
                     Message::InstallSnapshotResponse {
                         term: self.hard.term,
                         match_index: self.commit_index,
+                        ack,
                     },
                 );
             }
-            Message::InstallSnapshotResponse { term, match_index } => {
+            Message::InstallSnapshotResponse {
+                term,
+                match_index,
+                ack,
+            } => {
                 if self.role != Role::Leader
                     || term != self.hard.term
                     || !self.next_index.contains_key(&from)
@@ -813,7 +829,25 @@ impl RaftNode {
                     return Ok(());
                 }
                 self.recent_active.insert(from.clone());
-                self.snapshot_sent.remove(&from);
+                if let Some(o) = self.outgoing.get_mut(&from) {
+                    if match_index < o.index {
+                        match ack {
+                            Some(seq) if seq == o.seq && !o.is_done() => {
+                                o.advance(self.ticks).map_err(std::io::Error::other)?;
+                                let msg = snapshot_message(self.hard.term, o);
+                                self.send(from, msg);
+                            }
+                            Some(_) => {}
+                            None => {
+                                let o = Outgoing::start(self.catalog.clone(), self.ticks);
+                                self.send(from.clone(), snapshot_message(self.hard.term, &o));
+                                self.outgoing.insert(from, o);
+                            }
+                        }
+                        return Ok(());
+                    }
+                }
+                self.outgoing.remove(&from);
                 let last = self.last_index();
                 let m = self.match_index.entry(from.clone()).or_insert(0);
                 *m = (*m).max(match_index.min(last));
@@ -886,18 +920,66 @@ impl RaftNode {
         Ok((true, match_index))
     }
 
-    fn handle_snapshot(&mut self, mut snap: Catalog) -> Result<(), RaftError> {
-        // The leader's catalog, whatever its own store holds: ours gets all of it.
-        snap.in_store = false;
-        snap.fill_usage().map_err(std::io::Error::other)?;
+    /// Stages chunk `seq` of the snapshot as of `index`; returns the chunk to acknowledge, or
+    /// `None` to have the leader start over.
+    fn handle_snapshot_chunk(
+        &mut self,
+        index: u64,
+        seq: u64,
+        chunk: SnapshotChunk,
+    ) -> Result<Option<u64>, RaftError> {
+        if index <= self.commit_index {
+            // Nothing to install; the response's match_index ends the transfer.
+            self.incoming = None;
+            return Ok(Some(seq));
+        }
+        if let SnapshotChunk::Header { catalog } = chunk {
+            self.incoming = None;
+            if seq != 0 {
+                return Ok(None);
+            }
+            self.incoming = Some(Incoming::start(&self.cfg.root, index, *catalog)?);
+            return Ok(Some(0));
+        }
+        let Some(inc) = self.incoming.as_mut().filter(|i| i.index == index) else {
+            return Ok(None);
+        };
+        if seq == inc.seq {
+            return Ok(Some(seq));
+        }
+        if seq != inc.seq + 1 {
+            return Ok(None);
+        }
+        if matches!(chunk, SnapshotChunk::Done) {
+            let inc = self.incoming.take().expect("matched above");
+            self.install_staged(inc)?;
+        } else {
+            inc.stage(chunk)?;
+            inc.seq = seq;
+        }
+        Ok(Some(seq))
+    }
+
+    /// Swaps a fully staged snapshot in for the catalog store and adopts it.
+    fn install_staged(&mut self, inc: Incoming) -> Result<(), RaftError> {
+        let staged = inc.finish();
+        // Paged tables read the store being replaced; nothing may outlive the swap.
+        self.spec = None;
+        self.catalog = Catalog::default();
+        let path = self.cfg.root.join(CATALOG_STORE);
+        fs::rename(&staged, &path)?;
+        durable::sync_dir(&self.cfg.root)?;
+        self.store = CatalogStore::open(&path)?.with_cache_inodes(self.cfg.catalog_cache_inodes);
+        let snap = load_checkpoint(&self.cfg.root, &self.store)?;
+        self.adopt_snapshot(snap)
+    }
+
+    /// Takes over a snapshot the store already holds durably.
+    fn adopt_snapshot(&mut self, snap: Catalog) -> Result<(), RaftError> {
         let si = snap.applied_index;
         let st = snap.current_term;
-        if si <= self.commit_index {
-            return Ok(());
-        }
         // The snapshot is durable before the log entries it covers go.
         self.catalog = snap;
-        self.persist_catalog()?;
         if self.term_at(si) == Some(st) {
             self.log.drain(..(si - self.snapshot_index) as usize);
             self.wal.compact_through(si)?;
@@ -981,6 +1063,7 @@ impl RaftNode {
         }
         self.role = Role::Follower;
         self.spec = None;
+        self.outgoing.clear();
         self.leader = leader;
         self.votes.clear();
         self.reset_election_timer();
@@ -991,6 +1074,8 @@ impl RaftNode {
         self.counters.leader_terms += 1;
         self.role = Role::Leader;
         self.spec = None;
+        self.outgoing.clear();
+        self.incoming = None;
         self.leader = Some(self.cfg.id.clone());
         self.heartbeat_elapsed = 0;
         self.check_quorum_elapsed = 0;
@@ -1041,23 +1126,22 @@ impl RaftNode {
             .min(self.last_index() + 1);
         let prev = next - 1;
         if prev < self.snapshot_index {
-            // A catalog clone per heartbeat or proposal would pile up in the peer's queue.
-            if self
-                .snapshot_sent
-                .get(peer)
-                .is_some_and(|t| self.ticks < t + self.cfg.election_ticks.1)
-            {
-                return;
-            }
-            self.snapshot_sent.insert(peer.clone(), self.ticks);
-            let snapshot = Box::new(self.catalog.clone());
-            self.send(
-                peer.clone(),
-                Message::InstallSnapshot {
-                    term: self.hard.term,
-                    snapshot,
-                },
-            );
+            // A chunk per heartbeat or proposal would pile up in the peer's queue.
+            let term = self.hard.term;
+            let msg = match self.outgoing.get_mut(peer) {
+                Some(o) if self.ticks < o.sent_at + self.cfg.election_ticks.1 => return,
+                Some(o) => {
+                    o.sent_at = self.ticks;
+                    snapshot_message(term, o)
+                }
+                None => {
+                    let o = Outgoing::start(self.catalog.clone(), self.ticks);
+                    let msg = snapshot_message(term, &o);
+                    self.outgoing.insert(peer.clone(), o);
+                    msg
+                }
+            };
+            self.send(peer.clone(), msg);
             return;
         }
         let prev_term = self.term_at(prev).unwrap_or(0);
@@ -1202,5 +1286,14 @@ impl RaftNode {
     fn persist_catalog(&mut self) -> Result<(), RaftError> {
         self.store.checkpoint(&mut self.catalog)?;
         Ok(())
+    }
+}
+
+fn snapshot_message(term: u64, o: &Outgoing) -> Message {
+    Message::InstallSnapshot {
+        term,
+        index: o.index,
+        seq: o.seq,
+        chunk: Box::new(o.chunk.clone()),
     }
 }

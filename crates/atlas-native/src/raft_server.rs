@@ -1030,17 +1030,23 @@ mod tests {
             to: "b".into(),
             msg: Message::InstallSnapshot {
                 term: 2,
-                snapshot: Box::new(catalog),
+                index: 7,
+                seq: 0,
+                chunk: Box::new(crate::raft_snapshot::SnapshotChunk::Header {
+                    catalog: Box::new(catalog),
+                }),
             },
         };
         let mut buf = Vec::new();
         write_frame(&mut buf, &snap).unwrap();
-        let Message::InstallSnapshot { snapshot, .. } =
-            read_frame(&mut buf.as_slice()).unwrap().msg
+        let Message::InstallSnapshot { chunk, .. } = read_frame(&mut buf.as_slice()).unwrap().msg
         else {
             panic!("not a snapshot");
         };
-        assert_eq!(snapshot.volumes["v"].extents[&4096], "e1");
+        let crate::raft_snapshot::SnapshotChunk::Header { catalog } = *chunk else {
+            panic!("not a header");
+        };
+        assert_eq!(catalog.volumes["v"].extents[&4096], "e1");
 
         let mut huge = ((MAX_FRAME + 1) as u32).to_be_bytes().to_vec();
         huge.extend_from_slice(b"{}");

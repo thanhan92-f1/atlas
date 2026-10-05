@@ -122,8 +122,18 @@ messages with `step()` and sends whatever `take_messages()` returns. Implemented
   consistency check after a lost message) rewinds it, and an acknowledgement never moves it back.
   Without this, concurrent proposals each resent the whole unacknowledged tail and throughput
   collapsed under load;
-- log compaction after `compact_after` applied entries and `InstallSnapshot` (the leader's applied
-  catalog) for followers behind the compaction point;
+- log compaction after `compact_after` applied entries, and a chunked `InstallSnapshot` for
+  followers behind the compaction point (`raft_snapshot`). The leader streams its applied catalog
+  from a clone pinned to its store snapshot: a header (everything but extents and filesystem
+  inodes), pages of 4096 extents and 1024 inodes, then `Done`. Each chunk waits for the previous
+  one's acknowledgement, and a chunk in flight is re-sent after an election timeout. The follower
+  stages every chunk in `catalog.redb.incoming` through ordinary incremental checkpoints, renames
+  it over `catalog.redb` on `Done`, and reloads. Neither side holds more than a chunk, and no
+  frame comes near the 256 MiB limit that a whole-catalog message would hit. An answer of `ack:
+  None` (a follower that restarted mid-transfer, or a chunk out of order) restarts the transfer.
+  A transfer cut short leaves the follower's store untouched, and a leftover staging file is
+  removed on open. Nodes from before chunked snapshots can't install snapshots from newer ones;
+  upgrade the whole group;
 - pre-vote: a node whose election timer fires first asks for pre-votes for `term + 1` without
   changing anyone's term, and only campaigns once a majority would vote for it, so a partitioned
   node cannot inflate its term and depose a healthy leader when it rejoins;
@@ -134,7 +144,8 @@ messages with `step()` and sends whatever `take_messages()` returns. Implemented
 Each replica keeps its own `raft_state.json` (term + vote), WAL and catalog store. Durability order:
 the vote is fsynced before any reply; entries are fsynced before they are acknowledged or counted
 toward the leader's own vote; the catalog is checkpointed before the log is compacted past it,
-and an installed snapshot is checkpointed (in full) before the log entries it covers are dropped.
+and an installed snapshot is durable in the swapped-in store before the log entries it covers
+are dropped.
 
 Proposals are validated on the leader against its applied catalog plus all uncommitted entries, so
 an invalid command is rejected instead of logged. If a committed command still fails to apply, it is
@@ -314,8 +325,10 @@ Not implemented yet:
 - process crash after WAL fsync but before the next checkpoint (commits between checkpoints are
   replayed from the WAL);
 - incremental checkpoints read back identical to the in-memory catalog across edits, removals,
-  snapshots, clones and a filesystem deleted and recreated under the same id; a Raft snapshot is
-  written in full; a legacy `catalog.json` migrates into the store;
+  snapshots, clones and a filesystem deleted and recreated under the same id; a paged catalog
+  matches an unpaged twin across checkpoints and a reload; a chunked Raft snapshot through the
+  wire encoding loads identical to the leader's catalog, and a lagging follower cut off mid-transfer
+  still converges and survives a restart; a legacy `catalog.json` migrates into the store;
 - torn final WAL record;
 - restart/replay without double-applying committed commands;
 - snapshot copy-on-write isolation and space protection;

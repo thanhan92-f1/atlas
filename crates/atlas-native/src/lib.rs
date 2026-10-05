@@ -28,6 +28,7 @@ pub mod node;
 pub mod placement;
 pub mod raft;
 pub mod raft_server;
+pub mod raft_snapshot;
 pub mod raw;
 pub mod store;
 pub mod telemetry;
