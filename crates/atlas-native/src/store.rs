@@ -23,7 +23,7 @@ use crate::{
     alloc::FreeList,
     membership::Membership,
     metadata::{Catalog, SnapshotId},
-    namespace::{FsId, FsMeta, Inode},
+    namespace::{FsId, FsMeta, Inode, InodeKind},
     tracked::Tracked,
 };
 
@@ -33,6 +33,8 @@ const SNAPSHOTS: TableDefinition<&str, &[u8]> = TableDefinition::new("snapshots"
 const EXTENTS: TableDefinition<&str, &[u8]> = TableDefinition::new("extents");
 const FILESYSTEMS: TableDefinition<&str, &[u8]> = TableDefinition::new("filesystems");
 const INODES: TableDefinition<(&str, u64), &[u8]> = TableDefinition::new("inodes");
+/// Directory entries, one record each, so a create in a large directory writes one small record.
+const DIR_ENTRIES: TableDefinition<(&str, u64, &str), u64> = TableDefinition::new("dir_entries");
 const FS_SNAPSHOTS: TableDefinition<&str, &[u8]> = TableDefinition::new("fs_snapshots");
 const STATE_KEY: &str = "catalog";
 
@@ -176,6 +178,34 @@ impl CatalogStore {
             Err(TableError::TableDoesNotExist(_)) => {}
             Err(e) => return Err(err(e)),
         }
+        match tx.open_table(DIR_ENTRIES) {
+            Ok(t) => {
+                let mut dirs: BTreeMap<(String, u64), BTreeMap<String, u64>> = BTreeMap::new();
+                for row in t.iter().map_err(err)? {
+                    let (k, v) = row.map_err(err)?;
+                    let (fs, dir, name) = k.value();
+                    dirs.entry((fs.to_string(), dir))
+                        .or_default()
+                        .insert(name.to_string(), v.value());
+                }
+                for ((fs, dir), names) in dirs {
+                    let inode = inodes.get_mut(&fs).and_then(|m| m.get_mut(&dir));
+                    match inode.map(|i| &mut i.kind) {
+                        Some(InodeKind::Dir { entries, .. }) => *entries = names.into(),
+                        _ => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!(
+                                    "directory entries for {fs}/{dir}, which is not a directory"
+                                ),
+                            ))
+                        }
+                    }
+                }
+            }
+            Err(TableError::TableDoesNotExist(_)) => {}
+            Err(e) => return Err(err(e)),
+        }
         c.filesystems = headers
             .into_values()
             .map(|h| {
@@ -194,8 +224,9 @@ impl CatalogStore {
         Ok(Some(c))
     }
 
-    /// Writes `c`'s changes (all of it unless `c.in_store`) durably, then forgets them.
-    pub fn checkpoint(&self, c: &mut Catalog) -> io::Result<()> {
+    /// Writes `c`'s changes (all of it unless `c.in_store`) durably, then forgets them. Returns
+    /// how many records were written or removed.
+    pub fn checkpoint(&self, c: &mut Catalog) -> io::Result<u64> {
         let tx = self.db.begin_write().map_err(err)?;
         let full = !c.in_store;
         if full {
@@ -210,23 +241,46 @@ impl CatalogStore {
                 tx.delete_table(t).map_err(err)?;
             }
             tx.delete_table(INODES).map_err(err)?;
+            tx.delete_table(DIR_ENTRIES).map_err(err)?;
         }
         write_state(&tx, c)?;
-        write_map(&tx, VOLUMES, &c.volumes, full)?;
-        write_map(&tx, SNAPSHOTS, &c.snapshots, full)?;
-        write_map(&tx, EXTENTS, &c.extents, full)?;
-        write_map(&tx, FS_SNAPSHOTS, &c.fs_snapshots, full)?;
-        write_filesystems(&tx, &c.filesystems, full)?;
+        let records = 1
+            + write_map(&tx, VOLUMES, &c.volumes, full)?
+            + write_map(&tx, SNAPSHOTS, &c.snapshots, full)?
+            + write_map(&tx, EXTENTS, &c.extents, full)?
+            + write_map(&tx, FS_SNAPSHOTS, &c.fs_snapshots, full)?
+            + write_filesystems(&tx, &c.filesystems, full)?;
         tx.commit().map_err(err)?;
 
         c.volumes.clear_changes();
         c.snapshots.clear_changes();
         c.extents.clear_changes();
         c.fs_snapshots.clear_changes();
-        c.filesystems
-            .clear_changes_nested(|f| f.inodes.clear_changes());
+        c.filesystems.clear_changes_with(|f| {
+            f.inodes.clear_changes_with(|i| {
+                if let InodeKind::Dir { entries, .. } = &mut i.kind {
+                    entries.clear_changes();
+                }
+            })
+        });
         c.in_store = true;
-        Ok(())
+        Ok(records)
+    }
+}
+
+/// An inode's record: a directory's entries are stored separately.
+fn inode_record(i: &Inode) -> io::Result<Vec<u8>> {
+    match &i.kind {
+        InodeKind::Dir { parent, .. } => json(&Inode {
+            kind: InodeKind::Dir {
+                parent: *parent,
+                entries: Tracked::default(),
+            },
+            op_id: i.op_id.clone(),
+            xattrs: i.xattrs.clone(),
+            ..*i
+        }),
+        _ => json(i),
     }
 }
 
@@ -267,14 +321,16 @@ fn write_map<V: Serialize>(
     def: TableDefinition<&str, &[u8]>,
     map: &Tracked<String, V>,
     full: bool,
-) -> io::Result<()> {
+) -> io::Result<u64> {
     let mut t = tx.open_table(def).map_err(err)?;
     let keys: Box<dyn Iterator<Item = &String>> = if full {
         Box::new(map.keys())
     } else {
         Box::new(map.touched().iter())
     };
+    let mut n = 0;
     for k in keys {
+        n += 1;
         match map.get(k) {
             Some(v) => {
                 t.insert(k.as_str(), json(v)?.as_slice()).map_err(err)?;
@@ -284,28 +340,34 @@ fn write_map<V: Serialize>(
             }
         }
     }
-    Ok(())
+    Ok(n)
 }
 
 fn write_filesystems(
     tx: &WriteTransaction,
     filesystems: &Tracked<FsId, FsMeta>,
     full: bool,
-) -> io::Result<()> {
+) -> io::Result<u64> {
     let mut headers = tx.open_table(FILESYSTEMS).map_err(err)?;
     let mut inodes = tx.open_table(INODES).map_err(err)?;
+    let mut dirents = tx.open_table(DIR_ENTRIES).map_err(err)?;
     let ids: Box<dyn Iterator<Item = &FsId>> = if full {
         Box::new(filesystems.keys())
     } else {
         Box::new(filesystems.touched().iter())
     };
+    let mut n = 0;
     for id in ids {
+        n += 1;
         let fs = id.as_str();
         // A filesystem replaced or removed since the last checkpoint keeps none of its records.
         let rewrite = full || filesystems.replaced().contains(id);
         if rewrite && !full {
             inodes
                 .retain_in((fs, 0)..=(fs, u64::MAX), |_, _| false)
+                .map_err(err)?;
+            dirents
+                .retain_in((fs, 0, "")..(fs, u64::MAX, ""), |_, _| false)
                 .map_err(err)?;
         }
         let Some(f) = filesystems.get(id) else {
@@ -325,20 +387,45 @@ fn write_filesystems(
         } else {
             Box::new(f.inodes.touched().iter())
         };
-        for ino in changed {
-            match f.inodes.get(ino) {
-                Some(i) => {
-                    inodes
-                        .insert((fs, *ino), json(i)?.as_slice())
-                        .map_err(err)?;
-                }
-                None => {
-                    inodes.remove((fs, *ino)).map_err(err)?;
+        for &ino in changed {
+            n += 1;
+            // An inode inserted or removed (not just edited) keeps none of its old entries.
+            let fresh = rewrite || f.inodes.replaced().contains(&ino);
+            if fresh && !rewrite {
+                dirents
+                    .retain_in((fs, ino, "")..(fs, ino + 1, ""), |_, _| false)
+                    .map_err(err)?;
+            }
+            let Some(i) = f.inodes.get(&ino) else {
+                inodes.remove((fs, ino)).map_err(err)?;
+                continue;
+            };
+            inodes
+                .insert((fs, ino), inode_record(i)?.as_slice())
+                .map_err(err)?;
+            if let InodeKind::Dir { entries, .. } = &i.kind {
+                let names: Box<dyn Iterator<Item = &String>> = if fresh {
+                    Box::new(entries.keys())
+                } else {
+                    Box::new(entries.touched().iter())
+                };
+                for name in names {
+                    n += 1;
+                    match entries.get(name) {
+                        Some(child) => {
+                            dirents
+                                .insert((fs, ino, name.as_str()), *child)
+                                .map_err(err)?;
+                        }
+                        None => {
+                            dirents.remove((fs, ino, name.as_str())).map_err(err)?;
+                        }
+                    }
                 }
             }
         }
     }
-    Ok(())
+    Ok(n)
 }
 
 #[cfg(test)]
@@ -463,6 +550,24 @@ mod tests {
         h.check();
         assert!(!h.catalog.filesystems["f"].inodes.contains_key(&a));
 
+        // Renames across directories and an rmdir move and drop entry records.
+        h.mknode("f", ROOT_INO, "gone", NodeType::Dir);
+        h.fs(FsOp::Rename {
+            fs: "f".into(),
+            parent: d,
+            name: "inner".into(),
+            new_parent: ROOT_INO,
+            new_name: "moved".into(),
+            now_ns: 6,
+        });
+        h.fs(FsOp::Rmdir {
+            fs: "f".into(),
+            parent: ROOT_INO,
+            name: "gone".into(),
+            now_ns: 6,
+        });
+        h.check();
+
         // A snapshot, a clone of it, and an edit in the clone.
         h.fs(FsOp::SnapshotFs {
             id: "s1".into(),
@@ -498,6 +603,26 @@ mod tests {
     }
 
     #[test]
+    fn a_create_in_a_large_directory_writes_a_few_records() {
+        let mut h = Harness::new();
+        h.fs(FsOp::CreateFs {
+            fs: "f".into(),
+            name: "f".into(),
+            now_ns: 1,
+            extent_bytes: None,
+        });
+        for i in 0..1000 {
+            h.mknode("f", ROOT_INO, &format!("file-{i}"), NodeType::File);
+        }
+        h.check();
+        h.mknode("f", ROOT_INO, "one-more", NodeType::File);
+        // State, filesystem header, the new inode, the directory inode and its new entry.
+        let written = h.store.checkpoint(&mut h.catalog).unwrap();
+        assert_eq!(written, 5);
+        h.check();
+    }
+
+    #[test]
     fn a_catalog_not_from_the_store_is_written_in_full() {
         let mut h = Harness::new();
         h.fs(FsOp::CreateFs {
@@ -526,5 +651,75 @@ mod tests {
             .unwrap()
             .filesystems
             .contains_key("f"));
+    }
+}
+
+#[cfg(test)]
+mod bench {
+    use super::*;
+    use crate::{
+        metadata::MetaCommand,
+        namespace::{FsOp, NodeType, ROOT_INO},
+    };
+
+    /// `cargo test --release -p atlas-native --lib store::bench -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn checkpoint_time_as_the_store_grows() {
+        let td = tempfile::tempdir().unwrap();
+        let store = CatalogStore::open(td.path().join(CATALOG_STORE)).unwrap();
+        let mut c = Catalog::default();
+        let mut index = 1;
+        c.apply(
+            1,
+            index,
+            &MetaCommand::Fs {
+                op: FsOp::CreateFs {
+                    fs: "f".into(),
+                    name: "f".into(),
+                    now_ns: 1,
+                    extent_bytes: None,
+                },
+            },
+        )
+        .unwrap();
+        for round in 0..64 {
+            let t = std::time::Instant::now();
+            for i in 0..1024 {
+                index += 1;
+                let name = format!("file-{round}-{i}");
+                c.apply(
+                    1,
+                    index,
+                    &MetaCommand::Fs {
+                        op: FsOp::Mknode {
+                            fs: "f".into(),
+                            parent: ROOT_INO,
+                            op_id: name.clone(),
+                            name,
+                            node_type: NodeType::File,
+                            target: None,
+                            rdev: 0,
+                            mode: 0o644,
+                            uid: 0,
+                            gid: 0,
+                            now_ns: 2,
+                        },
+                    },
+                )
+                .unwrap();
+            }
+            let applied = t.elapsed();
+            let t = std::time::Instant::now();
+            let n = store.checkpoint(&mut c).unwrap();
+            if round % 8 == 7 {
+                println!(
+                    "{} inodes: apply 1024 in {applied:?}, checkpoint {n} records in {:?}, file {} KiB",
+                    c.filesystems["f"].inodes.len(),
+                    t.elapsed(),
+                    std::fs::metadata(store.path()).unwrap().len() / 1024
+                );
+            }
+        }
     }
 }

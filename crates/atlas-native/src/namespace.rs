@@ -86,7 +86,7 @@ pub enum XattrMode {
 pub enum InodeKind {
     Dir {
         parent: u64,
-        entries: BTreeMap<String, u64>,
+        entries: Tracked<String, u64>,
     },
     File {
         size: u64,
@@ -312,7 +312,7 @@ impl FsMeta {
         }
     }
 
-    fn entries_mut(&mut self, dir: u64) -> Result<&mut BTreeMap<String, u64>, MetaError> {
+    fn entries_mut(&mut self, dir: u64) -> Result<&mut Tracked<String, u64>, MetaError> {
         match &mut self.inode_mut(dir)?.kind {
             InodeKind::Dir { entries, .. } => Ok(entries),
             _ => Err(MetaError::NotDir(format!("inode {dir}"))),
@@ -463,7 +463,7 @@ impl Catalog {
                     ROOT_INO,
                     InodeKind::Dir {
                         parent: ROOT_INO,
-                        entries: BTreeMap::new(),
+                        entries: Tracked::default(),
                     },
                     0o755,
                     0,
@@ -519,7 +519,7 @@ impl Catalog {
                     },
                     NodeType::Dir => InodeKind::Dir {
                         parent: *parent,
-                        entries: BTreeMap::new(),
+                        entries: Tracked::default(),
                     },
                     NodeType::Symlink => {
                         let t = target

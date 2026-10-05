@@ -27,8 +27,8 @@ acknowledged) is discarded on open; corruption anywhere else is a hard error.
 ## Catalog store
 
 The catalog is checkpointed to `catalog.redb`, an embedded [redb](https://github.com/cberner/redb)
-key-value store with one record per volume, volume snapshot, extent, filesystem, inode and
-filesystem snapshot, plus one record for the rest (applied index, term, free list, membership,
+key-value store with one record per volume, volume snapshot, extent, filesystem, inode, directory
+entry and filesystem snapshot, plus one record for the rest (applied index, term, free list, membership,
 Raft addresses). The catalog's large maps record which keys change between checkpoints
 (`tracked::Tracked`: every mutation goes through it, so the record is complete by construction),
 and a checkpoint writes only those records, in one durable transaction. A checkpoint therefore
@@ -41,9 +41,15 @@ store and then deletes `catalog.json`. The store is preferred whenever it holds 
 crash between those steps is harmless. There is no way back to `catalog.json`, so downgrading past
 this version means restoring a backup.
 
+A directory's inode record carries no entries; each entry is its own `(fs, dir, name) -> ino`
+record, so a create in a directory of any size checkpoints five records (state, filesystem header,
+new inode, directory inode, new entry). `NativeEngine::checkpoint` and Raft compaction write one
+redb transaction; `store::bench` (ignored) measures it at ~4–5 ms per 1024 creates from 8k to 65k
+inodes on tmpfs, growing only with the B-tree's depth.
+
 Limits: the working catalog still lives in memory in full; the store makes checkpoints
-incremental, but it doesn't page the catalog out yet. A directory is one inode record holding all
-of its entries, so a checkpoint after creates in a very large directory rewrites that whole record.
+incremental, but it doesn't page the catalog out yet. Checkpoints run on the commit path, under
+the catalog lock.
 
 ## Checkpoint and WAL compaction
 

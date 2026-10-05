@@ -3,6 +3,7 @@
 
 //! File creates per second through the local-WAL engine and a 3-voter Raft group on localhost,
 //! from one thread and from several, and whether the rate holds as the namespace grows.
+//! `BENCH_WAL_COMPACT_AFTER` overrides the local engine's checkpoint interval (0: never).
 //! `BENCH_FILES=20000 cargo test --release -p atlas-native --test metadata_bench -- --ignored --nocapture`
 
 use std::{
@@ -137,7 +138,14 @@ fn file_creates_per_second() {
     let files = files();
     let td = tempfile::tempdir().unwrap();
     let nodes = (1..=3).map(node).collect();
-    let e = NativeEngine::open(EngineConfig::new(td.path()), nodes).unwrap();
+    let mut cfg = EngineConfig::new(td.path());
+    if let Some(n) = std::env::var("BENCH_WAL_COMPACT_AFTER")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        cfg.wal_compact_after = n;
+    }
+    let e = NativeEngine::open(cfg, nodes).unwrap();
     e.create_fs_as("f".into(), "fs").unwrap();
 
     let window = (files / 10).max(1);
