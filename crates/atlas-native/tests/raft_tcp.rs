@@ -285,7 +285,7 @@ fn tcp_metrics_expose_role_replication_and_transport_failures() {
 
     let m = c.servers[&l].as_ref().unwrap().render_metrics().unwrap();
     assert!(m.contains(&format!(
-        "atlas_native_raft_role{{node=\"{l}\",role=\"leader\"}} 1"
+        "atlas_native_raft_role{{node=\"{l}\",group=\"0\",role=\"leader\"}} 1"
     )));
     assert!(m.contains("# TYPE atlas_native_raft_peer_match_index gauge"));
     assert_eq!(m.matches("atlas_native_raft_peer_match_index{").count(), 2);
@@ -294,15 +294,16 @@ fn tcp_metrics_expose_role_replication_and_transport_failures() {
     let (fid, f) = c.live().find(|(id, _)| **id != l).unwrap();
     let fm = f.render_metrics().unwrap();
     assert!(fm.contains(&format!(
-        "atlas_native_raft_role{{node=\"{fid}\",role=\"follower\"}} 1"
+        "atlas_native_raft_role{{node=\"{fid}\",group=\"0\",role=\"follower\"}} 1"
     )));
     let fid = fid.clone();
 
     c.stop(&fid);
     let deadline = Instant::now() + WAIT;
     let leader = c.servers[&l].as_ref().unwrap();
-    let pattern =
-        format!("atlas_native_transport_connect_failures_total{{node=\"{l}\",peer=\"{fid}\"}} ");
+    let pattern = format!(
+        "atlas_native_transport_connect_failures_total{{node=\"{l}\",group=\"0\",peer=\"{fid}\"}} "
+    );
     loop {
         let m = leader.render_metrics().unwrap();
         let failures: u64 = m

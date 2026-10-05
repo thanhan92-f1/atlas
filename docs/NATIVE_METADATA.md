@@ -166,6 +166,12 @@ standard library:
 - one sender thread per peer keeps a connection open, reconnects with a short backoff and drops
   messages while the peer is down (Raft retransmits);
 - inbound envelopes are dropped unless `from` is a configured peer and `to` is this node;
+- several Raft groups can share one listener: `RaftMux::start(listener, tls)` accepts the
+  connections and `RaftServer::start_in(&mux, group, ...)` runs one group on it. Each envelope
+  names its `group` (omitted on the wire for group 0, so a single-group node is unchanged) and the
+  mux hands it to that group's server; frames for a group not served here are dropped and counted
+  in group 0's `rejected_frames`. Every group dials its own connections to its peers, so a busy
+  group never queues behind another. `RaftServer::start` is a private mux serving group 0;
 - `propose(cmd, timeout)` blocks until the entry is applied locally, or returns `NotLeader` (with a
   leader hint), `LeadershipLost` (outcome unknown), `Timeout` or `Shutdown`;
 - a storage error inside the node (e.g. a failed fsync) stops the server and is reported by
@@ -175,7 +181,9 @@ Started without a `TlsIdentity` the transport has **no authentication or encrypt
 private metadata network only, or enable mutual TLS (below).
 
 `tests/raft_tcp.rs` runs a real 3-server cluster over localhost: election and replication, follower
-redirect, and leader shutdown, failover and rejoin from disk.
+redirect, and leader shutdown, failover and rejoin from disk. `tests/raft_groups.rs` runs three
+groups on each node's one listener: they replicate independently, and one group failing over (its
+leader's server stopped, the listener kept) leaves the other groups' leaders and terms alone.
 
 ### Quorum configuration (`membership` module)
 
@@ -189,19 +197,20 @@ configuration) is not implemented yet.
 
 `RaftServer::render_metrics()` and `NativeEngine::render_metrics()` return Prometheus text; the
 process hosting a node serves them on its `/metrics` endpoint (there is no standalone native node
-binary yet). All Raft series carry a `node` label:
+binary yet). All Raft series carry `node` and `group` labels:
 
 - Raft: `atlas_native_raft_{term,commit_index,applied_index,last_index,snapshot_index}`,
   `atlas_native_raft_role{role}` (one-hot), `atlas_native_raft_peer_match_index{peer}` (leader only),
   `atlas_native_raft_{elections,leader_terms,append_rejections}_total`;
 - transport, per peer: `atlas_native_transport_{sent,connect_failures,write_failures,dropped}_total`,
-  plus `atlas_native_transport_rejected_frames_total`;
+  plus `atlas_native_transport_rejected_frames_total` and the node-wide
+  `atlas_native_transport_tls_handshake_failures_total`;
 - engine: `atlas_native_{reads,writes,read_bytes,write_bytes,checksum_failures,replica_fallbacks}_total`,
   `atlas_native_gc_reclaimed_extents_total`, `atlas_native_metadata_applied_index`,
   `atlas_native_wal_records`, `atlas_native_{volumes,snapshots,extents}`,
   `atlas_native_allocator_free_{bytes,ranges}`, `atlas_native_device_bytes{node}`;
 - data node: `atlas_native_data_requests_total{op}`, `atlas_native_data_{fenced_writes,errors,
-  written_bytes,read_bytes}_total`, `atlas_native_data_fence`, `atlas_native_data_device_bytes{node,device}`.
+  written_bytes,read_bytes}_total`, `atlas_native_data_fence{node,group}`, `atlas_native_data_device_bytes{node,device}`.
 
 ### Data nodes (`data_node` module)
 
@@ -216,9 +225,14 @@ The engine writes replicas through the `BlockStore` trait: `FileDevice` for loca
   append can leave an unreferenced copy, the same leak as a crash between data write and commit);
 - without a `TlsIdentity` the transport has **no authentication or encryption**, same as Raft.
 
-**Write fencing.** Every `append`/`write_at` carries a fence: the writer's Raft term. The node
-durably records (`root/fence`, atomic rewrite) the highest fence it has accepted and rejects lower
-ones with `Fenced { current }`, holding the fence lock across the write. This is what makes free-list
+**Write fencing.** Every `append`/`write_at` carries a fence, the writer's Raft term, and the
+metadata group it writes for (`RemoteDevice::in_group`; omitted on the wire for group 0). The node
+durably records the highest fence it has accepted from each group (`root/fence` for group 0,
+`root/fence.g<N>` for the others, atomic rewrite) and rejects lower ones with `Fenced { current }`,
+holding that group's fence lock across the write. Groups have independent terms and never write
+the same range, so one group's election never fences another's writes. Before its first write a
+client for a group other than 0 asks the node for its fences (`Fences`); a node too old to answer
+is refused rather than silently fencing every group against one term. This is what makes free-list
 reuse safe across leader changes: a deposed leader that has not stepped down yet can only allocate
 ranges that are free in its own state, and the new leader always writes a range to its data nodes
 before committing it, so the stale write either lands first and is overwritten, or arrives later and

@@ -51,6 +51,6 @@ pub use metadata::{Catalog, MetaCommand, SnapshotId, VolumeId};
 pub use namespace::{FsId, FsOp, Inode, InodeKind, NodeType, SetAttr, XattrMode, ROOT_INO};
 pub use placement::{FailureDomain, Node, PlacementPolicy};
 pub use raft::{Envelope, Message, RaftConfig, RaftCounters, RaftError, RaftNode, Role};
-pub use raft_server::{RaftServer, RaftStatus};
+pub use raft_server::{RaftMux, RaftServer, RaftStatus};
 pub use raw::{open_store, DeviceBackend};
 pub use tls::TlsIdentity;

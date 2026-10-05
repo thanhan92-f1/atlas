@@ -3,10 +3,13 @@
 
 //! Runs a [`RaftNode`] over TCP: a driver thread owns the clock and inbound queue, one sender
 //! thread per peer keeps a connection open and drops messages while the peer is unreachable
-//! (Raft tolerates loss), and the listener accepts peer connections.
+//! (Raft tolerates loss), and a [`RaftMux`] accepts peer connections. Several Raft groups (one
+//! [`RaftServer`] each) can share a node's mux: every envelope names its group and the mux hands
+//! it to that group's server.
 //!
 //! Wire format: a 4-byte big-endian length followed by a JSON [`Envelope`]. Inbound envelopes are
-//! dropped unless they come from a configured peer and are addressed to this node.
+//! dropped unless they belong to a group served here, come from one of its configured peers and
+//! are addressed to this node.
 //!
 //! Without TLS there is no authentication or encryption; bind to a private metadata network only.
 //! With a [`TlsIdentity`] every connection is mutual TLS against the cluster CA, a peer is dialled
@@ -20,7 +23,7 @@ use std::{
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender},
-        Arc, Condvar, Mutex, MutexGuard,
+        Arc, Condvar, Mutex, MutexGuard, RwLock,
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -140,6 +143,7 @@ struct PeerSpawner {
 
 struct Shared {
     id: NodeId,
+    group: u32,
     node: Mutex<RaftNode>,
     changed: Condvar,
     stop: AtomicBool,
@@ -149,12 +153,8 @@ struct Shared {
     /// Inbound frames dropped for a wrong addressee, an unknown sender, or a sender the
     /// connection's certificate does not vouch for.
     rejected_frames: AtomicU64,
-    tls_server: Option<Arc<ServerConfig>>,
+    /// Inbound and outbound handshake failures of the whole node (shared with its mux).
     tls_handshake_failures: Arc<AtomicU64>,
-    /// Accepted connections, kept so shutdown can unblock their readers; removed on reader exit.
-    conns: Mutex<BTreeMap<u64, TcpStream>>,
-    next_conn: AtomicU64,
-    readers: Mutex<Vec<JoinHandle<()>>>,
 }
 
 impl Shared {
@@ -173,7 +173,8 @@ impl Shared {
         let Ok(peers) = self.peers.lock() else {
             return Ok(());
         };
-        for env in msgs {
+        for mut env in msgs {
+            env.group = self.group;
             if let Some(p) = peers.get(&env.to) {
                 // A full queue means the peer is unreachable; Raft retransmits.
                 if p.tx.try_send(env).is_err() {
@@ -275,8 +276,120 @@ impl Shared {
     }
 }
 
+/// A group's inbound side, as registered with a [`RaftMux`].
+struct Route {
+    shared: Arc<Shared>,
+    inbound: Sender<Envelope>,
+}
+
+struct MuxShared {
+    tls_server: Option<Arc<ServerConfig>>,
+    tls_handshake_failures: Arc<AtomicU64>,
+    stop: AtomicBool,
+    routes: RwLock<BTreeMap<u32, Route>>,
+    /// Inbound frames for a group not served here.
+    unrouted: AtomicU64,
+    /// Accepted connections, kept so shutdown can unblock their readers; removed on reader exit.
+    conns: Mutex<BTreeMap<u64, TcpStream>>,
+    next_conn: AtomicU64,
+    readers: Mutex<Vec<JoinHandle<()>>>,
+}
+
+/// A node's Raft listener, shared by every group the node serves.
+pub struct RaftMux {
+    shared: Arc<MuxShared>,
+    addr: SocketAddr,
+    acceptor: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl RaftMux {
+    /// Starts accepting on an already-bound `listener`, with mutual TLS when `tls` is set.
+    pub fn start(listener: TcpListener, tls: Option<&TlsIdentity>) -> Result<Arc<Self>, RaftError> {
+        let tls_server = tls.map(TlsIdentity::server_config).transpose()?;
+        let addr = listener.local_addr()?;
+        listener.set_nonblocking(true)?;
+        let shared = Arc::new(MuxShared {
+            tls_server,
+            tls_handshake_failures: Arc::new(AtomicU64::new(0)),
+            stop: AtomicBool::new(false),
+            routes: RwLock::new(BTreeMap::new()),
+            unrouted: AtomicU64::new(0),
+            conns: Mutex::new(BTreeMap::new()),
+            next_conn: AtomicU64::new(0),
+            readers: Mutex::new(Vec::new()),
+        });
+        let acceptor = {
+            let shared = shared.clone();
+            thread::spawn(move || accept_loop(listener, &shared))
+        };
+        Ok(Arc::new(Self {
+            shared,
+            addr,
+            acceptor: Mutex::new(Some(acceptor)),
+        }))
+    }
+
+    pub fn local_addr(&self) -> SocketAddr {
+        self.addr
+    }
+
+    fn register(&self, group: u32, route: Route) -> Result<(), RaftError> {
+        let mut routes = self
+            .shared
+            .routes
+            .write()
+            .map_err(|_| RaftError::Shutdown)?;
+        if routes.contains_key(&group) {
+            return Err(RaftError::Config(format!(
+                "raft group {group} already runs on this listener"
+            )));
+        }
+        routes.insert(group, route);
+        Ok(())
+    }
+
+    fn unregister(&self, group: u32) {
+        if let Ok(mut routes) = self.shared.routes.write() {
+            routes.remove(&group);
+        }
+    }
+
+    /// Stops accepting and closes every inbound connection. Servers still registered stop
+    /// receiving.
+    pub fn shutdown(&self) {
+        self.shared.stop.store(true, Ordering::SeqCst);
+        // Join the acceptor first so no connection can be registered after the sweep below.
+        if let Some(a) = self.acceptor.lock().ok().and_then(|mut a| a.take()) {
+            let _ = a.join();
+        }
+        if let Ok(conns) = self.shared.conns.lock() {
+            for c in conns.values() {
+                let _ = c.shutdown(std::net::Shutdown::Both);
+            }
+        }
+        let readers: Vec<_> = self
+            .shared
+            .readers
+            .lock()
+            .map(|mut r| r.drain(..).collect())
+            .unwrap_or_default();
+        for r in readers {
+            let _ = r.join();
+        }
+    }
+}
+
+impl Drop for RaftMux {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
 pub struct RaftServer {
     shared: Arc<Shared>,
+    mux: Arc<RaftMux>,
+    /// Whether this server started `mux` and stops it on shutdown.
+    owns_mux: bool,
     addr: SocketAddr,
     threads: Vec<JoinHandle<()>>,
 }
@@ -302,29 +415,42 @@ impl RaftServer {
         tick: Duration,
         tls: Option<TlsIdentity>,
     ) -> Result<Self, RaftError> {
+        let mux = RaftMux::start(listener, tls.as_ref())?;
+        let mut server = Self::start_in(&mux, 0, cfg, peers, tick, tls)?;
+        server.owns_mux = true;
+        Ok(server)
+    }
+
+    /// Runs Raft group `group` on a shared `mux`. Every node of the group must run it under the
+    /// same number, and `tls` must match the mux's.
+    pub fn start_in<A: std::fmt::Display>(
+        mux: &Arc<RaftMux>,
+        group: u32,
+        cfg: RaftConfig,
+        peers: BTreeMap<NodeId, A>,
+        tick: Duration,
+        tls: Option<TlsIdentity>,
+    ) -> Result<Self, RaftError> {
         for p in &cfg.peers {
             if !peers.contains_key(p) {
                 return Err(RaftError::Config(format!("no address for peer {p}")));
             }
         }
-        let (tls_server, tls_client) = match &tls {
-            Some(id) => (Some(id.server_config()?), Some(id.client_config()?)),
-            None => (None, None),
-        };
+        let tls_client = tls.as_ref().map(TlsIdentity::client_config).transpose()?;
         if tls.is_some() {
             for p in cfg.peers.iter().chain([&cfg.id]) {
                 tls::server_name(p).map_err(|e| RaftError::Config(e.to_string()))?;
             }
         }
-        let tls_handshake_failures = Arc::new(AtomicU64::new(0));
-        let addr = listener.local_addr()?;
-        listener.set_nonblocking(true)?;
+        let tls_handshake_failures = mux.shared.tls_handshake_failures.clone();
+        let addr = mux.local_addr();
         let node = RaftNode::open(cfg.clone())?;
 
         let stop = Arc::new(AtomicBool::new(false));
         let mut threads = Vec::new();
         let shared = Arc::new(Shared {
             id: cfg.id.clone(),
+            group,
             node: Mutex::new(node),
             changed: Condvar::new(),
             stop: AtomicBool::new(false),
@@ -343,11 +469,7 @@ impl RaftServer {
                     .collect(),
             },
             rejected_frames: AtomicU64::new(0),
-            tls_server,
             tls_handshake_failures,
-            conns: Mutex::new(BTreeMap::new()),
-            next_conn: AtomicU64::new(0),
-            readers: Mutex::new(Vec::new()),
         });
         {
             let node = shared.lock()?;
@@ -355,10 +477,13 @@ impl RaftServer {
         }
 
         let (in_tx, in_rx) = mpsc::channel();
-        {
-            let shared = shared.clone();
-            threads.push(thread::spawn(move || accept_loop(listener, &shared, in_tx)));
-        }
+        mux.register(
+            group,
+            Route {
+                shared: shared.clone(),
+                inbound: in_tx,
+            },
+        )?;
         {
             let shared = shared.clone();
             let stop = stop.clone();
@@ -369,9 +494,15 @@ impl RaftServer {
         }
         Ok(Self {
             shared,
+            mux: mux.clone(),
+            owns_mux: false,
             addr,
             threads,
         })
+    }
+
+    pub fn group(&self) -> u32 {
+        self.shared.group
     }
 
     pub fn local_addr(&self) -> SocketAddr {
@@ -519,7 +650,8 @@ impl RaftServer {
     pub fn render_metrics(&self) -> Result<String, RaftError> {
         let n = self.shared.lock()?;
         let id = n.id().to_string();
-        let node = [("node", id.as_str())];
+        let group = self.shared.group.to_string();
+        let node = [("node", id.as_str()), ("group", group.as_str())];
         let mut p = PromText::new();
         p.family("atlas_native_raft_term", "gauge", "Current Raft term.")
             .sample("atlas_native_raft_term", &node, n.term());
@@ -564,7 +696,11 @@ impl RaftServer {
         ] {
             p.sample(
                 "atlas_native_raft_role",
-                &[("node", id.as_str()), ("role", name)],
+                &[
+                    ("node", id.as_str()),
+                    ("group", group.as_str()),
+                    ("role", name),
+                ],
                 u8::from(n.role() == role),
             );
         }
@@ -603,7 +739,11 @@ impl RaftServer {
         for (peer, m) in n.peer_match_index() {
             p.sample(
                 "atlas_native_raft_peer_match_index",
-                &[("node", id.as_str()), ("peer", peer.as_str())],
+                &[
+                    ("node", id.as_str()),
+                    ("group", group.as_str()),
+                    ("peer", peer.as_str()),
+                ],
                 m,
             );
         }
@@ -649,7 +789,11 @@ impl RaftServer {
             for (peer, st) in &stats {
                 p.sample(
                     name,
-                    &[("node", id.as_str()), ("peer", peer.as_str())],
+                    &[
+                        ("node", id.as_str()),
+                        ("group", group.as_str()),
+                        ("peer", peer.as_str()),
+                    ],
                     get(st),
                 );
             }
@@ -657,17 +801,22 @@ impl RaftServer {
         p.family(
             "atlas_native_transport_rejected_frames_total",
             "counter",
-            "Inbound frames from unknown senders or for another node.",
+            "Inbound frames from unknown senders or for another node (group 0 also counts frames for groups not served here).",
         )
         .sample(
             "atlas_native_transport_rejected_frames_total",
             &node,
-            self.shared.rejected_frames.load(Ordering::Relaxed),
+            self.shared.rejected_frames.load(Ordering::Relaxed)
+                + if self.shared.group == 0 {
+                    self.mux.shared.unrouted.load(Ordering::Relaxed)
+                } else {
+                    0
+                },
         );
         p.family(
             "atlas_native_transport_tls_handshake_failures_total",
             "counter",
-            "Inbound and outbound TLS handshakes that failed.",
+            "Inbound and outbound TLS handshakes that failed, node-wide.",
         )
         .sample(
             "atlas_native_transport_tls_handshake_failures_total",
@@ -731,23 +880,12 @@ impl RaftServer {
     pub fn shutdown(&mut self) {
         self.shared.stop.store(true, Ordering::SeqCst);
         self.shared.changed.notify_all();
-        // Join the acceptor first so no connection can be registered after the sweep below.
+        self.mux.unregister(self.shared.group);
         for t in self.threads.drain(..) {
             let _ = t.join();
         }
-        if let Ok(conns) = self.shared.conns.lock() {
-            for c in conns.values() {
-                let _ = c.shutdown(std::net::Shutdown::Both);
-            }
-        }
-        let readers: Vec<_> = self
-            .shared
-            .readers
-            .lock()
-            .map(|mut r| r.drain(..).collect())
-            .unwrap_or_default();
-        for r in readers {
-            let _ = r.join();
+        if self.owns_mux {
+            self.mux.shutdown();
         }
         let senders: Vec<_> = self
             .shared
@@ -814,7 +952,7 @@ fn drive(shared: &Shared, inbound: Receiver<Envelope>, tick: Duration) {
     }
 }
 
-fn accept_loop(listener: TcpListener, shared: &Arc<Shared>, inbound: Sender<Envelope>) {
+fn accept_loop(listener: TcpListener, shared: &Arc<MuxShared>) {
     while !shared.stop.load(Ordering::SeqCst) {
         match listener.accept() {
             Ok((stream, _)) => {
@@ -829,12 +967,11 @@ fn accept_loop(listener: TcpListener, shared: &Arc<Shared>, inbound: Sender<Enve
                 if let Ok(mut conns) = shared.conns.lock() {
                     conns.insert(conn_id, clone);
                 }
-                let inbound = inbound.clone();
                 let reader_shared = shared.clone();
                 let handle = thread::spawn(move || {
                     match Conn::accept(stream, reader_shared.tls_server.as_ref(), HANDSHAKE_TIMEOUT)
                     {
-                        Ok(conn) => read_loop(conn, &inbound, &reader_shared),
+                        Ok(conn) => read_loop(conn, &reader_shared),
                         Err(_) => {
                             reader_shared
                                 .tls_handshake_failures
@@ -858,30 +995,39 @@ fn accept_loop(listener: TcpListener, shared: &Arc<Shared>, inbound: Sender<Enve
     }
 }
 
-/// Delivers frames addressed to this node from known peers. Over TLS a sender may only speak
-/// for node ids its certificate is valid for (checked once per id per connection).
-fn read_loop(mut stream: Conn, inbound: &Sender<Envelope>, shared: &Shared) {
+/// Delivers frames to their group's server when they are addressed to this node from one of the
+/// group's known peers. Over TLS a sender may only speak for node ids its certificate is valid
+/// for (checked once per id per connection).
+fn read_loop(mut stream: Conn, mux: &MuxShared) {
     let mut vouched: BTreeMap<NodeId, bool> = BTreeMap::new();
+    // Groups this connection has carried a frame for, so each peer's liveness counts the
+    // connection once per group.
+    let mut seen: BTreeMap<(u32, NodeId), ()> = BTreeMap::new();
     while let Ok(env) = read_frame(&mut stream) {
+        let Some((shared, inbound)) = mux.routes.read().ok().and_then(|r| {
+            r.get(&env.group)
+                .map(|r| (r.shared.clone(), r.inbound.clone()))
+        }) else {
+            mux.unrouted.fetch_add(1, Ordering::Relaxed);
+            continue;
+        };
         let ok = env.to == shared.id
             && shared.is_known_peer(&env.from)
             && *vouched.entry(env.from.clone()).or_insert_with(|| {
-                let ok = !stream.is_tls()
+                !stream.is_tls()
                     || !stream
                         .peer_names(std::slice::from_ref(&env.from))
-                        .is_empty();
-                if ok {
-                    shared.with_liveness(&env.from, PeerLiveness::inbound_connected);
-                }
-                ok
+                        .is_empty()
             });
         if !ok {
             shared.rejected_frames.fetch_add(1, Ordering::Relaxed);
             continue;
         }
-        if inbound.send(env).is_err() {
-            return;
+        if seen.insert((env.group, env.from.clone()), ()).is_none() {
+            shared.with_liveness(&env.from, PeerLiveness::inbound_connected);
         }
+        // A send fails only while the group is shutting down; other groups keep the connection.
+        let _ = inbound.send(env);
     }
 }
 
@@ -1004,6 +1150,7 @@ mod tests {
         let env = Envelope {
             from: "a".into(),
             to: "b".into(),
+            group: 3,
             msg: Message::RequestVoteResponse {
                 term: 3,
                 granted: true,
@@ -1012,7 +1159,7 @@ mod tests {
         let mut buf = Vec::new();
         write_frame(&mut buf, &env).unwrap();
         let back = read_frame(&mut buf.as_slice()).unwrap();
-        assert_eq!(back.from, "a");
+        assert_eq!((back.from.as_str(), back.group), ("a", 3));
         assert_eq!(back.msg.term(), 3);
 
         let mut catalog = crate::metadata::Catalog::default();
@@ -1028,6 +1175,7 @@ mod tests {
         let snap = Envelope {
             from: "a".into(),
             to: "b".into(),
+            group: 0,
             msg: Message::InstallSnapshot {
                 term: 2,
                 index: 7,

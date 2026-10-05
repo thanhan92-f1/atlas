@@ -425,7 +425,7 @@ fn http_api_round_trip_with_auth_and_leader_redirect() {
     let (_, dm) = http(d1, "GET", "/metrics", None, b"");
     assert!(String::from_utf8(dm)
         .unwrap()
-        .contains("atlas_native_data_fence{node=\"d1\"}"));
+        .contains("atlas_native_data_fence{node=\"d1\",group=\"0\"}"));
     assert_eq!(api(d1, "GET", "/v1/volumes", b"").0, 404);
 }
 

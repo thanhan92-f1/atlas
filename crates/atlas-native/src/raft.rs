@@ -229,7 +229,14 @@ mod embedded_json {
 pub struct Envelope {
     pub from: NodeId,
     pub to: NodeId,
+    /// The Raft group the message belongs to; several share one transport listener.
+    #[serde(default, skip_serializing_if = "is_group_zero")]
+    pub group: u32,
     pub msg: Message,
+}
+
+fn is_group_zero(g: &u32) -> bool {
+    *g == 0
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -1273,6 +1280,7 @@ impl RaftNode {
         self.outbox.push(Envelope {
             from: self.cfg.id.clone(),
             to,
+            group: 0,
             msg,
         });
     }
