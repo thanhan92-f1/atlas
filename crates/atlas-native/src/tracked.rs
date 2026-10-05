@@ -84,10 +84,15 @@ impl<K: Ord + Clone, V> Tracked<K, V> {
         self.replaced.clear();
     }
 
-    /// [`Self::clear_changes`], then `f` on every value to clear maps nested in them.
-    pub fn clear_changes_nested(&mut self, f: impl FnMut(&mut V)) {
+    /// [`Self::clear_changes`], first calling `f` on each changed value still present, to clear
+    /// maps nested in it (a nested map only changes through its parent's `get_mut`).
+    pub fn clear_changes_with(&mut self, mut f: impl FnMut(&mut V)) {
+        for k in &self.touched {
+            if let Some(v) = self.map.get_mut(k) {
+                f(v);
+            }
+        }
         self.clear_changes();
-        self.map.values_mut().for_each(f);
     }
 }
 

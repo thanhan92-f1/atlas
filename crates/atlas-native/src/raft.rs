@@ -1193,6 +1193,7 @@ impl RaftNode {
     }
 
     fn persist_catalog(&mut self) -> Result<(), RaftError> {
-        Ok(self.store.checkpoint(&mut self.catalog)?)
+        self.store.checkpoint(&mut self.catalog)?;
+        Ok(())
     }
 }
