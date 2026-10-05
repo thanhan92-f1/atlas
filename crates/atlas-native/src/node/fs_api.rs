@@ -3,7 +3,8 @@
 
 //! `/v1/fs/...`: the inode-based file API. Paths address inodes by number; names travel in JSON
 //! bodies (or a percent-encoded `name` query on lookup). A snapshot tree is read as `<fs>@<id>`.
-//! Only the metadata leader answers, unless a read passes `?stale=1`.
+//! Only the metadata leader answers, unless a read passes `?barrier=1` (any replica, after a
+//! read barrier: still linearizable) or `?stale=1` (any replica, as far as it has applied).
 
 use serde_json::json;
 
@@ -18,8 +19,12 @@ type Routed = Result<Response, NativeError>;
 
 pub(super) fn route(sh: &NodeShared, e: &NativeEngine, req: &Request, segs: &[&str]) -> Routed {
     // A follower's catalog can lag the leader, so a client could miss its own writes there.
-    // `?stale=1` opts into reading whatever this replica has applied.
-    if req.method != "GET" || !req.query.contains_key("stale") {
+    // `?barrier=1` first catches this replica up to the leader's commit index; `?stale=1` opts
+    // into reading whatever it has applied.
+    let get = req.method == "GET";
+    if get && req.query.contains_key("barrier") {
+        e.read_barrier()?;
+    } else if !get || !req.query.contains_key("stale") {
         e.ensure_leader()?;
     }
     match (req.method.as_str(), segs) {

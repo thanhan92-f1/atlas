@@ -150,6 +150,10 @@ pub enum Message {
         prev_log_term: u64,
         entries: Vec<Entry>,
         leader_commit: u64,
+        /// The leader's read round when it sent this; echoed back, it confirms the leadership
+        /// that read barriers registered up to that round depend on.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        read_seq: u64,
     },
     /// On success `match_index` is the last index known to match the leader; on failure it is a
     /// hint for where the leader should retry.
@@ -157,6 +161,8 @@ pub enum Message {
         term: u64,
         success: bool,
         match_index: u64,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        read_seq: u64,
     },
     /// Chunk `seq` of the leader's applied catalog as of `index` (see [`crate::raft_snapshot`]);
     /// the header's `applied_index`/`current_term` are the snapshot's last included index/term.
@@ -176,6 +182,23 @@ pub enum Message {
         #[serde(default)]
         ack: Option<u64>,
     },
+    /// A follower asks the leader for a read barrier: the leader's commit index, once a quorum
+    /// has confirmed it is still the leader.
+    ReadIndex {
+        term: u64,
+        id: u64,
+    },
+    /// `index` is None when the responder could not serve the barrier (not the leader, or not
+    /// yet committed an entry in its term); the follower asks again.
+    ReadIndexResponse {
+        term: u64,
+        id: u64,
+        index: Option<u64>,
+    },
+}
+
+fn is_zero(v: &u64) -> bool {
+    *v == 0
 }
 
 impl Message {
@@ -187,6 +210,7 @@ impl Message {
                 | Message::RequestVoteResponse { .. }
                 | Message::AppendEntriesResponse { .. }
                 | Message::InstallSnapshotResponse { .. }
+                | Message::ReadIndexResponse { .. }
         )
     }
 
@@ -199,7 +223,9 @@ impl Message {
             | Message::AppendEntries { term, .. }
             | Message::AppendEntriesResponse { term, .. }
             | Message::InstallSnapshot { term, .. }
-            | Message::InstallSnapshotResponse { term, .. } => *term,
+            | Message::InstallSnapshotResponse { term, .. }
+            | Message::ReadIndex { term, .. }
+            | Message::ReadIndexResponse { term, .. } => *term,
         }
     }
 }
@@ -256,6 +282,18 @@ pub struct RaftCounters {
     pub append_rejections: u64,
 }
 
+/// A read barrier the leader is confirming: `index` is its commit index when the barrier was
+/// registered in read round `seq`.
+#[derive(Debug)]
+struct PendingRead {
+    seq: u64,
+    index: u64,
+    /// The follower that asked, or None for this node.
+    from: Option<NodeId>,
+    id: u64,
+    acks: BTreeSet<NodeId>,
+}
+
 #[derive(Debug)]
 pub struct RaftNode {
     cfg: RaftConfig,
@@ -296,6 +334,12 @@ pub struct RaftNode {
     incoming: Option<Incoming>,
     rng: u64,
     outbox: Vec<Envelope>,
+    /// Leader only: the read round, raised whenever a barrier is registered.
+    read_seq: u64,
+    pending_reads: Vec<PendingRead>,
+    next_read_id: u64,
+    /// Barriers this node asked for: id to the index to wait for (None: ask again).
+    read_results: BTreeMap<u64, Option<u64>>,
 }
 
 impl RaftNode {
@@ -392,6 +436,10 @@ impl RaftNode {
             incoming: None,
             rng: rng | 1,
             outbox: Vec::new(),
+            read_seq: 0,
+            pending_reads: Vec::new(),
+            next_read_id: 1,
+            read_results: BTreeMap::new(),
             cfg,
         };
         node.refresh_membership();
@@ -564,6 +612,97 @@ impl RaftNode {
         }
         Ok(())
     }
+    /// Starts a read barrier and returns its id. Once [`Self::read_result`] yields an index,
+    /// every entry committed before this call is at or below it, so a catalog applied through
+    /// that index reflects every write acknowledged before the call (a linearizable read).
+    /// The leader confirms its leadership with a quorum first; a follower asks the leader.
+    pub fn read_index(&mut self) -> Result<u64, RaftError> {
+        let id = self.next_read_id;
+        self.next_read_id += 1;
+        if self.role == Role::Leader {
+            if !self.register_read(None, id) {
+                return Err(RaftError::NotLeader {
+                    leader: self.leader.clone(),
+                });
+            }
+        } else {
+            let Some(leader) = self.leader.clone() else {
+                return Err(RaftError::NotLeader { leader: None });
+            };
+            let term = self.hard.term;
+            self.send(leader, Message::ReadIndex { term, id });
+        }
+        Ok(id)
+    }
+
+    /// The outcome of barrier `id`: None while pending, `Some(None)` if the leader turned it
+    /// down (ask again), `Some(Some(index))` once confirmed. Taking a result forgets it.
+    pub fn read_result(&mut self, id: u64) -> Option<Option<u64>> {
+        self.read_results.remove(&id)
+    }
+
+    /// Forgets barrier `id` (the caller gave up on it).
+    pub fn forget_read(&mut self, id: u64) {
+        self.read_results.remove(&id);
+        self.pending_reads
+            .retain(|r| !(r.from.is_none() && r.id == id));
+    }
+
+    /// Leader only: registers a barrier at the commit index, or returns false if this leader
+    /// has not committed an entry in its term yet (its commit index may still trail a
+    /// predecessor's).
+    fn register_read(&mut self, from: Option<NodeId>, id: u64) -> bool {
+        if self.term_at(self.commit_index) != Some(self.hard.term) {
+            return false;
+        }
+        self.read_seq += 1;
+        self.pending_reads.push(PendingRead {
+            seq: self.read_seq,
+            index: self.commit_index,
+            from,
+            id,
+            acks: BTreeSet::from([self.cfg.id.clone()]),
+        });
+        // A single-voter group confirms at once; otherwise the next round of appends does.
+        self.confirm_reads(None, 0);
+        if !self.pending_reads.is_empty() {
+            self.broadcast_append();
+        }
+        true
+    }
+
+    /// Counts `from`'s answer to read round `seq` toward every barrier registered by then and
+    /// completes those a quorum has confirmed.
+    fn confirm_reads(&mut self, from: Option<&NodeId>, seq: u64) {
+        let mut done = Vec::new();
+        self.pending_reads.retain_mut(|r| {
+            if let Some(f) = from.filter(|_| seq >= r.seq) {
+                r.acks.insert(f.clone());
+            }
+            if self.membership.has_quorum(&r.acks) {
+                done.push((r.from.take(), r.id, r.index));
+                false
+            } else {
+                true
+            }
+        });
+        for (from, id, index) in done {
+            self.answer_read(from, id, Some(index));
+        }
+    }
+
+    fn answer_read(&mut self, from: Option<NodeId>, id: u64, index: Option<u64>) {
+        match from {
+            None => {
+                self.read_results.insert(id, index);
+            }
+            Some(f) => {
+                let term = self.hard.term;
+                self.send(f, Message::ReadIndexResponse { term, id, index });
+            }
+        }
+    }
+
     pub fn counters(&self) -> RaftCounters {
         self.counters
     }
@@ -740,6 +879,7 @@ impl RaftNode {
                 prev_log_term,
                 entries,
                 leader_commit,
+                read_seq,
             } => {
                 if term < self.hard.term {
                     self.send(
@@ -748,6 +888,7 @@ impl RaftNode {
                             term: self.hard.term,
                             success: false,
                             match_index: 0,
+                            read_seq,
                         },
                     );
                     return Ok(());
@@ -765,6 +906,7 @@ impl RaftNode {
                         term: self.hard.term,
                         success,
                         match_index,
+                        read_seq,
                     },
                 );
             }
@@ -772,6 +914,7 @@ impl RaftNode {
                 term,
                 success,
                 match_index,
+                read_seq,
             } => {
                 if self.role != Role::Leader
                     || term != self.hard.term
@@ -780,6 +923,9 @@ impl RaftNode {
                     return Ok(());
                 }
                 self.recent_active.insert(from.clone());
+                if read_seq > 0 {
+                    self.confirm_reads(Some(&from), read_seq);
+                }
                 if success {
                     let m = self.match_index.entry(from.clone()).or_insert(0);
                     *m = (*m).max(match_index);
@@ -863,6 +1009,27 @@ impl RaftNode {
                 self.advance_commit()?;
                 if next <= self.last_index() {
                     self.send_append(&from);
+                }
+            }
+            Message::ReadIndex { term, id } => {
+                if term != self.hard.term
+                    || self.role != Role::Leader
+                    || !self.register_read(Some(from.clone()), id)
+                {
+                    let term = self.hard.term;
+                    self.send(
+                        from,
+                        Message::ReadIndexResponse {
+                            term,
+                            id,
+                            index: None,
+                        },
+                    );
+                }
+            }
+            Message::ReadIndexResponse { id, index, .. } => {
+                if self.role != Role::Leader {
+                    self.read_results.insert(id, index);
                 }
             }
         }
@@ -1068,6 +1235,10 @@ impl RaftNode {
             self.hard.voted_for = None;
             self.persist_hard()?;
         }
+        // Barriers this node was confirming as leader can no longer be; their askers retry.
+        for r in std::mem::take(&mut self.pending_reads) {
+            self.answer_read(r.from, r.id, None);
+        }
         self.role = Role::Follower;
         self.spec = None;
         self.outgoing.clear();
@@ -1168,6 +1339,7 @@ impl RaftNode {
                 prev_log_term: prev_term,
                 entries,
                 leader_commit: self.commit_index,
+                read_seq: self.read_seq,
             },
         );
     }

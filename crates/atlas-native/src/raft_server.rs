@@ -45,6 +45,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
 const RECONNECT_BACKOFF: Duration = Duration::from_millis(100);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long [`RaftServer::read_barrier`] waits for an answer before asking again.
+pub const READ_RETRY: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RaftStatus {
@@ -634,6 +636,76 @@ impl RaftServer {
                 .map_err(|_| RaftError::Shutdown)?
                 .0;
         }
+    }
+
+    /// A linearizable read barrier: blocks until this replica's catalog reflects every entry
+    /// committed before the call, leader or not (Raft's ReadIndex: the leader's commit index,
+    /// confirmed by a quorum, then applied here). A lost request or answer is asked again after
+    /// [`READ_RETRY`]. Returns the index waited for.
+    pub fn read_barrier(&self, timeout: Duration) -> Result<u64, RaftError> {
+        let deadline = Instant::now() + timeout;
+        let mut node = self.shared.lock()?;
+        let mut asked: Option<(u64, Instant)> = None;
+        let index = loop {
+            if self.shared.stop.load(Ordering::SeqCst) {
+                return Err(RaftError::Shutdown);
+            }
+            let now = Instant::now();
+            if let Some((id, at)) = asked {
+                match node.read_result(id) {
+                    Some(Some(index)) => break index,
+                    Some(None) => asked = None,
+                    None if now >= at + READ_RETRY => {
+                        node.forget_read(id);
+                        asked = None;
+                    }
+                    None => {}
+                }
+            }
+            if now >= deadline {
+                if let Some((id, _)) = asked {
+                    node.forget_read(id);
+                }
+                return Err(RaftError::Timeout {
+                    index: node.commit_index(),
+                });
+            }
+            if asked.is_none() {
+                match node.read_index() {
+                    Ok(id) => asked = Some((id, now)),
+                    // No leader known yet: an election may be under way.
+                    Err(RaftError::NotLeader { leader: None }) => {}
+                    Err(e) => return Err(e),
+                }
+                self.shared.flush(&mut node)?;
+                if let Some(Some(index)) = asked.and_then(|(id, _)| node.read_result(id)) {
+                    break index;
+                }
+            }
+            let wait = (deadline - now).min(READ_RETRY);
+            node = self
+                .shared
+                .changed
+                .wait_timeout(node, wait)
+                .map_err(|_| RaftError::Shutdown)?
+                .0;
+        };
+        while node.applied_index() < index {
+            if self.shared.stop.load(Ordering::SeqCst) {
+                return Err(RaftError::Shutdown);
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(RaftError::Timeout { index });
+            }
+            node = self
+                .shared
+                .changed
+                .wait_timeout(node, deadline - now)
+                .map_err(|_| RaftError::Shutdown)?
+                .0;
+        }
+        Ok(index)
     }
 
     /// Like [`Self::propose`], but refuses to propose unless the node is still leader in `term`.

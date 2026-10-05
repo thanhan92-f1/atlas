@@ -72,7 +72,9 @@ ENODATA), `too_big` (E2BIG), `unsupported` (EOPNOTSUPP) — all 409 except where
 `not_leader` (421), `unavailable` (503) and `internal` (500).
 
 Reads are served by the leader once it has applied its log as of the request, so a client always
-sees its own writes; `?stale=1` on a `GET` reads whatever the receiving replica has applied.
+sees its own writes. `?barrier=1` on a `GET` lets any replica answer after a read barrier (still
+linearizable, at the cost of one round trip to the leader), and `?stale=1` reads whatever the
+receiving replica has applied.
 Mutations go to the leader; followers answer 421 with the leader's id.
 
 ## atlas-native-mount

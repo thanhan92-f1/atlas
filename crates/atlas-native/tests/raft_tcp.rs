@@ -411,3 +411,24 @@ fn tcp_membership_grows_then_drops_the_leader() {
     assert_eq!(m.voters().into_iter().collect::<Vec<_>>(), rest);
     assert!(addrs.contains_key("m4"));
 }
+
+#[test]
+fn tcp_read_barrier_on_a_follower_sees_every_acknowledged_write() {
+    let c = TcpCluster::new(3);
+    for i in 0..20 {
+        let name = format!("r{i}");
+        c.propose_on_leader(create(&name));
+        let l = c.wait_leader();
+        for (id, s) in c.live().filter(|(id, _)| **id != l) {
+            s.read_barrier(Duration::from_secs(5)).unwrap();
+            assert!(
+                s.with_catalog(|c| c.volumes.contains_key(&format!("vol-{name}")))
+                    .unwrap(),
+                "{id} passed a read barrier without write {name}"
+            );
+        }
+    }
+    let l = c.wait_leader();
+    let s = c.servers[&l].as_ref().unwrap();
+    assert!(s.read_barrier(Duration::from_secs(5)).unwrap() >= 20);
+}

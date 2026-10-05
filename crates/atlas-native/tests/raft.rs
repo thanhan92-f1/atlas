@@ -589,3 +589,48 @@ fn proposals_are_validated_against_uncommitted_entries_across_leaders() {
     assert!(c.run_until(200, |c| c.converged(&["a", "b"])));
     assert_eq!(c.node(&l).catalog().volumes["vol-a"].size_bytes, 8192);
 }
+
+#[test]
+fn read_barriers_wait_for_a_quorum_and_cover_acknowledged_writes() {
+    let mut c = Cluster::new(3, 0);
+    let l = c.elect();
+    c.run(5);
+    let idx = c.node_mut(&l).propose(create("a")).unwrap();
+    assert!(c.run_until(50, |c| c.node(&l).applied_index() >= idx));
+
+    // The leader needs a quorum's answer to a later round of appends first.
+    let id = c.node_mut(&l).read_index().unwrap();
+    assert_eq!(c.node_mut(&l).read_result(id), None);
+    c.deliver();
+    let at = c.node_mut(&l).read_result(id).unwrap().unwrap();
+    assert!(at >= idx, "barrier at {at} misses write {idx}");
+
+    // A follower asks the leader.
+    let f = c.live_ids().into_iter().find(|id| *id != l).unwrap();
+    let id = c.node_mut(&f).read_index().unwrap();
+    c.deliver();
+    let at = c.node_mut(&f).read_result(id).unwrap().unwrap();
+    assert!(at >= idx);
+    assert!(c.node(&f).applied_index() >= at);
+}
+
+#[test]
+fn an_isolated_leader_never_confirms_a_read() {
+    let mut c = Cluster::new(3, 0);
+    let old = c.elect();
+    c.run(5);
+    c.isolated.insert(old.clone());
+    let id = c.node_mut(&old).read_index().unwrap();
+    // The rest elect a new leader and commit a write the old leader never sees.
+    assert!(c.run_until(500, |c| c.leader().is_some_and(|l| l != old)));
+    let new = c.leader().unwrap();
+    c.node_mut(&new).propose(create("b")).unwrap();
+    c.run(5);
+    // Check-quorum has deposed the old leader, which turns the barrier down instead.
+    assert!(!c.node(&old).is_leader());
+    assert_eq!(c.node_mut(&old).read_result(id), Some(None));
+    match c.node_mut(&old).read_index() {
+        Err(RaftError::NotLeader { leader: None }) => {}
+        other => panic!("expected NotLeader without a known leader, got {other:?}"),
+    }
+}

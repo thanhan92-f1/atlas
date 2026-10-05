@@ -180,6 +180,25 @@ standard library:
 Started without a `TlsIdentity` the transport has **no authentication or encryption**; bind it to a
 private metadata network only, or enable mutual TLS (below).
 
+### Read barriers (ReadIndex)
+
+`RaftServer::read_barrier(timeout)` (and `NativeEngine::read_barrier()`) blocks until the local
+replica reflects every entry committed before the call, on a follower as well as the leader, so a
+read served after it is linearizable (Raft thesis §6.4):
+
+1. the node asks the leader (`ReadIndex`; the leader asks itself) for a barrier;
+2. the leader turns it down until it has committed an entry in its own term (until then its commit
+   index may trail its predecessor's), else records its commit index and raises its read round;
+3. every `AppendEntries` carries the leader's read round and every response echoes it; once a
+   quorum has answered a round at or after the barrier's, no newer leader can have committed
+   anything before the barrier was taken, and the leader answers with the recorded index;
+4. the node waits until it has applied that index.
+
+A leader that steps down turns its pending barriers down and the askers ask again; a lost request
+or answer is asked again after 500 ms. An isolated old leader never confirms one: it cannot reach a
+quorum, and check-quorum deposes it. Older metadata nodes do not know these messages and drop the
+connection that carries one, so upgrade every replica before relying on barriers.
+
 `tests/raft_tcp.rs` runs a real 3-server cluster over localhost: election and replication, follower
 redirect, and leader shutdown, failover and rejoin from disk. `tests/raft_groups.rs` runs three
 groups on each node's one listener: they replicate independently, and one group failing over (its
@@ -250,9 +269,9 @@ all configured with the same node ids and data-node addresses:
   free list that reflects every committed reservation. The returned term fences the data writes,
   and `InstallExtent` is proposed with `propose_in_term`, which refuses if the term moved on;
 - `gc_once` waits for the same barrier so it never proposes a reclaim that is already in the log;
-- reads come from the local replica's applied catalog, so a follower can lag the leader (no
-  linearizable reads yet); extent metadata is copied out before the network read, so a slow data
-  node never holds the Raft node lock;
+- reads come from the local replica's applied catalog, so a follower can lag the leader unless
+  the caller runs `read_barrier()` first (below); extent metadata is copied out before the network
+  read, so a slow data node never holds the Raft node lock;
 - `checkpoint` is refused: the Raft node compacts its own log. `wal_records` reports the Raft log
   length above its compaction point.
 
@@ -332,7 +351,7 @@ Not implemented yet:
 - a background repair schedule and repair rate limiting (`repair_once` is a full scan per call);
 - membership changes: the voter set is fixed at open (quorum math already supports joint
   configurations);
-- linearizable reads (read index / leases).
+- lease-based reads (every read barrier costs the leader one round of appends).
 
 ## Failure model covered
 
