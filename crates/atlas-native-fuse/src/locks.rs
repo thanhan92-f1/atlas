@@ -155,7 +155,7 @@ impl Locks {
                 match renewed {
                     Ok(_) => {}
                     Err(e) if is(&e, "no_session") => {
-                        tracing::error!(session = %id, "lock session expired; its locks are lost");
+                        tracing::error!("lock session expired; its locks are lost");
                         lost.fetch_add(1, Ordering::Relaxed);
                         if let Ok(mut s) = state.lock() {
                             if s.session.as_deref() == Some(id.as_str()) {

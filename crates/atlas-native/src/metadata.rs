@@ -189,8 +189,9 @@ pub enum MetaError {
     Unsupported(String),
     #[error("locked: {0}")]
     Locked(String),
-    #[error("no such session (expired or closed): {0}")]
-    NoSession(String),
+    /// Session ids are never echoed: one lets its holder renew the session or drop its locks.
+    #[error("no such session (expired or closed)")]
+    NoSession,
     /// The catalog store could not be read: not a property of the command.
     #[error("catalog store: {0}")]
     Store(String),

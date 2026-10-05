@@ -113,7 +113,7 @@ pub enum LeaseOp {
 fn check_session_id(session: &str) -> Result<(), MetaError> {
     if session.is_empty() || session.len() > MAX_SESSION_ID_BYTES {
         return Err(MetaError::Invalid(format!(
-            "invalid session id {session:?}"
+            "session ids are 1 to {MAX_SESSION_ID_BYTES} bytes"
         )));
     }
     Ok(())
@@ -168,9 +168,7 @@ impl Leases {
     }
 
     fn session_mut(&mut self, session: &str) -> Result<&mut Session, MetaError> {
-        self.sessions
-            .get_mut(session)
-            .ok_or_else(|| MetaError::NoSession(session.into()))
+        self.sessions.get_mut(session).ok_or(MetaError::NoSession)
     }
 
     fn drop_sessions(&mut self, gone: &[String]) {
@@ -273,7 +271,7 @@ impl Leases {
                     );
                 if mine > MAX_LOCKS_PER_SESSION {
                     return Err(MetaError::TooBig(format!(
-                        "session {session} would hold more than {MAX_LOCKS_PER_SESSION} locks"
+                        "a session would hold more than {MAX_LOCKS_PER_SESSION} locks"
                     )));
                 }
                 let s = self.session_mut(session)?;
@@ -485,7 +483,7 @@ mod tests {
         lock(&mut l, "b", 1, Some(LockKind::Write), 10, 19).unwrap();
         assert!(matches!(
             lock(&mut l, "zz", 1, Some(LockKind::Write), 30, 39),
-            Err(MetaError::NoSession(_))
+            Err(MetaError::NoSession)
         ));
         assert_eq!(l.expired(10_000).collect::<Vec<_>>(), vec!["a"]);
         l.apply(&LeaseOp::Expire { now_ms: 10_000 }, any_file)
@@ -500,7 +498,7 @@ mod tests {
                 },
                 any_file
             ),
-            Err(MetaError::NoSession(_))
+            Err(MetaError::NoSession)
         ));
         l.apply(
             &LeaseOp::Close {

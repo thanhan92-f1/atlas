@@ -64,7 +64,7 @@ impl NativeEngine {
 
     pub fn session(&self, session: &str) -> Result<Session, NativeError> {
         self.with_catalog(|c| c.leases.sessions.get(session).copied())?
-            .ok_or_else(|| MetaError::NoSession(session.into()).into())
+            .ok_or_else(|| MetaError::NoSession.into())
     }
 
     pub fn renew_session(&self, session: &str) -> Result<Session, NativeError> {
