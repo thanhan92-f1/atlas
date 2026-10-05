@@ -730,7 +730,7 @@ fn error_response(e: NativeError) -> Response {
             (404, "not_found", None)
         }
         (_, Some(MetaError::NoAttr(_))) => (404, "no_attr", None),
-        (_, Some(MetaError::NoSession(_))) => (410, "no_session", None),
+        (_, Some(MetaError::NoSession)) => (410, "no_session", None),
         (_, Some(m)) => (
             409,
             match m {
