@@ -24,7 +24,9 @@ use crate::{
     placement::{select_replicas, Node, PlacementPolicy},
     raft::RaftError,
     raft_server::RaftServer,
-    store::{load_checkpoint, remove_legacy_catalog, CatalogStore, CATALOG_STORE},
+    store::{
+        load_checkpoint, remove_legacy_catalog, CatalogStore, CATALOG_STORE, DEFAULT_CACHE_INODES,
+    },
     telemetry::NativeIoCounters,
     wal::{Wal, WalError, WalRecord},
 };
@@ -136,6 +138,8 @@ pub struct EngineConfig {
     /// After an I/O failure a node is skipped for placement (and tried last for reads) for this
     /// long, then given another chance.
     pub node_retry_after: Duration,
+    /// Unchanged inodes the catalog keeps in memory; the rest stay in the catalog store.
+    pub catalog_cache_inodes: usize,
 }
 
 impl EngineConfig {
@@ -146,6 +150,7 @@ impl EngineConfig {
             placement: PlacementPolicy::default(),
             wal_compact_after: 1024,
             node_retry_after: Duration::from_secs(5),
+            catalog_cache_inodes: DEFAULT_CACHE_INODES,
         }
     }
 }
@@ -288,7 +293,8 @@ impl NativeEngine {
             .collect();
         let meta = match meta {
             MetaBackend::Local => {
-                let store = CatalogStore::open(cfg.root.join(CATALOG_STORE))?;
+                let store = CatalogStore::open(cfg.root.join(CATALOG_STORE))?
+                    .with_cache_inodes(cfg.catalog_cache_inodes);
                 let (catalog, wal) = load_local(&cfg.root, &store)?;
                 Meta::Local {
                     store,

@@ -9,9 +9,10 @@
 //! `catalog.json`, installed from a Raft snapshot) is written in full.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet, HashMap},
     fs, io,
     path::{Path, PathBuf},
+    sync::{Arc, Mutex, MutexGuard, PoisonError},
 };
 
 use redb::{
@@ -21,6 +22,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     alloc::FreeList,
+    inodes::InodeTable,
     membership::Membership,
     metadata::{Catalog, SnapshotId},
     namespace::{FsId, FsMeta, FsUsage, Inode, InodeKind},
@@ -67,7 +69,16 @@ struct FsHeader {
     extent_bytes: Option<u64>,
     #[serde(default)]
     usage: Option<FsUsage>,
+    /// Inode count (absent before tables were paged: counted on load).
+    #[serde(default)]
+    inodes: Option<u64>,
 }
+
+/// redb's own page cache; the operating system's page cache sits behind it.
+const STORE_CACHE_BYTES: usize = 64 << 20;
+
+/// Inodes the paged tables kept in memory after a checkpoint, unless configured otherwise.
+pub const DEFAULT_CACHE_INODES: usize = 256 * 1024;
 
 fn err(e: impl Into<redb::Error>) -> io::Error {
     io::Error::other(e.into())
@@ -94,7 +105,7 @@ pub fn load_checkpoint(root: &Path, store: &CatalogStore) -> io::Result<Catalog>
         None if legacy.exists() => parse(&fs::read(&legacy)?)?,
         None => Catalog::default(),
     };
-    c.fill_usage();
+    c.fill_usage().map_err(io::Error::other)?;
     Ok(c)
 }
 
@@ -110,6 +121,9 @@ pub fn remove_legacy_catalog(root: &Path) -> io::Result<()> {
 pub struct CatalogStore {
     db: Database,
     path: PathBuf,
+    cache_inodes: usize,
+    /// The snapshot the last load or checkpoint paged the catalog on.
+    last: Mutex<Option<Arc<StoreSnapshot>>>,
 }
 
 impl std::fmt::Debug for CatalogStore {
@@ -128,9 +142,47 @@ impl CatalogStore {
             fs::create_dir_all(dir)?;
         }
         Ok(Self {
-            db: Database::create(&path).map_err(err)?,
+            db: redb::Builder::new()
+                .set_cache_size(STORE_CACHE_BYTES)
+                .create(&path)
+                .map_err(err)?,
             path,
+            cache_inodes: DEFAULT_CACHE_INODES,
+            last: Mutex::new(None),
         })
+    }
+
+    /// How many unchanged inodes paged tables keep in memory (at least 64).
+    pub fn with_cache_inodes(mut self, n: usize) -> Self {
+        self.cache_inodes = n.max(64);
+        self
+    }
+
+    /// A snapshot of the store as it is now, with the still-valid part of the last one's cache:
+    /// everything but the inodes in `stale` and the filesystems in `stale_fs`.
+    fn snapshot(
+        &self,
+        stale: &BTreeSet<(FsId, u64)>,
+        stale_fs: &BTreeSet<FsId>,
+    ) -> io::Result<Arc<StoreSnapshot>> {
+        let mut cache = Lru::new(self.cache_inodes);
+        let mut last = lock(&self.last);
+        if let Some(old) = last.take() {
+            cache = std::mem::replace(&mut *lock(&old.cache), Lru::new(0));
+            for (fs, ino) in stale {
+                cache.take(fs, *ino);
+            }
+            if !stale_fs.is_empty() {
+                cache.retain(|k| !stale_fs.contains(&k.0));
+            }
+            cache.cap = self.cache_inodes;
+        }
+        let snap = Arc::new(StoreSnapshot {
+            tx: self.db.begin_read().map_err(err)?,
+            cache: Mutex::new(cache),
+        });
+        *last = Some(snap.clone());
+        Ok(snap)
     }
 
     pub fn path(&self) -> &Path {
@@ -160,72 +212,29 @@ impl CatalogStore {
         c.snapshots = read_table(&tx, SNAPSHOTS)?;
         c.extents = read_table(&tx, EXTENTS)?;
         c.fs_snapshots = read_table(&tx, FS_SNAPSHOTS)?;
-        let headers: BTreeMap<FsId, FsHeader> = read_table::<FsHeader>(&tx, FILESYSTEMS)?
+        let headers: Vec<FsHeader> = read_table::<FsHeader>(&tx, FILESYSTEMS)?
             .into_values()
-            .map(|h| (h.id.clone(), h))
             .collect();
-        let mut inodes: BTreeMap<FsId, BTreeMap<u64, Inode>> = BTreeMap::new();
-        match tx.open_table(INODES) {
-            Ok(t) => {
-                for row in t.iter().map_err(err)? {
-                    let (k, v) = row.map_err(err)?;
-                    let (fs, ino) = k.value();
-                    inodes
-                        .entry(fs.to_string())
-                        .or_default()
-                        .insert(ino, parse(v.value())?);
-                }
-            }
-            Err(TableError::TableDoesNotExist(_)) => {}
-            Err(e) => return Err(err(e)),
+        drop(tx);
+        let snap = self.snapshot(&BTreeSet::new(), &BTreeSet::new())?;
+        let mut filesystems = BTreeMap::new();
+        for h in headers {
+            let len = match h.inodes {
+                Some(n) => n,
+                None => snap.inos(&h.id)?.len() as u64,
+            };
+            let fs = FsMeta {
+                inodes: InodeTable::paged(h.id.clone(), snap.clone(), len),
+                id: h.id.clone(),
+                name: h.name,
+                next_ino: h.next_ino,
+                source_snapshot: h.source_snapshot,
+                extent_bytes: h.extent_bytes,
+                usage: h.usage,
+            };
+            filesystems.insert(h.id, fs);
         }
-        match tx.open_table(DIR_ENTRIES) {
-            Ok(t) => {
-                let mut dirs: BTreeMap<(String, u64), BTreeMap<String, u64>> = BTreeMap::new();
-                for row in t.iter().map_err(err)? {
-                    let (k, v) = row.map_err(err)?;
-                    let (fs, dir, name) = k.value();
-                    dirs.entry((fs.to_string(), dir))
-                        .or_default()
-                        .insert(name.to_string(), v.value());
-                }
-                for ((fs, dir), names) in dirs {
-                    let inode = inodes.get_mut(&fs).and_then(|m| m.get_mut(&dir));
-                    match inode.map(|i| &mut i.kind) {
-                        Some(InodeKind::Dir { entries, .. }) => *entries = names.into(),
-                        _ => {
-                            return Err(io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                format!(
-                                    "directory entries for {fs}/{dir}, which is not a directory"
-                                ),
-                            ))
-                        }
-                    }
-                }
-            }
-            Err(TableError::TableDoesNotExist(_)) => {}
-            Err(e) => return Err(err(e)),
-        }
-        c.filesystems = headers
-            .into_values()
-            .map(|h| {
-                let fs = FsMeta {
-                    inodes: inodes
-                        .remove(&h.id)
-                        .unwrap_or_default()
-                        .into_values()
-                        .collect(),
-                    id: h.id.clone(),
-                    name: h.name,
-                    next_ino: h.next_ino,
-                    source_snapshot: h.source_snapshot,
-                    extent_bytes: h.extent_bytes,
-                    usage: h.usage,
-                };
-                (h.id, fs)
-            })
-            .collect();
+        c.filesystems = filesystems.into();
         c.in_store = true;
         Ok(Some(c))
     }
@@ -258,12 +267,24 @@ impl CatalogStore {
             + write_filesystems(&tx, &c.filesystems, full)?;
         tx.commit().map_err(err)?;
 
+        let stale_fs: BTreeSet<FsId> = c.filesystems.replaced().iter().cloned().collect();
+        let stale: BTreeSet<(FsId, u64)> = c
+            .filesystems
+            .touched()
+            .iter()
+            .filter_map(|id| c.filesystems.get(id))
+            .flat_map(|f| f.inodes.touched().map(|ino| (f.id.clone(), ino)))
+            .collect();
         c.volumes.clear_changes();
         c.snapshots.clear_changes();
         c.extents.clear_changes();
         c.fs_snapshots.clear_changes();
         c.filesystems
             .clear_changes_with(|f| f.inodes.clear_changes());
+        let snap = self.snapshot(&stale, &stale_fs)?;
+        for f in c.filesystems.values_mut_quietly() {
+            f.inodes.attach(&f.id, snap.clone());
+        }
         c.in_store = true;
         Ok(records)
     }
@@ -382,10 +403,13 @@ fn write_filesystems(
             source_snapshot: f.source_snapshot.clone(),
             extent_bytes: f.extent_bytes,
             usage: f.usage,
+            inodes: Some(f.inodes.len()),
         })?;
         headers.insert(fs, header.as_slice()).map_err(err)?;
+        let all;
         let changed: Box<dyn Iterator<Item = u64>> = if rewrite {
-            Box::new(f.inodes.values().map(|i| i.ino))
+            all = f.inodes.scan().map_err(io::Error::other)?;
+            Box::new(all.iter().map(|i| i.ino))
         } else {
             Box::new(f.inodes.touched())
         };
@@ -398,7 +422,7 @@ fn write_filesystems(
                     .retain_in((fs, ino, "")..(fs, ino + 1, ""), |_, _| false)
                     .map_err(err)?;
             }
-            let Some(i) = f.inodes.get(ino) else {
+            let Some(i) = f.inodes.get(ino).map_err(io::Error::other)? else {
                 inodes.remove((fs, ino)).map_err(err)?;
                 continue;
             };
@@ -428,6 +452,151 @@ fn write_filesystems(
         }
     }
     Ok(n)
+}
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The store as of one checkpoint, which paged inode tables read, with a cache of the inodes
+/// read so far. A catalog cloned before a later checkpoint keeps reading this one.
+pub struct StoreSnapshot {
+    tx: redb::ReadTransaction,
+    cache: Mutex<Lru>,
+}
+
+impl StoreSnapshot {
+    pub(crate) fn get(&self, fs: &str, ino: u64) -> io::Result<Option<Arc<Inode>>> {
+        if let Some(i) = lock(&self.cache).get(fs, ino) {
+            return Ok(Some(i));
+        }
+        let Some(i) = self.read(fs, ino)? else {
+            return Ok(None);
+        };
+        let i = Arc::new(i);
+        self.put(fs, ino, i.clone());
+        Ok(Some(i))
+    }
+
+    /// As [`Self::get`] without filling the cache (a scan of a whole filesystem).
+    pub(crate) fn peek(&self, fs: &str, ino: u64) -> io::Result<Option<Arc<Inode>>> {
+        if let Some(i) = lock(&self.cache).get(fs, ino) {
+            return Ok(Some(i));
+        }
+        Ok(self.read(fs, ino)?.map(Arc::new))
+    }
+
+    /// The inode for an edit: out of the cache, so the caller holds the only reference.
+    pub(crate) fn take(&self, fs: &str, ino: u64) -> io::Result<Option<Arc<Inode>>> {
+        if let Some(i) = lock(&self.cache).take(fs, ino) {
+            return Ok(Some(i));
+        }
+        Ok(self.read(fs, ino)?.map(Arc::new))
+    }
+
+    pub(crate) fn put(&self, fs: &str, ino: u64, i: Arc<Inode>) {
+        lock(&self.cache).put((fs.to_string(), ino), i);
+    }
+
+    /// Every inode number of `fs`, in order.
+    pub(crate) fn inos(&self, fs: &str) -> io::Result<Vec<u64>> {
+        let t = match self.tx.open_table(INODES) {
+            Ok(t) => t,
+            Err(TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(err(e)),
+        };
+        let mut out = Vec::new();
+        for row in t.range((fs, 0)..=(fs, u64::MAX)).map_err(err)? {
+            out.push(row.map_err(err)?.0.value().1);
+        }
+        Ok(out)
+    }
+
+    fn read(&self, fs: &str, ino: u64) -> io::Result<Option<Inode>> {
+        let t = match self.tx.open_table(INODES) {
+            Ok(t) => t,
+            Err(TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(e) => return Err(err(e)),
+        };
+        let Some(v) = t.get((fs, ino)).map_err(err)? else {
+            return Ok(None);
+        };
+        let mut inode: Inode = parse(v.value())?;
+        if let InodeKind::Dir { entries, .. } = &mut inode.kind {
+            let mut names = BTreeMap::new();
+            match self.tx.open_table(DIR_ENTRIES) {
+                Ok(d) => {
+                    for row in d.range((fs, ino, "")..(fs, ino + 1, "")).map_err(err)? {
+                        let (k, v) = row.map_err(err)?;
+                        names.insert(k.value().2.to_string(), v.value());
+                    }
+                }
+                Err(TableError::TableDoesNotExist(_)) => {}
+                Err(e) => return Err(err(e)),
+            }
+            *entries = names.into();
+        }
+        Ok(Some(inode))
+    }
+}
+
+/// A least-recently-used map from `(filesystem, inode)` to inode.
+pub(crate) struct Lru {
+    cap: usize,
+    tick: u64,
+    map: HashMap<(FsId, u64), (Arc<Inode>, u64)>,
+    order: BTreeMap<u64, (FsId, u64)>,
+}
+
+impl Lru {
+    fn new(cap: usize) -> Self {
+        Self {
+            cap,
+            tick: 0,
+            map: HashMap::new(),
+            order: BTreeMap::new(),
+        }
+    }
+
+    fn get(&mut self, fs: &str, ino: u64) -> Option<Arc<Inode>> {
+        let k = (fs.to_string(), ino);
+        let (v, t) = self.map.get_mut(&k)?;
+        self.order.remove(t);
+        self.tick += 1;
+        *t = self.tick;
+        self.order.insert(self.tick, k);
+        Some(v.clone())
+    }
+
+    fn take(&mut self, fs: &str, ino: u64) -> Option<Arc<Inode>> {
+        let (v, t) = self.map.remove(&(fs.to_string(), ino))?;
+        self.order.remove(&t);
+        Some(v)
+    }
+
+    fn put(&mut self, k: (FsId, u64), v: Arc<Inode>) {
+        self.tick += 1;
+        if let Some((_, t)) = self.map.insert(k.clone(), (v, self.tick)) {
+            self.order.remove(&t);
+        }
+        self.order.insert(self.tick, k);
+        while self.map.len() > self.cap {
+            let Some((_, k)) = self.order.pop_first() else {
+                break;
+            };
+            self.map.remove(&k);
+        }
+    }
+
+    fn retain(&mut self, keep: impl Fn(&(FsId, u64)) -> bool) {
+        self.map.retain(|k, _| keep(k));
+        self.order.retain(|_, k| keep(k));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.map.len()
+    }
 }
 
 #[cfg(test)]
@@ -550,7 +719,7 @@ mod tests {
             now_ns: 6,
         });
         h.check();
-        assert!(!h.catalog.filesystems["f"].inodes.contains(a));
+        assert!(h.catalog.filesystems["f"].inodes.get(a).unwrap().is_none());
 
         // Renames across directories and an rmdir move and drop entry records.
         h.mknode("f", ROOT_INO, "gone", NodeType::Dir);
@@ -625,6 +794,116 @@ mod tests {
     }
 
     #[test]
+    fn a_paged_catalog_matches_one_kept_in_memory() {
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join(CATALOG_STORE);
+        let store = CatalogStore::open(&path).unwrap().with_cache_inodes(64);
+        let mut paged = Catalog::default();
+        let mut mem = Catalog::default();
+        let mut index = 0;
+        let mut run = |paged: &mut Catalog, mem: &mut Catalog, op: FsOp| {
+            index += 1;
+            let cmd = MetaCommand::Fs { op };
+            let a = paged.apply(1, index, &cmd).map_err(|e| e.to_string());
+            let b = mem.apply(1, index, &cmd).map_err(|e| e.to_string());
+            assert_eq!(a.is_ok(), b.is_ok(), "{cmd:?}: {a:?} vs {b:?}");
+        };
+        let mk = |parent: u64, name: String, node_type: NodeType| FsOp::Mknode {
+            fs: "f".into(),
+            parent,
+            op_id: name.clone(),
+            name,
+            node_type,
+            target: None,
+            rdev: 0,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            now_ns: 2,
+        };
+        run(
+            &mut paged,
+            &mut mem,
+            FsOp::CreateFs {
+                fs: "f".into(),
+                name: "f".into(),
+                now_ns: 1,
+                extent_bytes: None,
+            },
+        );
+        for d in 0..8u64 {
+            run(
+                &mut paged,
+                &mut mem,
+                mk(ROOT_INO, format!("d{d}"), NodeType::Dir),
+            );
+        }
+        for round in 0..6u64 {
+            for i in 0..100u64 {
+                let dir = 2 + (i * 7 + round) % 8;
+                run(
+                    &mut paged,
+                    &mut mem,
+                    mk(dir, format!("f{round}-{i}"), NodeType::File),
+                );
+                if i % 3 == 0 && round > 0 {
+                    run(
+                        &mut paged,
+                        &mut mem,
+                        FsOp::Unlink {
+                            fs: "f".into(),
+                            parent: dir,
+                            name: format!("f{}-{i}", round - 1),
+                            now_ns: 3,
+                        },
+                    );
+                }
+                if i % 5 == 0 {
+                    run(
+                        &mut paged,
+                        &mut mem,
+                        FsOp::Rename {
+                            fs: "f".into(),
+                            parent: dir,
+                            name: format!("f{round}-{i}"),
+                            new_parent: 2 + (dir + 1) % 8,
+                            new_name: format!("moved-{round}-{i}"),
+                            now_ns: 4,
+                        },
+                    );
+                }
+            }
+            if round == 3 {
+                run(
+                    &mut paged,
+                    &mut mem,
+                    FsOp::SnapshotFs {
+                        id: "s".into(),
+                        fs: "f".into(),
+                        name: "s".into(),
+                        now_ns: 5,
+                    },
+                );
+            }
+            store.checkpoint(&mut paged).unwrap();
+            assert!(lock(&lock(&store.last).as_ref().unwrap().cache).len() <= 64);
+            assert!(paged.filesystems["f"].inodes.len() > 64);
+            assert_eq!(
+                serde_json::to_value(&paged).unwrap(),
+                serde_json::to_value(&mem).unwrap()
+            );
+        }
+        drop(paged);
+        drop(store);
+        let store = CatalogStore::open(&path).unwrap();
+        let loaded = load_checkpoint(td.path(), &store).unwrap();
+        assert_eq!(
+            serde_json::to_value(&loaded).unwrap(),
+            serde_json::to_value(&mem).unwrap()
+        );
+    }
+
+    #[test]
     fn usage_missing_from_an_older_checkpoint_is_counted_on_load() {
         let mut h = Harness::new();
         h.fs(FsOp::CreateFs {
@@ -696,6 +975,77 @@ mod bench {
         metadata::MetaCommand,
         namespace::{FsOp, NodeType, ROOT_INO},
     };
+
+    fn peak_rss() -> String {
+        std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|s| {
+                s.lines()
+                    .find(|l| l.starts_with("VmHWM:"))
+                    .map(str::to_owned)
+            })
+            .unwrap_or_default()
+    }
+
+    /// Peak memory of a paged catalog with a small cache, files in one directory or spread
+    /// over `BENCH_DIRS` of them.
+    #[test]
+    #[ignore]
+    fn memory_of_a_paged_catalog() {
+        let td = tempfile::tempdir().unwrap();
+        let store = CatalogStore::open(td.path().join(CATALOG_STORE))
+            .unwrap()
+            .with_cache_inodes(4096);
+        let dirs: u64 = std::env::var("BENCH_DIRS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1);
+        let mut c = Catalog::default();
+        let mut index = 0;
+        let mut apply = |c: &mut Catalog, op: FsOp| {
+            index += 1;
+            c.apply(1, index, &MetaCommand::Fs { op }).unwrap();
+        };
+        let mk = |parent: u64, name: String, node_type: NodeType| FsOp::Mknode {
+            fs: "f".into(),
+            parent,
+            op_id: name.clone(),
+            name,
+            node_type,
+            target: None,
+            rdev: 0,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            now_ns: 2,
+        };
+        apply(
+            &mut c,
+            FsOp::CreateFs {
+                fs: "f".into(),
+                name: "f".into(),
+                now_ns: 1,
+                extent_bytes: None,
+            },
+        );
+        for d in 0..dirs.saturating_sub(1) {
+            apply(&mut c, mk(ROOT_INO, format!("d{d}"), NodeType::Dir));
+        }
+        for i in 0..400_000u64 {
+            let parent = if dirs == 1 {
+                ROOT_INO
+            } else {
+                2 + i % (dirs - 1)
+            };
+            apply(&mut c, mk(parent, format!("file-{i}"), NodeType::File));
+            if i % 1024 == 1023 {
+                store.checkpoint(&mut c).unwrap();
+            }
+            if i % 100_000 == 99_999 {
+                println!("{} files: {}", i + 1, peak_rss());
+            }
+        }
+    }
 
     /// `cargo test --release -p atlas-native --lib store::bench -- --ignored --nocapture`
     #[test]

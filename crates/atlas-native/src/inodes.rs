@@ -4,58 +4,147 @@
 //! A filesystem's inode table. Inodes are shared (`Arc`): a read hands out a reference without
 //! holding the table, and a snapshot or clone shares every inode until one side changes it.
 //! Changes are tracked for the catalog store like the catalog's other maps.
+//!
+//! Once the catalog store holds a filesystem, its table is paged: memory keeps only the inodes
+//! changed since the last checkpoint, and every other read goes to the store as of that
+//! checkpoint, through a bounded cache ([`StoreSnapshot`]).
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, fmt, io, sync::Arc};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{
-    namespace::{Inode, InodeKind},
+    metadata::MetaError,
+    namespace::{FsId, Inode, InodeKind},
+    store::StoreSnapshot,
     tracked::Tracked,
 };
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default)]
 pub struct InodeTable {
+    /// Every inode of an unpaged table; the inodes changed since the last checkpoint of a
+    /// paged one (an inode removed since is absent here but in the change record).
     map: Tracked<u64, Arc<Inode>>,
+    len: u64,
+    paged: Option<Paged>,
+}
+
+#[derive(Clone)]
+struct Paged {
+    fs: FsId,
+    store: Arc<StoreSnapshot>,
+}
+
+impl fmt::Debug for Paged {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Paged").field("fs", &self.fs).finish()
+    }
+}
+
+fn store_err(e: io::Error) -> MetaError {
+    MetaError::Store(e.to_string())
 }
 
 impl InodeTable {
-    pub fn get(&self, ino: u64) -> Option<Arc<Inode>> {
-        self.map.get(&ino).cloned()
+    /// A table of `len` inodes that the store holds.
+    pub(crate) fn paged(fs: FsId, store: Arc<StoreSnapshot>, len: u64) -> Self {
+        Self {
+            map: Tracked::default(),
+            len,
+            paged: Some(Paged { fs, store }),
+        }
     }
 
-    pub fn contains(&self, ino: u64) -> bool {
-        self.map.contains_key(&ino)
+    /// The unchanged store behind `ino`, unless the table changed it since the checkpoint.
+    fn behind(&self, ino: u64) -> Option<&Paged> {
+        self.paged
+            .as_ref()
+            .filter(|_| !self.map.touched().contains(&ino))
+    }
+
+    pub fn get(&self, ino: u64) -> Result<Option<Arc<Inode>>, MetaError> {
+        if let Some(i) = self.map.get(&ino) {
+            return Ok(Some(i.clone()));
+        }
+        match self.behind(ino) {
+            Some(p) => p.store.get(&p.fs, ino).map_err(store_err),
+            None => Ok(None),
+        }
     }
 
     pub fn len(&self) -> u64 {
-        self.map.len() as u64
+        self.len
     }
 
     pub fn is_empty(&self) -> bool {
-        self.map.is_empty()
+        self.len == 0
+    }
+
+    /// Brings `ino` into `map` to be changed; false if there is no such inode.
+    fn page_in(&mut self, ino: u64) -> Result<bool, MetaError> {
+        if self.map.contains_key(&ino) {
+            return Ok(true);
+        }
+        let Some(p) = self.behind(ino) else {
+            return Ok(false);
+        };
+        match p.store.take(&p.fs, ino).map_err(store_err)? {
+            Some(i) => {
+                self.map.insert_quietly(ino, i);
+                Ok(true)
+            }
+            None => Ok(false),
+        }
     }
 
     /// The inode to edit in place; copied first if a snapshot or a reader still shares it.
-    pub fn get_mut(&mut self, ino: u64) -> Option<&mut Inode> {
-        self.map.get_mut(&ino).map(Arc::make_mut)
+    pub fn get_mut(&mut self, ino: u64) -> Result<Option<&mut Inode>, MetaError> {
+        if !self.page_in(ino)? {
+            return Ok(None);
+        }
+        Ok(self.map.get_mut(&ino).map(Arc::make_mut))
     }
 
+    /// Adds a new inode (inode numbers are never reused).
     pub fn insert(&mut self, inode: Inode) {
-        self.map.insert(inode.ino, Arc::new(inode));
+        if self.map.insert(inode.ino, Arc::new(inode)).is_none() {
+            self.len += 1;
+        }
     }
 
-    pub fn remove(&mut self, ino: u64) -> Option<Inode> {
-        self.map.remove(&ino).map(Arc::unwrap_or_clone)
+    pub fn remove(&mut self, ino: u64) -> Result<Option<Inode>, MetaError> {
+        if !self.page_in(ino)? {
+            return Ok(None);
+        }
+        let i = self.map.remove(&ino).map(Arc::unwrap_or_clone);
+        if i.is_some() {
+            self.len -= 1;
+        }
+        Ok(i)
     }
 
-    /// Every inode, in inode order.
-    pub fn values(&self) -> impl Iterator<Item = &Inode> {
-        self.map.values().map(|i| &**i)
+    /// Every inode, in inode order (read from the store for a paged table, bypassing its cache).
+    pub fn scan(&self) -> Result<Vec<Arc<Inode>>, MetaError> {
+        let Some(p) = &self.paged else {
+            return Ok(self.map.values().cloned().collect());
+        };
+        let mut all = BTreeMap::new();
+        for ino in p.store.inos(&p.fs).map_err(store_err)? {
+            if self.map.touched().contains(&ino) {
+                continue;
+            }
+            if let Some(i) = p.store.peek(&p.fs, ino).map_err(store_err)? {
+                all.insert(ino, i);
+            }
+        }
+        all.extend(self.map.iter().map(|(k, v)| (*k, v.clone())));
+        Ok(all.into_values().collect())
     }
 
-    pub fn into_values(self) -> impl Iterator<Item = Inode> {
-        self.map.into_values().map(Arc::unwrap_or_clone)
+    /// The same inodes in memory, apart from the store and with no changes recorded (a
+    /// snapshot's frozen tree).
+    pub fn detached(&self) -> Result<Self, MetaError> {
+        Ok(self.scan()?.into_iter().map(Arc::unwrap_or_clone).collect())
     }
 
     /// Inodes changed since [`Self::clear_changes`].
@@ -79,19 +168,45 @@ impl InodeTable {
             }
         });
     }
+
+    /// Pages the table on `store`, which holds all of it, handing the inodes in memory to its
+    /// cache. Only after [`Self::clear_changes`].
+    pub(crate) fn attach(&mut self, fs: &FsId, store: Arc<StoreSnapshot>) {
+        debug_assert!(self.map.touched().is_empty());
+        for i in std::mem::take(&mut self.map).into_values() {
+            store.put(fs, i.ino, i);
+        }
+        self.paged = Some(Paged {
+            fs: fs.clone(),
+            store,
+        });
+    }
 }
 
 impl FromIterator<Inode> for InodeTable {
     fn from_iter<I: IntoIterator<Item = Inode>>(iter: I) -> Self {
+        let map: Tracked<u64, Arc<Inode>> =
+            iter.into_iter().map(|i| (i.ino, Arc::new(i))).collect();
         Self {
-            map: iter.into_iter().map(|i| (i.ino, Arc::new(i))).collect(),
+            len: map.len() as u64,
+            map,
+            paged: None,
         }
     }
 }
 
+/// Equality is over contents (read from the store where paged; a store error is inequality).
+impl PartialEq for InodeTable {
+    fn eq(&self, other: &Self) -> bool {
+        matches!((self.scan(), other.scan()), (Ok(a), Ok(b)) if a == b)
+    }
+}
+impl Eq for InodeTable {}
+
 impl Serialize for InodeTable {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        s.collect_map(self.map.iter().map(|(k, v)| (k, &**v)))
+        let all = self.scan().map_err(serde::ser::Error::custom)?;
+        s.collect_map(all.iter().map(|i| (i.ino, &**i)))
     }
 }
 

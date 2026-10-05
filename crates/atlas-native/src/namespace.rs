@@ -316,14 +316,14 @@ impl Inode {
 impl FsMeta {
     pub fn inode(&self, ino: u64) -> Result<Arc<Inode>, MetaError> {
         self.inodes
-            .get(ino)
+            .get(ino)?
             .ok_or_else(|| MetaError::NotFound(format!("inode {ino} in filesystem {}", self.id)))
     }
 
     fn inode_mut(&mut self, ino: u64) -> Result<&mut Inode, MetaError> {
         let id = &self.id;
         self.inodes
-            .get_mut(ino)
+            .get_mut(ino)?
             .ok_or_else(|| MetaError::NotFound(format!("inode {ino} in filesystem {id}")))
     }
 
@@ -367,7 +367,7 @@ impl FsMeta {
         i.nlink = i.nlink.saturating_sub(1);
         i.ctime_ns = now_ns;
         if i.nlink == 0 {
-            return Ok(self.inodes.remove(ino));
+            return self.inodes.remove(ino);
         }
         Ok(None)
     }
@@ -451,8 +451,8 @@ impl Catalog {
             .ok_or_else(|| MetaError::NotFound(format!("filesystem {fs}")))
     }
 
-    fn drop_inode(&mut self, inode: Inode, gc: &mut Vec<ExtentId>) -> Result<(), MetaError> {
-        if let InodeKind::File { extents, .. } = inode.kind {
+    fn drop_inode(&mut self, inode: &Inode, gc: &mut Vec<ExtentId>) -> Result<(), MetaError> {
+        if let InodeKind::File { extents, .. } = &inode.kind {
             for eid in extents.values() {
                 self.dec_ref(eid, gc)?;
             }
@@ -461,7 +461,8 @@ impl Catalog {
     }
 
     fn share_extents(&mut self, inodes: &InodeTable) -> Result<(), MetaError> {
-        for eid in file_extents(inodes.values()) {
+        let all = inodes.scan()?;
+        for eid in file_extents(all.iter().map(|i| &**i)) {
             self.extents
                 .get_mut(eid)
                 .ok_or_else(|| MetaError::NotFound(eid.clone()))?
@@ -492,24 +493,26 @@ impl Catalog {
     }
 
     /// Counts the usage of every filesystem and snapshot tree that doesn't keep it yet.
-    pub fn fill_usage(&mut self) {
-        let count = |c: &Catalog, f: &FsMeta| FsUsage {
-            file_bytes: f
-                .inodes
-                .values()
-                .filter(|i| matches!(i.kind, InodeKind::File { .. }))
-                .map(Inode::size)
-                .sum(),
-            used_bytes: file_extents(f.inodes.values())
-                .map(|e| c.extent_len(e))
-                .sum(),
+    pub fn fill_usage(&mut self) -> Result<(), MetaError> {
+        let count = |c: &Catalog, f: &FsMeta| -> Result<FsUsage, MetaError> {
+            let all = f.inodes.scan()?;
+            Ok(FsUsage {
+                file_bytes: all
+                    .iter()
+                    .filter(|i| matches!(i.kind, InodeKind::File { .. }))
+                    .map(|i| i.size())
+                    .sum(),
+                used_bytes: file_extents(all.iter().map(|i| &**i))
+                    .map(|e| c.extent_len(e))
+                    .sum(),
+            })
         };
         let fs: Vec<(FsId, FsUsage)> = self
             .filesystems
             .values()
             .filter(|f| f.usage.is_none())
-            .map(|f| (f.id.clone(), count(self, f)))
-            .collect();
+            .map(|f| Ok((f.id.clone(), count(self, f)?)))
+            .collect::<Result<_, MetaError>>()?;
         for (id, u) in fs {
             if let Some(f) = self.filesystems.get_mut(&id) {
                 f.usage = Some(u);
@@ -519,13 +522,14 @@ impl Catalog {
             .fs_snapshots
             .values()
             .filter(|s| s.tree.usage.is_none())
-            .map(|s| (s.id.clone(), count(self, &s.tree)))
-            .collect();
+            .map(|s| Ok((s.id.clone(), count(self, &s.tree)?)))
+            .collect::<Result<_, MetaError>>()?;
         for (id, u) in snaps {
             if let Some(s) = self.fs_snapshots.get_mut(&id) {
                 s.tree.usage = Some(u);
             }
         }
+        Ok(())
     }
 
     pub(crate) fn apply_fs(&mut self, op: &FsOp, gc: &mut Vec<ExtentId>) -> Result<(), MetaError> {
@@ -570,11 +574,9 @@ impl Catalog {
                 );
             }
             FsOp::DeleteFs { fs } => {
-                let f = self
-                    .filesystems
-                    .remove(fs)
-                    .ok_or_else(|| MetaError::NotFound(format!("filesystem {fs}")))?;
-                for inode in f.inodes.into_values() {
+                let all = self.filesystem(fs)?.inodes.scan()?;
+                self.filesystems.remove(fs);
+                for inode in &all {
                     self.drop_inode(inode, gc)?;
                 }
             }
@@ -674,7 +676,7 @@ impl Catalog {
                 f.dir_changed(*parent, 0, *now_ns)?;
                 if let Some(gone) = f.drop_link(ino, *now_ns)? {
                     self.forget_usage(fs, &gone);
-                    self.drop_inode(gone, gc)?;
+                    self.drop_inode(&gone, gc)?;
                 }
             }
             FsOp::Rmdir {
@@ -692,7 +694,7 @@ impl Catalog {
                 }
                 f.entries_mut(*parent)?.remove(name);
                 f.dir_changed(*parent, -1, *now_ns)?;
-                f.inodes.remove(ino);
+                f.inodes.remove(ino)?;
             }
             FsOp::Rename {
                 fs,
@@ -738,7 +740,7 @@ impl Catalog {
                     }
                     f.entries_mut(*new_parent)?.remove(new_name);
                     if dst_dir {
-                        f.inodes.remove(dst);
+                        f.inodes.remove(dst)?;
                         f.dir_changed(*new_parent, -1, *now_ns)?;
                     } else {
                         dropped = f.drop_link(dst, *now_ns)?;
@@ -756,7 +758,7 @@ impl Catalog {
                 }
                 if let Some(gone) = dropped {
                     self.forget_usage(fs, &gone);
-                    self.drop_inode(gone, gc)?;
+                    self.drop_inode(&gone, gc)?;
                 }
             }
             FsOp::SetAttr {
@@ -936,7 +938,11 @@ impl Catalog {
                     }
                     return Err(MetaError::Exists(format!("filesystem snapshot {id}")));
                 }
-                let tree = self.filesystem(fs)?.clone();
+                let f = self.filesystem(fs)?;
+                let tree = FsMeta {
+                    inodes: f.inodes.detached()?,
+                    ..f.clone()
+                };
                 self.share_extents(&tree.inodes)?;
                 self.fs_snapshots.insert(
                     id.clone(),
@@ -954,8 +960,8 @@ impl Catalog {
                     .fs_snapshots
                     .remove(id)
                     .ok_or_else(|| MetaError::NotFound(format!("filesystem snapshot {id}")))?;
-                for inode in s.tree.inodes.into_values() {
-                    self.drop_inode(inode, gc)?;
+                for inode in s.tree.inodes.scan()? {
+                    self.drop_inode(&inode, gc)?;
                 }
             }
             FsOp::CloneFs {
@@ -1024,7 +1030,7 @@ mod tests {
             for id in ids {
                 counted.fs_snapshots.get_mut(&id).unwrap().tree.usage = None;
             }
-            counted.fill_usage();
+            counted.fill_usage().unwrap();
             assert_eq!(
                 serde_json::to_value(&counted).unwrap(),
                 serde_json::to_value(&self.c).unwrap(),
