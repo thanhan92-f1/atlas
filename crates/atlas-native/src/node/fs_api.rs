@@ -3,35 +3,68 @@
 
 //! `/v1/fs/...`: the inode-based file API. Paths address inodes by number; names travel in JSON
 //! bodies (or a percent-encoded `name` query on lookup). A snapshot tree is read as `<fs>@<id>`.
-//! Only the metadata leader answers, unless a read passes `?barrier=1` (any replica, after a
-//! read barrier: still linearizable) or `?stale=1` (any replica, as far as it has applied).
+//! Only the leader of the metadata group holding the filesystem answers, unless a read passes
+//! `?barrier=1` (any replica, after a read barrier: still linearizable) or `?stale=1` (any
+//! replica, as far as it has applied). Listings span every group.
 
 use serde_json::json;
 
-use super::{body_json, client_id, query_u64, read_range, NodeShared};
+use super::{body_json, client_id, query_u64, read_range, MetaGroup, NodeShared};
 use crate::{
-    engine::{NativeEngine, NativeError, NewNode},
+    engine::{NativeEngine, NativeError, NewNode, ObjectKind},
     http::{Request, Response},
     namespace::{SetAttr, XattrMode},
 };
 
 type Routed = Result<Response, NativeError>;
 
-pub(super) fn route(sh: &NodeShared, e: &NativeEngine, req: &Request, segs: &[&str]) -> Routed {
+/// How current a request needs this replica's catalog of one group to be.
+fn gate(req: &Request, e: &NativeEngine) -> Result<(), NativeError> {
     // A follower's catalog can lag the leader, so a client could miss its own writes there.
     // `?barrier=1` first catches this replica up to the leader's commit index; `?stale=1` opts
     // into reading whatever it has applied.
     let get = req.method == "GET";
     if get && req.query.contains_key("barrier") {
-        e.read_barrier()?;
+        e.read_barrier()
     } else if !get || !req.query.contains_key("stale") {
-        e.ensure_leader()?;
+        e.ensure_leader()
+    } else {
+        Ok(())
     }
+}
+
+/// A listing over every group: with one group the usual gate, with several a read barrier on
+/// each (no node need lead them all) unless `?stale=1`.
+fn list<T>(
+    sh: &NodeShared,
+    req: &Request,
+    each: impl Fn(&NativeEngine) -> Result<Vec<T>, NativeError>,
+) -> Result<Vec<T>, NativeError> {
+    match sh.groups.as_slice() {
+        [g] => gate(req, &g.engine)?,
+        _ if req.query.contains_key("stale") => {}
+        _ => sh.barrier_all()?,
+    }
+    let mut all = Vec::new();
+    for g in &sh.groups {
+        all.extend(each(&g.engine)?);
+    }
+    Ok(all)
+}
+
+/// The group holding filesystem `fs` (`<fs>@<snapshot>` names a snapshot tree of it).
+fn fs_group<'a>(sh: &'a NodeShared, fs: &str) -> Result<(usize, &'a MetaGroup), NativeError> {
+    let id = fs.split_once('@').map_or(fs, |(fs, _)| fs);
+    sh.route(ObjectKind::Filesystem, id)
+}
+
+pub(super) fn route(sh: &NodeShared, req: &Request, segs: &[&str]) -> Routed {
     match (req.method.as_str(), segs) {
-        ("GET", ["v1", "fs"]) => Ok(Response::json(
-            200,
-            &json!({ "filesystems": e.filesystems()? }),
-        )),
+        ("GET", ["v1", "fs"]) => {
+            let mut all = list(sh, req, |e| e.filesystems())?;
+            all.sort_by(|a, b| a.id.cmp(&b.id));
+            Ok(Response::json(200, &json!({ "filesystems": all })))
+        }
         ("POST", ["v1", "fs"]) => {
             let body = parse(req)?;
             let name = str_field(&body, "name")?;
@@ -42,11 +75,67 @@ pub(super) fn route(sh: &NodeShared, e: &NativeEngine, req: &Request, segs: &[&s
                     NativeError::Invalid("extent_bytes must be an integer".into())
                 })?),
             };
+            let e = &sh.route(ObjectKind::Filesystem, &id)?.1.engine;
+            gate(req, e)?;
             Ok(Response::json(
                 201,
                 &json!({ "id": e.create_fs_with(id, name, extent_bytes)? }),
             ))
         }
+        ("GET", ["v1", "fs-snapshots"]) => {
+            let mut all = list(sh, req, |e| e.fs_snapshots())?;
+            all.sort_by(|a, b| a.id.cmp(&b.id));
+            Ok(Response::json(200, &json!({ "snapshots": all })))
+        }
+        (_, ["v1", "fs-snapshots", id, ..]) => {
+            let (g, group) = sh.route(ObjectKind::FsSnapshot, id)?;
+            gate(req, &group.engine)?;
+            snapshot_route(sh, &group.engine, g, req, segs)
+        }
+        (_, ["v1", "fs", fs, ..]) => {
+            let (g, group) = fs_group(sh, fs)?;
+            gate(req, &group.engine)?;
+            fs_route(sh, &group.engine, g, req, segs)
+        }
+        _ => Ok(Response::text(404, "no such route")),
+    }
+}
+
+fn snapshot_route(
+    sh: &NodeShared,
+    e: &NativeEngine,
+    group: usize,
+    req: &Request,
+    segs: &[&str],
+) -> Routed {
+    match (req.method.as_str(), segs) {
+        ("DELETE", ["v1", "fs-snapshots", id]) => {
+            e.delete_fs_snapshot(id)?;
+            Ok(Response::text(204, ""))
+        }
+        ("POST", ["v1", "fs-snapshots", id, "clone"]) => {
+            let body = parse(req)?;
+            let name = str_field(&body, "name")?;
+            let fid = client_id(&body).map_err(bad)?;
+            // A clone shares the snapshot's extents, so it lives in the snapshot's group.
+            sh.claim(ObjectKind::Filesystem, &fid, group)?;
+            Ok(Response::json(
+                201,
+                &json!({ "id": e.clone_fs_as(fid, id, name)? }),
+            ))
+        }
+        _ => Ok(Response::text(404, "no such route")),
+    }
+}
+
+fn fs_route(
+    sh: &NodeShared,
+    e: &NativeEngine,
+    group: usize,
+    req: &Request,
+    segs: &[&str],
+) -> Routed {
+    match (req.method.as_str(), segs) {
         ("DELETE", ["v1", "fs", fs]) => {
             e.delete_fs(fs)?;
             Ok(Response::text(204, ""))
@@ -67,26 +156,11 @@ pub(super) fn route(sh: &NodeShared, e: &NativeEngine, req: &Request, segs: &[&s
             let body = parse(req)?;
             let name = str_field(&body, "name")?;
             let id = client_id(&body).map_err(bad)?;
+            // A snapshot shares the filesystem's extents, so it lives in the filesystem's group.
+            sh.claim(ObjectKind::FsSnapshot, &id, group)?;
             Ok(Response::json(
                 201,
                 &json!({ "id": e.snapshot_fs_as(id, fs, name)? }),
-            ))
-        }
-        ("GET", ["v1", "fs-snapshots"]) => Ok(Response::json(
-            200,
-            &json!({ "snapshots": e.fs_snapshots()? }),
-        )),
-        ("DELETE", ["v1", "fs-snapshots", id]) => {
-            e.delete_fs_snapshot(id)?;
-            Ok(Response::text(204, ""))
-        }
-        ("POST", ["v1", "fs-snapshots", id, "clone"]) => {
-            let body = parse(req)?;
-            let name = str_field(&body, "name")?;
-            let fid = client_id(&body).map_err(bad)?;
-            Ok(Response::json(
-                201,
-                &json!({ "id": e.clone_fs_as(fid, id, name)? }),
             ))
         }
         (method, ["v1", "fs", fs, "inodes", ino, rest @ ..]) => {

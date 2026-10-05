@@ -254,7 +254,7 @@ impl NativeApi for HttpApi {
         let deadline = Instant::now() + ELECTION_WAIT;
         loop {
             let s: NodeStatus = self.get("/v1/status").await?;
-            let electing = s.metadata.as_ref().is_some_and(|m| m.leader.is_none());
+            let electing = s.leaderless_group().is_some();
             if !electing || Instant::now() >= deadline {
                 return Ok(s);
             }

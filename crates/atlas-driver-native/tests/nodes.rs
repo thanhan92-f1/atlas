@@ -95,6 +95,7 @@ impl Cluster {
                     proposal_timeout_ms: 3000,
                     repair_interval_secs: 0,
                     gc_interval_secs: 0,
+                    groups: 1,
                 });
                 let listeners = Listeners {
                     http: Some(bind()),
