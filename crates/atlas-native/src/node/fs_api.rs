@@ -255,10 +255,19 @@ fn inode_route(
             };
             leased(e.fs_getattr(fs, found.ino)?, lease)
         }
-        ("GET", ["entries"]) => Ok(Response::json(
-            200,
-            &json!({ "entries": e.fs_readdir(fs, ino)? }),
-        )),
+        ("GET", ["entries"]) => {
+            let after = req.query.get("after").map(|a| pct_decode(a)).transpose()?;
+            let limit = match req.query.get("limit") {
+                Some(l) => l.parse().map_err(|_| {
+                    NativeError::Invalid("query parameter limit must be an integer".into())
+                })?,
+                None => usize::MAX,
+            };
+            Ok(Response::json(
+                200,
+                &json!({ "entries": e.fs_readdir_page(fs, ino, after.as_deref(), limit)? }),
+            ))
+        }
         ("POST", ["entries"]) => {
             let node: NewNode = serde_json::from_slice(&req.body)
                 .map_err(|err| NativeError::Invalid(format!("invalid node: {err}")))?;

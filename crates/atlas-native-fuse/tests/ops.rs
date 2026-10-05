@@ -263,6 +263,18 @@ fn posix_operations_through_the_ops_layer() {
         .map(|e| e.name)
         .collect();
     assert_eq!(names, ["big.bin", "dir", "hard", "link", "moved.txt"]);
+    let mut paged = Vec::new();
+    let mut after = None;
+    loop {
+        let (page, next) = ops.readdir_page(ROOT_INO, after.as_deref(), 2).unwrap();
+        assert!(page.len() <= 2);
+        paged.extend(page.into_iter().map(|e| e.name));
+        match next {
+            Some(n) => after = Some(n),
+            None => break,
+        }
+    }
+    assert_eq!(paged, names);
 
     // A file unlinked while open stays readable through the handle until the last close.
     let o = ops

@@ -146,7 +146,7 @@ impl Outgoing {
                         continue;
                     };
                     let page = match self.catalog.filesystems.get(id) {
-                        Some(f) => f.inodes.page(*from, CHUNK_INODES)?,
+                        Some(f) => f.inodes.page_full(*from, CHUNK_INODES)?,
                         None => Vec::new(),
                     };
                     let next = match page.last() {
