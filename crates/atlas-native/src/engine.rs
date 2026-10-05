@@ -848,6 +848,16 @@ impl NativeEngine {
         Ok(())
     }
 
+    /// Waits until this replica's catalog reflects every metadata write committed before the
+    /// call, so reads served from it are linearizable on a follower too (see
+    /// [`RaftServer::read_barrier`]). A local engine is always current.
+    pub fn read_barrier(&self) -> Result<(), NativeError> {
+        if let Meta::Raft { server, timeout } = &self.meta {
+            server.read_barrier(*timeout)?;
+        }
+        Ok(())
+    }
+
     /// Volumes in the applied catalog, ordered by id.
     pub fn volumes(&self) -> Result<Vec<VolumeInfo>, NativeError> {
         self.with_catalog(|c| {

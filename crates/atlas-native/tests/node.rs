@@ -651,6 +651,27 @@ fn http_file_api_on_a_three_node_cluster() {
         .map(|e| e["name"].as_str().unwrap().to_string())
         .collect::<Vec<_>>();
     assert_eq!(names, ["d", "ln"]);
+
+    // After a read barrier any replica serves a read that sees the latest write, at once.
+    let (st, _) = call(
+        "POST",
+        "/v1/fs/f1/inodes/1/entries",
+        br#"{"name":"fresh","op_id":"o9","kind":"dir","mode":493}"#,
+    );
+    assert_eq!(st, 201);
+    for (id, addr) in c.meta_addrs() {
+        let (st, b) = api(
+            addr,
+            "GET",
+            "/v1/fs/f1/inodes/1/lookup?name=fresh&barrier=1",
+            b"",
+        );
+        assert_eq!(st, 200, "{id}: {}", String::from_utf8_lossy(&b));
+    }
+    assert_eq!(
+        call("POST", "/v1/fs/f1/inodes/1/rmdir", br#"{"name":"fresh"}"#).0,
+        204
+    );
     let (_, b) = call("GET", &format!("/v1/fs/f1/inodes/{l}/target"), b"");
     assert_eq!(json(&b)["target"], "d/my file é");
 
