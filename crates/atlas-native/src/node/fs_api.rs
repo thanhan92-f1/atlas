@@ -7,13 +7,19 @@
 //! `?barrier=1` (any replica, after a read barrier: still linearizable) or `?stale=1` (any
 //! replica, as far as it has applied). Listings span every group.
 
+use std::time::Duration;
+
 use serde_json::json;
 
-use super::{body_json, client_id, query_u64, read_range, MetaGroup, NodeShared};
+use super::{
+    body_json, cache_leases::Change, client_id, query_u64, read_range, MetaGroup, NodeShared,
+};
 use crate::{
-    engine::{NativeEngine, NativeError, NewNode, ObjectKind},
+    engine::{LockRequest, NativeEngine, NativeError, NewNode, ObjectKind},
     http::{Request, Response},
+    leases::{LockKind, Session},
     namespace::{SetAttr, XattrMode},
+    raft::Role,
 };
 
 type Routed = Result<Response, NativeError>;
@@ -135,21 +141,58 @@ fn fs_route(
     req: &Request,
     segs: &[&str],
 ) -> Routed {
+    let g = &sh.groups[group];
     match (req.method.as_str(), segs) {
         ("DELETE", ["v1", "fs", fs]) => {
             e.delete_fs(fs)?;
             Ok(Response::text(204, ""))
         }
         ("GET", ["v1", "fs", fs, "statfs"]) => Ok(Response::json(200, &json!(e.fs_statfs(fs)?))),
+        ("POST", ["v1", "fs", fs, "sessions"]) => {
+            let body = parse(req)?;
+            let id = str_field(&body, "session")?;
+            let cache = body["cache"].as_bool().unwrap_or(false);
+            let s = e.open_session(fs, id, u64_field(&body, "ttl_ms")?, cache)?;
+            Ok(session_json(id, s))
+        }
+        ("GET", ["v1", "fs", fs, "sessions", id, "recalls"]) => {
+            let wait = req
+                .query
+                .get("wait_ms")
+                .and_then(|w| w.parse().ok())
+                .map_or(Duration::ZERO, Duration::from_millis);
+            Ok(Response::json(
+                200,
+                &json!({ "inos": g.leases.recalls(fs, id, wait, &sh.stop)? }),
+            ))
+        }
+        ("POST", ["v1", "fs", fs, "sessions", id, "recalls", "done"]) => {
+            let inos: Vec<u64> = serde_json::from_value(parse(req)?["inos"].clone())
+                .map_err(|err| NativeError::Invalid(format!("body field \"inos\": {err}")))?;
+            g.leases.give_back(fs, id, &inos)?;
+            Ok(Response::text(204, ""))
+        }
+        ("POST", ["v1", "fs", _, "sessions", id, "renew"]) => {
+            Ok(session_json(id, e.renew_session(id)?))
+        }
+        ("DELETE", ["v1", "fs", _, "sessions", id]) => {
+            e.close_session(id)?;
+            g.leases.forget_session(id)?;
+            Ok(Response::text(204, ""))
+        }
+        ("GET", ["v1", "fs", fs, "locks"]) => Ok(Response::json(200, &json!(e.fs_locks(fs)?))),
         ("POST", ["v1", "fs", fs, "rename"]) => {
             let body = parse(req)?;
-            e.fs_rename(
-                fs,
-                u64_field(&body, "parent")?,
-                str_field(&body, "name")?,
+            let (parent, name) = (u64_field(&body, "parent")?, str_field(&body, "name")?);
+            let (new_parent, new_name) = (
                 u64_field(&body, "new_parent")?,
                 str_field(&body, "new_name")?,
-            )?;
+            );
+            let mut inos = vec![parent, new_parent];
+            inos.extend(child(e, fs, parent, name));
+            inos.extend(child(e, fs, new_parent, new_name));
+            let _change = change(g, req, fs, &inos)?;
+            e.fs_rename(fs, parent, name, new_parent, new_name)?;
             Ok(Response::text(204, ""))
         }
         ("POST", ["v1", "fs", fs, "snapshots"]) => {
@@ -167,7 +210,7 @@ fn fs_route(
             let ino: u64 = ino
                 .parse()
                 .map_err(|_| NativeError::Invalid(format!("inode {ino:?} is not a number")))?;
-            inode_route(sh, e, req, method, fs, ino, rest)
+            inode_route(sh, g, req, method, fs, ino, rest)
         }
         _ => Ok(Response::text(404, "no such route")),
     }
@@ -175,19 +218,25 @@ fn fs_route(
 
 fn inode_route(
     sh: &NodeShared,
-    e: &NativeEngine,
+    g: &MetaGroup,
     req: &Request,
     method: &str,
     fs: &str,
     ino: u64,
     rest: &[&str],
 ) -> Routed {
+    let e = &g.engine;
     let attr = |a| Ok(Response::json(200, &json!(a)));
+    let change = |inos: &[u64]| change(g, req, fs, inos);
     match (method, rest) {
-        ("GET", []) => attr(e.fs_getattr(fs, ino)?),
+        ("GET", []) => {
+            let lease = lease(g, req, fs, &[ino])?;
+            leased(e.fs_getattr(fs, ino)?, lease)
+        }
         ("POST", ["attr"]) => {
             let a: SetAttr = serde_json::from_slice(&req.body)
                 .map_err(|err| NativeError::Invalid(format!("invalid attributes: {err}")))?;
+            let _change = change(&[ino])?;
             attr(e.fs_setattr(fs, ino, a)?)
         }
         ("GET", ["lookup"]) => {
@@ -196,33 +245,58 @@ fn inode_route(
                 .get("name")
                 .ok_or_else(|| NativeError::Invalid("query parameter name is required".into()))
                 .and_then(|n| pct_decode(n))?;
-            attr(e.fs_lookup(fs, ino, &name)?)
+            // The directory's lease covers the name, the child's its attributes; each is read
+            // after its lease is granted.
+            let dir = lease(g, req, fs, &[ino])?;
+            let found = e.fs_lookup(fs, ino, &name)?;
+            let lease = match dir {
+                Some(_) => lease(g, req, fs, &[found.ino])?,
+                None => None,
+            };
+            leased(e.fs_getattr(fs, found.ino)?, lease)
         }
-        ("GET", ["entries"]) => Ok(Response::json(
-            200,
-            &json!({ "entries": e.fs_readdir(fs, ino)? }),
-        )),
+        ("GET", ["entries"]) => {
+            let after = req.query.get("after").map(|a| pct_decode(a)).transpose()?;
+            let limit = match req.query.get("limit") {
+                Some(l) => l.parse().map_err(|_| {
+                    NativeError::Invalid("query parameter limit must be an integer".into())
+                })?,
+                None => usize::MAX,
+            };
+            Ok(Response::json(
+                200,
+                &json!({ "entries": e.fs_readdir_page(fs, ino, after.as_deref(), limit)? }),
+            ))
+        }
         ("POST", ["entries"]) => {
             let node: NewNode = serde_json::from_slice(&req.body)
                 .map_err(|err| NativeError::Invalid(format!("invalid node: {err}")))?;
+            let _change = change(&[ino])?;
             Ok(Response::json(201, &json!(e.fs_mknode(fs, ino, node)?)))
         }
         ("POST", ["unlink"]) => {
-            e.fs_unlink(fs, ino, str_field(&parse(req)?, "name")?)?;
+            let body = parse(req)?;
+            let name = str_field(&body, "name")?;
+            let mut inos = vec![ino];
+            inos.extend(child(e, fs, ino, name));
+            let _change = change(&inos)?;
+            e.fs_unlink(fs, ino, name)?;
             Ok(Response::text(204, ""))
         }
         ("POST", ["rmdir"]) => {
-            e.fs_rmdir(fs, ino, str_field(&parse(req)?, "name")?)?;
+            let body = parse(req)?;
+            let name = str_field(&body, "name")?;
+            let mut inos = vec![ino];
+            inos.extend(child(e, fs, ino, name));
+            let _change = change(&inos)?;
+            e.fs_rmdir(fs, ino, name)?;
             Ok(Response::text(204, ""))
         }
         ("POST", ["links"]) => {
             let body = parse(req)?;
-            attr(e.fs_link(
-                fs,
-                ino,
-                u64_field(&body, "parent")?,
-                str_field(&body, "name")?,
-            )?)
+            let parent = u64_field(&body, "parent")?;
+            let _change = change(&[ino, parent])?;
+            attr(e.fs_link(fs, ino, parent, str_field(&body, "name")?)?)
         }
         ("GET", ["xattrs"]) => Ok(Response::json(
             200,
@@ -239,11 +313,59 @@ fn inode_route(
                 Some("replace") => XattrMode::Replace,
                 Some(m) => return Err(NativeError::Invalid(format!("unknown xattr mode {m:?}"))),
             };
+            let _change = change(&[ino])?;
             e.fs_setxattr(fs, ino, &pct_decode(name)?, &req.body, mode)?;
             Ok(Response::text(204, ""))
         }
         ("DELETE", ["xattrs", name]) => {
+            let _change = change(&[ino])?;
             e.fs_removexattr(fs, ino, &pct_decode(name)?)?;
+            Ok(Response::text(204, ""))
+        }
+        ("POST", ["locks"]) => {
+            let body = parse(req)?;
+            let kind = match str_field(&body, "kind")? {
+                "unlock" => None,
+                k => Some(lock_kind(k)?),
+            };
+            let (start, end) = lock_range(|k| body[k].as_u64())?;
+            e.set_lock(
+                fs,
+                ino,
+                LockRequest {
+                    session: str_field(&body, "session")?.into(),
+                    owner: u64_field(&body, "owner")?,
+                    kind,
+                    start,
+                    end,
+                    pid: body["pid"].as_u64().unwrap_or(0) as u32,
+                },
+            )?;
+            Ok(Response::text(204, ""))
+        }
+        ("GET", ["locks"]) => {
+            let q = |k: &str| req.query.get(k);
+            let num = |k: &str| q(k).and_then(|v| v.parse::<u64>().ok());
+            let session = q("session").ok_or_else(|| {
+                NativeError::Invalid("query parameter session is required".into())
+            })?;
+            let owner = num("owner")
+                .ok_or_else(|| NativeError::Invalid("query parameter owner is required".into()))?;
+            let kind = lock_kind(q("kind").map_or("write", String::as_str))?;
+            let (start, end) = lock_range(num)?;
+            Ok(Response::json(
+                200,
+                &json!({ "conflict": e.test_lock(fs, ino, session, owner, kind, start, end)? }),
+            ))
+        }
+        ("POST", ["locks", "release"]) => {
+            let body = parse(req)?;
+            e.release_lock_owner(
+                fs,
+                ino,
+                str_field(&body, "session")?,
+                u64_field(&body, "owner")?,
+            )?;
             Ok(Response::text(204, ""))
         }
         ("GET", ["target"]) => Ok(Response::json(
@@ -272,10 +394,90 @@ fn inode_route(
                 Ok(o) => o,
                 Err(r) => return Ok(r),
             };
+            let _change = change(&[ino])?;
             attr(e.write_file(fs, ino, offset, &req.body)?)
         }
         _ => Ok(Response::text(404, "no such route")),
     }
+}
+
+/// The client session a request comes from (`?session=`), if it names one.
+fn session_of(req: &Request) -> Option<&str> {
+    req.query.get("session").map(String::as_str)
+}
+
+/// The inode `name` in `dir` names, if any.
+fn child(e: &NativeEngine, fs: &str, dir: u64, name: &str) -> Option<u64> {
+    e.fs_lookup(fs, dir, name).ok().map(|a| a.ino)
+}
+
+/// Starts a change to `inos`, first recalling other sessions' cache leases on them.
+fn change<'a>(
+    g: &'a MetaGroup,
+    req: &Request,
+    fs: &str,
+    inos: &[u64],
+) -> Result<Change<'a>, NativeError> {
+    let term = g.raft.status()?.term;
+    let grace = g.engine.caching_since_before(term)?;
+    g.leases.begin(term, grace, fs, inos, session_of(req))
+}
+
+/// With `?lease=1&session=<id>` on the leader, grants the session a cache lease on `inos` once
+/// its leadership is confirmed; the caller reads what it returns after this.
+fn lease(
+    g: &MetaGroup,
+    req: &Request,
+    fs: &str,
+    inos: &[u64],
+) -> Result<Option<Duration>, NativeError> {
+    let Some(session) = session_of(req).filter(|_| req.query.contains_key("lease")) else {
+        return Ok(None);
+    };
+    if fs.contains('@') {
+        return Ok(None);
+    }
+    let status = g.raft.status()?;
+    if status.role != Role::Leader {
+        return Ok(None);
+    }
+    g.engine.session(session)?;
+    g.engine.read_barrier()?;
+    g.leases.grant(status.term, fs, inos, session)
+}
+
+/// Attributes, with the length of the cache lease granted on them if any.
+fn leased(a: impl serde::Serialize, lease: Option<Duration>) -> Routed {
+    let mut v = json!(a);
+    if let (Some(l), Some(o)) = (lease, v.as_object_mut()) {
+        o.insert("lease_ms".into(), json!(l.as_millis() as u64));
+    }
+    Ok(Response::json(200, &v))
+}
+
+fn session_json(id: &str, s: Session) -> Response {
+    Response::json(
+        200,
+        &json!({ "session": id, "ttl_ms": s.ttl_ms, "expires_ms": s.expires_ms }),
+    )
+}
+
+fn lock_kind(k: &str) -> Result<LockKind, NativeError> {
+    match k {
+        "read" => Ok(LockKind::Read),
+        "write" => Ok(LockKind::Write),
+        _ => Err(NativeError::Invalid(format!(
+            "lock kind must be read, write or unlock, not {k:?}"
+        ))),
+    }
+}
+
+/// `start` (default 0) and inclusive `end` (default end of file).
+fn lock_range(field: impl Fn(&str) -> Option<u64>) -> Result<(u64, u64), NativeError> {
+    Ok((
+        field("start").unwrap_or(0),
+        field("end").unwrap_or(u64::MAX),
+    ))
 }
 
 fn bad(r: Response) -> NativeError {

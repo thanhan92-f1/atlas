@@ -94,6 +94,7 @@ impl Outgoing {
                 })
                 .collect(),
             fs_snapshots: catalog.fs_snapshots.clone(),
+            leases: catalog.leases.clone(),
             in_store: false,
         };
         Self {
@@ -145,7 +146,7 @@ impl Outgoing {
                         continue;
                     };
                     let page = match self.catalog.filesystems.get(id) {
-                        Some(f) => f.inodes.page(*from, CHUNK_INODES)?,
+                        Some(f) => f.inodes.page_full(*from, CHUNK_INODES)?,
                         None => Vec::new(),
                     };
                     let next = match page.last() {

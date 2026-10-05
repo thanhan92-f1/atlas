@@ -254,16 +254,27 @@ impl NativeEngine {
         })
     }
 
+    /// Every entry of a directory.
     pub fn fs_readdir(&self, fs: &str, dir: u64) -> Result<Vec<DirEntry>, NativeError> {
+        self.fs_readdir_page(fs, dir, None, usize::MAX)
+    }
+
+    /// Up to `limit` entries of a directory named after `after`, in name order.
+    pub fn fs_readdir_page(
+        &self,
+        fs: &str,
+        dir: u64,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<DirEntry>, NativeError> {
         self.with_fs(fs, |_, f| {
-            f.dir(dir)?
-                .entries()
-                .iter()
+            f.entries(dir, after, limit)?
+                .into_iter()
                 .map(|(name, ino)| {
                     Ok(DirEntry {
-                        name: name.clone(),
-                        ino: *ino,
-                        kind: kind_of(f.inode(*ino)?.as_ref()),
+                        name,
+                        ino,
+                        kind: kind_of(f.inode(ino)?.as_ref()),
                     })
                 })
                 .collect()

@@ -41,8 +41,8 @@ store and then deletes `catalog.json`. The store is preferred whenever it holds 
 crash between those steps is harmless. There is no way back to `catalog.json`, so downgrading past
 this version means restoring a backup.
 
-A directory's inode record carries no entries; each entry is its own `(fs, dir, name) -> ino`
-record, so a create in a directory of any size checkpoints five records (state, filesystem header,
+A directory's inode record carries its entry count, not its entries; each entry is its own
+`(fs, dir, name) -> ino` record, so a create in a directory of any size checkpoints five records (state, filesystem header,
 new inode, directory inode, new entry). `NativeEngine::checkpoint` and Raft compaction write one
 redb transaction; `store::bench` (ignored) measures it at ~4–5 ms per 1024 creates from 8k to 65k
 inodes on tmpfs, growing only with the B-tree's depth.
@@ -62,18 +62,28 @@ copies. Each filesystem keeps `file_bytes` and `used_bytes` counters in every co
 and the filesystem list never walk the inodes. Catalogs written before the counters existed are
 counted once on load.
 
+Directory entries are paged the same way (`inodes::DirEntries`). Once the store holds a
+directory, its inode keeps only the entry count and the entries changed since the last checkpoint
+(a removal is remembered as a changed name with no entry). A lookup that memory can't answer reads
+the one `(fs, dir, name)` record, and a listing merges the changed names with a range read of the
+store, a page at a time (`GET .../entries?after=&limit=`). A checkpoint writes the changed entries
+and drops them from memory. A snapshot tree, a Raft snapshot chunk and the debug-build
+consistency check read directories whole (`InodeTable::full`). Inode records written before
+entries were paged hold `{}` in place of the count; their entries are counted when the inode is
+read, until the directory is next written.
+
 A store read error while applying a command panics: the command may be half applied, and a
 replica that could read its store would accept it. A restart recovers from the checkpoint and the
 log. A read error on a read path is returned to the caller.
 
 `metadata_bench` (local engine, second lab host): ~100k creates/s from one thread at 40k files
 with either a 4096-inode or a 262,144-inode cache. `store::bench::memory_of_a_paged_catalog`
-(4096-inode cache, 400k files, one directory or 1000) peaks at ~112 MB, growing ~9 MB per 100k
-files at the end as redb's 64 MiB page cache fills.
+(4096-inode cache, 400k files, second lab host) peaks at ~76 MB with every file in one directory
+and ~78 MB spread over 1000, flat from 300k files on as redb's 64 MiB page cache fills. Before
+directory entries were paged, the same runs peaked at 112–114 MB and were still growing.
 
 Limits: filesystem snapshot trees are still held in memory in full (one `fs_snapshots` record
-each), and a directory's entries are paged in with it as a whole. Checkpoints run on the commit
-path, under the catalog lock.
+each). Checkpoints run on the commit path, under the catalog lock.
 
 ## Checkpoint and WAL compaction
 
@@ -203,6 +213,34 @@ connection that carries one, so upgrade every replica before relying on barriers
 redirect, and leader shutdown, failover and rejoin from disk. `tests/raft_groups.rs` runs three
 groups on each node's one listener: they replicate independently, and one group failing over (its
 leader's server stopped, the listener kept) leaves the other groups' leaders and terms alone.
+
+### Client sessions and file locks (`leases` module)
+
+`MetaCommand::Lease` carries session and lock changes: `Open` (create or renew with a TTL),
+`Renew`, `Close`, `Expire{now_ms}`, `Lock` (POSIX `F_SETLK` over an inclusive byte range for one
+`(session, owner)`: the owner's overlapping locks are split or replaced, same-kind neighbours
+merged; another owner's overlapping lock, where either side is a write lock, rejects it with
+`locked`) and `ReleaseOwner`. Every time is the proposing leader's wall clock, carried in the
+command, so replicas agree. The leader validates a lock against its speculative catalog, so a
+conflicting lock is refused without appending anything.
+
+Sessions and locks live in `Catalog::leases`, which is written whole into the store's state
+record at each checkpoint and shipped in a Raft snapshot's header; deleting a filesystem drops
+its locks. Each metadata group leader proposes `Expire` once a second when a session's
+`expires_ms` has passed. A new leader first waits out the longest TTL of any open session from
+when it took over: every live session has then been renewed against its own clock, so a clock
+that runs ahead of the previous leader's cannot expire a live client. Limits: TTL 1–300 s,
+65 536 sessions per group, 4 096 locks per session.
+
+Cache leases (`node::cache_leases`) are not replicated: the leader keeps them in memory. A
+leased read first confirms leadership with a read barrier, then registers the lease, then reads
+what it returns. A change first marks its inodes (no lease is granted on them until it commits),
+recalls every other session's unexpired lease on them and waits for each to be given back or run
+out. A lease from an earlier term is covered by the grace period instead: a new leader, while a
+caching session opened before its term is open (`Session::term`), holds changes back for one
+lease (5 s) from when it first serves a lease operation. Because the old leader confirmed its
+leadership after the client sent its request, the client's lease (counted from the send) ends
+before that grace does.
 
 ### Namespace sharding (`node::shards`)
 
@@ -372,7 +410,9 @@ Not implemented yet:
   replayed from the WAL);
 - incremental checkpoints read back identical to the in-memory catalog across edits, removals,
   snapshots, clones and a filesystem deleted and recreated under the same id; a paged catalog
-  matches an unpaged twin across checkpoints and a reload; a chunked Raft snapshot through the
+  matches an unpaged twin across checkpoints and a reload; a 2000-entry directory keeps only its
+  uncheckpointed changes in memory, pages by name to exactly its entries, and an inode record
+  from before entries were paged is counted on read; a chunked Raft snapshot through the
   wire encoding loads identical to the leader's catalog, and a lagging follower cut off mid-transfer
   still converges and survives a restart; a legacy `catalog.json` migrates into the store;
 - torn final WAL record;

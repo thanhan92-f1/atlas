@@ -680,6 +680,23 @@ fn http_file_api_on_a_three_node_cluster() {
         .map(|e| e["name"].as_str().unwrap().to_string())
         .collect::<Vec<_>>();
     assert_eq!(names, ["d", "ln"]);
+    let page = |q: &str| {
+        let (st, b) = call("GET", &format!("/v1/fs/f1/inodes/1/entries?{q}"), b"");
+        assert_eq!(st, 200, "{q}");
+        json(&b)["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["name"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(page("limit=1"), ["d"]);
+    assert_eq!(page("limit=1&after=d"), ["ln"]);
+    assert!(page("limit=5&after=ln").is_empty());
+    assert_eq!(
+        call("GET", "/v1/fs/f1/inodes/1/entries?limit=x", b"").0,
+        400
+    );
 
     // After a read barrier any replica serves a read that sees the latest write, at once.
     let (st, _) = call(
@@ -1014,4 +1031,199 @@ fn http_members_change_reaches_every_raft_group() {
         let body = format!(r#"{{"id":"after{v}","name":"after","size_bytes":4096}}"#);
         c.on_leader("POST", "/v1/volumes", body.as_bytes(), 201);
     }
+}
+
+#[test]
+fn http_sessions_and_file_locks_survive_failover_and_expire() {
+    let mut c = Cluster::start(3, 3, 0);
+    c.on_leader("POST", "/v1/fs", br#"{"id":"lk","name":"locks"}"#, 201);
+    let (_, b) = c.on_leader(
+        "POST",
+        "/v1/fs/lk/inodes/1/entries",
+        br#"{"name":"f","op_id":"o1","kind":"file","mode":420}"#,
+        201,
+    );
+    let ino = json(&b)["ino"].as_u64().unwrap();
+    let locks = format!("/v1/fs/lk/inodes/{ino}/locks");
+    let lock = |session: &str, kind: &str, start: u64, end: u64| {
+        format!(
+            r#"{{"session":"{session}","owner":1,"kind":"{kind}","start":{start},"end":{end},"pid":7}}"#
+        )
+    };
+    for s in ["a", "b"] {
+        let body = format!(r#"{{"session":"{s}","ttl_ms":60000}}"#);
+        let (_, b) = c.on_leader("POST", "/v1/fs/lk/sessions", body.as_bytes(), 200);
+        assert_eq!(json(&b)["ttl_ms"], 60000);
+    }
+
+    let (leader, _) = c.on_leader("POST", &locks, lock("a", "write", 0, 99).as_bytes(), 204);
+    let (st, b) = c.on_leader_any("POST", &locks, lock("b", "write", 50, 60).as_bytes());
+    assert_eq!((st, json(&b)["code"].as_str()), (409, Some("locked")));
+    c.on_leader("POST", &locks, lock("b", "read", 100, 199).as_bytes(), 204);
+    let (st, b) = c.on_leader_any("POST", &locks, lock("zz", "read", 0, 0).as_bytes());
+    assert_eq!((st, json(&b)["code"].as_str()), (410, Some("no_session")));
+    let (st, b) = c.on_leader_any(
+        "POST",
+        "/v1/fs/lk/inodes/1/locks",
+        lock("a", "read", 0, 0).as_bytes(),
+    );
+    assert_eq!(st, 409, "a directory: {}", String::from_utf8_lossy(&b));
+    let test = format!("{locks}?session=b&owner=1&kind=write&start=0&end=10");
+    let (_, b) = c.on_leader("GET", &test, b"", 200);
+    let conflict = &json(&b)["conflict"];
+    assert_eq!(
+        (&conflict["session"], &conflict["pid"]),
+        (&serde_json::json!("a"), &serde_json::json!(7))
+    );
+
+    // Locks are replicated: a new leader enforces them.
+    c.meta.insert(leader, None);
+    let (st, _) = c.on_leader_any("POST", &locks, lock("b", "write", 50, 60).as_bytes());
+    assert_eq!(st, 409);
+    // Closing a session releases its locks.
+    c.on_leader("DELETE", "/v1/fs/lk/sessions/a", b"", 204);
+    c.on_leader("POST", &locks, lock("b", "write", 50, 60).as_bytes(), 204);
+    c.on_leader("DELETE", "/v1/fs/lk/sessions/b", b"", 204);
+
+    // A session that stops renewing is expired with its locks.
+    c.on_leader(
+        "POST",
+        "/v1/fs/lk/sessions",
+        br#"{"session":"c","ttl_ms":1000}"#,
+        200,
+    );
+    c.on_leader("POST", &locks, lock("c", "write", 0, 9).as_bytes(), 204);
+    let (_, b) = c.on_leader("GET", "/v1/fs/lk/locks", b"", 200);
+    assert_eq!(json(&b)["locks"].as_array().unwrap().len(), 1);
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let (_, b) = c.on_leader("GET", "/v1/fs/lk/locks", b"", 200);
+        if json(&b)["locks"].as_array().unwrap().is_empty() {
+            assert_eq!(json(&b)["sessions"], 0);
+            break;
+        }
+        assert!(Instant::now() < deadline, "session c never expired");
+        thread::sleep(Duration::from_millis(100));
+    }
+    let (st, _) = c.on_leader_any("POST", "/v1/fs/lk/sessions/c/renew", b"");
+    assert_eq!(st, 410);
+    let expired: u64 = c
+        .meta_addrs()
+        .into_iter()
+        .map(|(_, addr)| {
+            let m = String::from_utf8(api(addr, "GET", "/metrics", b"").1).unwrap();
+            m.lines()
+                .find(|l| l.starts_with("atlas_native_client_sessions_expired_total"))
+                .and_then(|l| l.rsplit(' ').next()?.parse().ok())
+                .unwrap_or(0)
+        })
+        .sum();
+    assert_eq!(expired, 1);
+}
+
+#[test]
+fn http_cache_leases_are_recalled_and_outlive_a_leader_change() {
+    let mut c = Cluster::start(3, 3, 0);
+    c.on_leader("POST", "/v1/fs", br#"{"id":"cl","name":"leases"}"#, 201);
+    let (_, b) = c.on_leader(
+        "POST",
+        "/v1/fs/cl/inodes/1/entries",
+        br#"{"name":"f","op_id":"o1","kind":"file","mode":420}"#,
+        201,
+    );
+    let ino = json(&b)["ino"].as_u64().unwrap();
+    c.on_leader(
+        "POST",
+        "/v1/fs/cl/sessions",
+        br#"{"session":"x","ttl_ms":60000,"cache":true}"#,
+        200,
+    );
+    // Without a session nothing is leased; with one the reply says for how long.
+    let (_, b) = c.on_leader("GET", &format!("/v1/fs/cl/inodes/{ino}?lease=1"), b"", 200);
+    assert!(json(&b).get("lease_ms").is_none());
+    let (st, _) = c.on_leader_any(
+        "GET",
+        &format!("/v1/fs/cl/inodes/{ino}?lease=1&session=nope"),
+        b"",
+    );
+    assert_eq!(st, 410);
+    let (leader, b) = c.on_leader(
+        "GET",
+        "/v1/fs/cl/inodes/1/lookup?name=f&lease=1&session=x",
+        b"",
+        200,
+    );
+    assert_eq!(json(&b)["lease_ms"], 5000);
+    let addr = c
+        .meta_addrs()
+        .into_iter()
+        .find(|(id, _)| *id == leader)
+        .unwrap()
+        .1;
+
+    // A write waits until the holder gives its lease back.
+    let started = Instant::now();
+    let writer = thread::spawn(move || {
+        let (st, _) = api(
+            addr,
+            "PUT",
+            &format!("/v1/fs/cl/inodes/{ino}/data?offset=0"),
+            b"new",
+        );
+        (st, started.elapsed())
+    });
+    let (st, b) = api(
+        addr,
+        "GET",
+        "/v1/fs/cl/sessions/x/recalls?wait_ms=5000",
+        b"",
+    );
+    assert_eq!(st, 200);
+    assert_eq!(json(&b)["inos"], serde_json::json!([ino]));
+    thread::sleep(Duration::from_millis(200));
+    assert!(
+        !writer.is_finished(),
+        "the write did not wait for the recall"
+    );
+    let body = format!(r#"{{"inos":[{ino}]}}"#);
+    let (st, _) = api(
+        addr,
+        "POST",
+        "/v1/fs/cl/sessions/x/recalls/done",
+        body.as_bytes(),
+    );
+    assert_eq!(st, 204);
+    let (st, waited) = writer.join().unwrap();
+    assert_eq!(st, 200);
+    assert!(waited < Duration::from_secs(3), "{waited:?}");
+    // The holder's own changes are not held up by its lease.
+    c.on_leader(
+        "GET",
+        &format!("/v1/fs/cl/inodes/{ino}?lease=1&session=x"),
+        b"",
+        200,
+    );
+    let started = Instant::now();
+    c.on_leader(
+        "PUT",
+        &format!("/v1/fs/cl/inodes/{ino}/data?offset=0&session=x"),
+        b"own",
+        200,
+    );
+    assert!(started.elapsed() < Duration::from_secs(2));
+
+    // A new leader cannot know its predecessor's leases, so it holds changes back for one lease.
+    c.meta.insert(leader, None);
+    let started = Instant::now();
+    c.on_leader(
+        "PUT",
+        &format!("/v1/fs/cl/inodes/{ino}/data?offset=0"),
+        b"after",
+        200,
+    );
+    assert!(
+        started.elapsed() >= Duration::from_secs(4),
+        "{:?}",
+        started.elapsed()
+    );
 }

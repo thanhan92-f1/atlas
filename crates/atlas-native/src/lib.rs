@@ -20,6 +20,7 @@ pub mod engine;
 pub mod gc;
 pub mod http;
 pub mod inodes;
+pub mod leases;
 pub mod membership;
 pub mod metadata;
 pub mod metrics;

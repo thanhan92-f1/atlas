@@ -263,6 +263,18 @@ fn posix_operations_through_the_ops_layer() {
         .map(|e| e.name)
         .collect();
     assert_eq!(names, ["big.bin", "dir", "hard", "link", "moved.txt"]);
+    let mut paged = Vec::new();
+    let mut after = None;
+    loop {
+        let (page, next) = ops.readdir_page(ROOT_INO, after.as_deref(), 2).unwrap();
+        assert!(page.len() <= 2);
+        paged.extend(page.into_iter().map(|e| e.name));
+        match next {
+            Some(n) => after = Some(n),
+            None => break,
+        }
+    }
+    assert_eq!(paged, names);
 
     // A file unlinked while open stays readable through the handle until the last close.
     let o = ops
@@ -616,4 +628,122 @@ fn extended_attributes_round_trip_and_follow_snapshots() {
         snap.setxattr(f.ino, "user.n", b"x", false, false),
         Err(libc::EROFS)
     );
+}
+
+#[test]
+fn file_locks_are_seen_by_every_mount() {
+    let c = Cluster::start();
+    create_fs(&c, "lk");
+    let a = mount(&c, "lk", OpsConfig::default());
+    let b = mount(&c, "lk", OpsConfig::default());
+    let f = a
+        .mknode(ROOT_INO, "f", NodeType::File, None, 0o644, 0, 0)
+        .unwrap();
+    use atlas_native_fuse::locks::{F_RDLCK as rd, F_UNLCK as un, F_WRLCK as wr};
+    assert_eq!(a.lock_session(), None, "no session before the first lock");
+    a.setlk(f.ino, 1, 0, 99, wr, 11, false).unwrap();
+    assert!(a.lock_session().is_some());
+    // Same lock owner number, other mount: still another owner.
+    assert_eq!(b.setlk(f.ino, 1, 50, 50, rd, 22, false), Err(libc::EAGAIN));
+    let conflict = b.getlk(f.ino, 1, 0, u64::MAX, rd).unwrap().unwrap();
+    assert_eq!(
+        (conflict.start, conflict.end, conflict.typ, conflict.pid),
+        (0, 99, wr, 11)
+    );
+    assert_eq!(b.getlk(f.ino, 1, 100, 200, wr).unwrap(), None);
+    b.setlk(f.ino, 1, 100, u64::MAX, rd, 22, false).unwrap();
+
+    // A blocking request waits until the holder lets go (here: closes the file).
+    let waiter = std::thread::scope(|s| {
+        let t = s.spawn(|| b.setlk(f.ino, 2, 0, 9, wr, 22, true));
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!t.is_finished());
+        a.release_locks(f.ino, 1).unwrap();
+        t.join().unwrap()
+    });
+    waiter.unwrap();
+    assert_eq!(a.setlk(f.ino, 1, 0, 0, rd, 11, false), Err(libc::EAGAIN));
+    b.setlk(f.ino, 2, 0, u64::MAX, un, 22, false).unwrap();
+    a.setlk(f.ino, 1, 0, 0, rd, 11, false).unwrap();
+
+    // Unmounting closes the session and releases what it held.
+    a.close_session();
+    drop(a);
+    b.setlk(f.ino, 3, 0, u64::MAX, wr, 22, false).unwrap_err();
+    b.setlk(f.ino, 1, 0, u64::MAX, wr, 22, false).unwrap();
+
+    // A snapshot mount never conflicts: nothing writes there.
+    let snap = mount(&c, "lk@none", OpsConfig::default());
+    assert_eq!(snap.getlk(f.ino, 1, 0, 9, wr), Ok(None));
+    assert_eq!(snap.lock_sessions_lost(), 0);
+}
+
+#[test]
+fn cache_leases_are_recalled_before_another_mount_changes_anything() {
+    let c = Cluster::start();
+    create_fs(&c, "cl");
+    let leased = OpsConfig {
+        cache_leases: true,
+        writeback_bytes: 0,
+        ..OpsConfig::default()
+    };
+    let a = mount(&c, "cl", leased.clone());
+    let b = mount(&c, "cl", leased);
+    assert_eq!(a.kernel_ttl(), Duration::ZERO);
+    let f = a
+        .mknode(ROOT_INO, "f", NodeType::File, None, 0o644, 0, 0)
+        .unwrap();
+    assert_eq!(b.lookup(ROOT_INO, "f").unwrap().size, 0);
+    assert_eq!(b.getattr(f.ino).unwrap().size, 0);
+    let held: u64 = c
+        .endpoints()
+        .iter()
+        .map(|e| {
+            let mut cfg = ClientConfig::new(vec![e.clone()]);
+            cfg.token = Some(TOKEN.into());
+            let m = Client::new(cfg)
+                .unwrap()
+                .request(Method::GET, "/metrics", Body::Empty, Retry::Idempotent)
+                .unwrap();
+            String::from_utf8(m)
+                .unwrap()
+                .lines()
+                .filter(|l| l.starts_with("atlas_native_cache_leases{"))
+                .filter_map(|l| l.rsplit(' ').next()?.parse::<u64>().ok())
+                .sum::<u64>()
+        })
+        .sum();
+    assert!(held >= 2, "leases on the root and the file: {held}");
+
+    // Each change waits for b to drop what it cached, so b never sees the old state, and b's
+    // recall thread answers well within the lease.
+    let started = std::time::Instant::now();
+    a.write(f.ino, 0, b"hello").unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(b.getattr(f.ino).unwrap().size, 5);
+    a.rename(ROOT_INO, "f", ROOT_INO, "g").unwrap();
+    assert_eq!(b.lookup(ROOT_INO, "f"), Err(libc::ENOENT));
+    assert_eq!(b.lookup(ROOT_INO, "g").unwrap().ino, f.ino);
+    a.setattr(
+        f.ino,
+        SetAttr {
+            mode: Some(0o600),
+            ..SetAttr::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(b.getattr(f.ino).unwrap().mode & 0o777, 0o600);
+    a.unlink(ROOT_INO, "g").unwrap();
+    assert_eq!(b.lookup(ROOT_INO, "g"), Err(libc::ENOENT));
+    // A mount's own changes do not wait on its own leases and show at once.
+    let h = b
+        .mknode(ROOT_INO, "h", NodeType::File, None, 0o644, 0, 0)
+        .unwrap();
+    b.write(h.ino, 0, b"own").unwrap();
+    assert_eq!(b.getattr(h.ino).unwrap().size, 3);
+    assert_eq!(a.lookup(ROOT_INO, "h").unwrap().size, 3);
 }

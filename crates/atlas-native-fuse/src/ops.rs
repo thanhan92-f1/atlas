@@ -3,13 +3,14 @@
 
 //! Filesystem operations against one native filesystem, independent of the kernel interface:
 //! every call returns a value or an errno. Attributes and name lookups are cached for a short
-//! TTL; writes are buffered per inode and sent on fsync, close, a non-sequential write, or once
-//! a run reaches the flush size.
+//! TTL, or with cache leases for as long as the cluster's lease on them lasts (a change by
+//! another client recalls it first); writes are buffered per inode and sent on fsync, close, a
+//! non-sequential write, or once a run reaches the flush size.
 
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use atlas_native::{
@@ -23,6 +24,7 @@ use serde_json::json;
 use crate::{
     cache::TtlCache,
     client::{encode, Body, Client, Error, Retry},
+    locks::{Conflict, Locks, Recall},
     writeback::{Dirty, WriteBack},
 };
 
@@ -44,6 +46,14 @@ pub struct OpsConfig {
     pub readahead_bytes: usize,
     /// Read file data straight from the data nodes instead of through the metadata leader.
     pub direct_reads: Option<DirectReads>,
+    /// Lease of the session holding this mount's file locks; renewed every third of it.
+    pub session_ttl: Duration,
+    /// Blocking lock requests (`F_SETLKW`) allowed to wait at once; keep it below the kernel
+    /// worker threads so waiters never block the unlock they wait for.
+    pub lock_waiters: usize,
+    /// Cache attributes and names under cache leases instead of for `ttl`: nothing cached is
+    /// ever stale, and the kernel is given a zero TTL so every lookup reaches this cache.
+    pub cache_leases: bool,
 }
 
 impl Default for OpsConfig {
@@ -54,6 +64,9 @@ impl Default for OpsConfig {
             max_io_bytes: 8 << 20,
             readahead_bytes: 4 << 20,
             direct_reads: None,
+            session_ttl: Duration::from_secs(15),
+            lock_waiters: 3,
+            cache_leases: false,
         }
     }
 }
@@ -73,12 +86,15 @@ pub struct DirectReads {
 const DIRECT_PARALLELISM: usize = 8;
 
 pub struct Ops {
-    client: Client,
+    client: Arc<Client>,
     /// `<fs>` or `<fs>@<snapshot>` (read-only).
     fs: String,
     pub cfg: OpsConfig,
-    attrs: Mutex<TtlCache<u64, Attr>>,
-    names: Mutex<TtlCache<(u64, String), u64>>,
+    attrs: Arc<Mutex<TtlCache<u64, Attr>>>,
+    names: Arc<Mutex<TtlCache<(u64, String), u64>>>,
+    /// When each inode's cache lease was last recalled: a leased reply to a request sent
+    /// before that is not cached.
+    recalled: Arc<Mutex<HashMap<u64, Instant>>>,
     dirty: Mutex<WriteBack>,
     readahead: Mutex<TtlCache<u64, Window>>,
     /// Where each inode's last read ended: only a read that continues there reads ahead.
@@ -91,6 +107,7 @@ pub struct Ops {
     /// Data-node clients for direct reads, by `(node id, endpoint, device)`.
     data_nodes: Mutex<HashMap<(String, String, usize), Arc<RemoteDevice>>>,
     direct_fallbacks: std::sync::atomic::AtomicU64,
+    locks: Locks,
 }
 
 /// Prefix of the names open-but-unlinked files are parked under; hidden from listings.
@@ -121,11 +138,50 @@ fn check_name(name: &str) -> Result<(), Errno> {
 
 impl Ops {
     pub fn new(client: Client, fs: impl Into<String>, cfg: OpsConfig) -> Self {
+        let client = Arc::new(client);
+        let fs = fs.into();
+        // Under cache leases only leased replies are cached.
+        let ttl = if cfg.cache_leases {
+            Duration::ZERO
+        } else {
+            cfg.ttl
+        };
+        let attrs = Arc::new(Mutex::new(TtlCache::new(ttl)));
+        let names = Arc::new(Mutex::new(TtlCache::new(ttl)));
+        let recalled = Arc::new(Mutex::new(HashMap::new()));
+        let recall: Option<Recall> = cfg.cache_leases.then(|| {
+            let (attrs, names, recalled) = (attrs.clone(), names.clone(), recalled.clone());
+            Arc::new(move |inos: &[u64]| {
+                let now = Instant::now();
+                if let Ok(mut r) = recalled.lock() {
+                    if r.len() >= 65_536 {
+                        r.retain(|_, at| now.duration_since(*at) < Duration::from_secs(60));
+                    }
+                    r.extend(inos.iter().map(|i| (*i, now)));
+                }
+                if let Ok(mut a) = attrs.lock() {
+                    for i in inos {
+                        a.remove(i);
+                    }
+                }
+                if let Ok(mut n) = names.lock() {
+                    n.retain(|(parent, _), _| !inos.contains(parent));
+                }
+            }) as Recall
+        });
         Self {
+            locks: Locks::new(
+                client.clone(),
+                &fs,
+                cfg.session_ttl,
+                cfg.lock_waiters,
+                recall,
+            ),
             client,
-            fs: fs.into(),
-            attrs: Mutex::new(TtlCache::new(cfg.ttl)),
-            names: Mutex::new(TtlCache::new(cfg.ttl)),
+            fs,
+            attrs,
+            names,
+            recalled,
             dirty: Mutex::new(WriteBack::new(cfg.writeback_bytes)),
             readahead: Mutex::new(TtlCache::new(if cfg.readahead_bytes > 0 {
                 cfg.ttl
@@ -147,6 +203,59 @@ impl Ops {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// `F_GETLK`. A snapshot mount has no writers, so nothing ever conflicts there.
+    pub fn getlk(
+        &self,
+        ino: u64,
+        owner: u64,
+        start: u64,
+        end: u64,
+        typ: i32,
+    ) -> Result<Option<Conflict>, Errno> {
+        if self.read_only() {
+            return Ok(None);
+        }
+        self.locks.getlk(ino, owner, start, end, typ)
+    }
+
+    /// `F_SETLK`/`F_SETLKW` (`wait`), seen by every mount of the filesystem.
+    #[allow(clippy::too_many_arguments)]
+    pub fn setlk(
+        &self,
+        ino: u64,
+        owner: u64,
+        start: u64,
+        end: u64,
+        typ: i32,
+        pid: u32,
+        wait: bool,
+    ) -> Result<(), Errno> {
+        if self.read_only() {
+            return Ok(());
+        }
+        self.locks.setlk(ino, owner, start, end, typ, pid, wait)
+    }
+
+    /// Drops the owner's locks on `ino`: POSIX locks go on any close by their process.
+    pub fn release_locks(&self, ino: u64, owner: u64) -> Result<(), Errno> {
+        self.locks.release(ino, owner)
+    }
+
+    /// Closes the lock session at unmount, releasing every lock this mount holds.
+    pub fn close_session(&self) {
+        self.locks.close();
+    }
+
+    /// The lock session's id, once this mount took a lock.
+    pub fn lock_session(&self) -> Option<String> {
+        self.locks.session_id()
+    }
+
+    /// Times the lock session expired under this mount (its locks were lost).
+    pub fn lock_sessions_lost(&self) -> usize {
+        self.locks.sessions_lost()
+    }
+
     /// The mounted filesystem: `<fs>` or `<fs>@<snapshot>`.
     pub fn fs(&self) -> &str {
         &self.fs
@@ -156,8 +265,56 @@ impl Ops {
         self.fs.contains('@')
     }
 
+    /// The TTL the kernel may cache attributes and names for.
+    pub fn kernel_ttl(&self) -> Duration {
+        if self.cfg.cache_leases {
+            Duration::ZERO
+        } else {
+            self.cfg.ttl
+        }
+    }
+
+    /// Requests name the mount's session (once it has one), so the cluster does not recall the
+    /// mount's own cache leases for its own changes.
     fn path(&self, rest: &str) -> String {
-        format!("/v1/fs/{}{rest}", self.fs)
+        match self.locks.session_id() {
+            Some(s) => {
+                let sep = if rest.contains('?') { '&' } else { '?' };
+                format!("/v1/fs/{}{rest}{sep}session={s}", self.fs)
+            }
+            None => format!("/v1/fs/{}{rest}", self.fs),
+        }
+    }
+
+    /// Whether to ask for cache leases: enabled, writable, and the session is open.
+    fn leasing(&self) -> bool {
+        self.cfg.cache_leases && !self.read_only() && self.locks.session().is_ok()
+    }
+
+    /// GET `rest` asking for a cache lease: the attributes, when the request was sent, and
+    /// until when the lease lasts (if one was granted).
+    fn leased_get(&self, rest: &str) -> Result<(Attr, Instant, Option<Instant>), Errno> {
+        let sep = if rest.contains('?') { '&' } else { '?' };
+        let sent = Instant::now();
+        let v = self.call(
+            Method::GET,
+            &format!("{rest}{sep}lease=1"),
+            Body::Empty,
+            Retry::Idempotent,
+        )?;
+        // Counted from the send, with a margin for clock rate differences.
+        let until = v["lease_ms"]
+            .as_u64()
+            .map(|ms| sent + Duration::from_millis(ms) * 9 / 10);
+        Ok((decode(v)?, sent, until))
+    }
+
+    /// Whether `ino`'s lease was not recalled since `sent`: a reply to a request sent before a
+    /// recall may predate the change the recall was for.
+    fn unrecalled(&self, ino: u64, sent: Instant) -> bool {
+        self.recalled
+            .lock()
+            .is_ok_and(|r| r.get(&ino).is_none_or(|at| *at < sent))
     }
 
     fn call(
@@ -180,10 +337,15 @@ impl Ops {
     }
 
     /// Caches `a` and returns it with any buffered bytes counted in its size.
-    fn remember(&self, mut a: Attr) -> Attr {
+    fn remember(&self, a: Attr) -> Attr {
         if let Ok(mut c) = self.attrs.lock() {
             c.put(a.ino, a.clone());
         }
+        self.adjust(a)
+    }
+
+    /// `a` with this mount's buffered bytes and parked unlinks applied.
+    fn adjust(&self, mut a: Attr) -> Attr {
         if let Some(end) = self.dirty.lock().ok().and_then(|d| d.end(a.ino)) {
             a.size = a.size.max(end);
         }
@@ -239,16 +401,24 @@ impl Ops {
     }
 
     pub fn getattr(&self, ino: u64) -> Result<Attr, Errno> {
-        let cached = self.attrs.lock().ok().and_then(|mut c| c.get(&ino));
-        let a = match cached {
-            Some(a) => a,
-            None => decode(self.call(
-                Method::GET,
-                &format!("/inodes/{ino}"),
-                Body::Empty,
-                Retry::Idempotent,
-            )?)?,
-        };
+        if let Some(a) = self.attrs.lock().ok().and_then(|mut c| c.get(&ino)) {
+            return Ok(self.adjust(a));
+        }
+        if self.leasing() {
+            let (a, sent, until) = self.leased_get(&format!("/inodes/{ino}"))?;
+            if let Some(until) = until.filter(|_| self.unrecalled(ino, sent)) {
+                if let Ok(mut c) = self.attrs.lock() {
+                    c.put_until(ino, a.clone(), until);
+                }
+            }
+            return Ok(self.adjust(a));
+        }
+        let a = decode(self.call(
+            Method::GET,
+            &format!("/inodes/{ino}"),
+            Body::Empty,
+            Retry::Idempotent,
+        )?)?;
         Ok(self.remember(a))
     }
 
@@ -260,28 +430,65 @@ impl Ops {
                 return Ok(a);
             }
         }
-        let a: Attr = decode(self.call(
-            Method::GET,
-            &format!("/inodes/{parent}/lookup?name={}", encode(name)),
-            Body::Empty,
-            Retry::Idempotent,
-        )?)?;
+        let rest = format!("/inodes/{parent}/lookup?name={}", encode(name));
+        if self.leasing() {
+            // One lease covers the name (the directory's), one the child's attributes.
+            let (a, sent, until) = self.leased_get(&rest)?;
+            if let Some(until) = until {
+                if self.unrecalled(parent, sent) {
+                    if let Ok(mut n) = self.names.lock() {
+                        n.put_until(key, a.ino, until);
+                    }
+                }
+                if self.unrecalled(a.ino, sent) {
+                    if let Ok(mut c) = self.attrs.lock() {
+                        c.put_until(a.ino, a.clone(), until);
+                    }
+                }
+            }
+            return Ok(self.adjust(a));
+        }
+        let a: Attr = decode(self.call(Method::GET, &rest, Body::Empty, Retry::Idempotent)?)?;
         if let Ok(mut n) = self.names.lock() {
             n.put(key, a.ino);
         }
         Ok(self.remember(a))
     }
 
+    /// Every visible entry of a directory.
     pub fn readdir(&self, ino: u64) -> Result<Vec<DirEntry>, Errno> {
-        let v = self.call(
-            Method::GET,
-            &format!("/inodes/{ino}/entries"),
-            Body::Empty,
-            Retry::Idempotent,
-        )?;
+        let mut all = Vec::new();
+        let mut after = None;
+        loop {
+            let (entries, next) = self.readdir_page(ino, after.as_deref(), crate::dirs::PAGE)?;
+            all.extend(entries);
+            match next {
+                Some(n) => after = Some(n),
+                None => return Ok(all),
+            }
+        }
+    }
+
+    /// Up to `limit` entries named after `after`: the visible ones, and the name to continue
+    /// after (`None` once the directory is done).
+    pub fn readdir_page(
+        &self,
+        ino: u64,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<crate::dirs::Page, Errno> {
+        let mut rest = format!("/inodes/{ino}/entries?limit={limit}");
+        if let Some(a) = after {
+            rest.push_str(&format!("&after={}", encode(a)));
+        }
+        let v = self.call(Method::GET, &rest, Body::Empty, Retry::Idempotent)?;
         let mut entries: Vec<DirEntry> = decode(v["entries"].clone())?;
+        let next = match entries.last() {
+            Some(e) if entries.len() >= limit => Some(e.name.clone()),
+            _ => None,
+        };
         entries.retain(|e| !e.name.starts_with(HIDDEN_PREFIX));
-        Ok(entries)
+        Ok((entries, next))
     }
 
     pub fn readlink(&self, ino: u64) -> Result<String, Errno> {
@@ -330,6 +537,7 @@ impl Ops {
             (false, true) => "replace",
             (false, false) => "set",
         };
+        self.forget_attr(ino);
         self.void(
             Method::PUT,
             &format!("/inodes/{ino}/xattrs/{}?mode={mode}", encode(name)),
@@ -339,6 +547,7 @@ impl Ops {
     }
 
     pub fn removexattr(&self, ino: u64, name: &str) -> Result<(), Errno> {
+        self.forget_attr(ino);
         self.void(
             Method::DELETE,
             &format!("/inodes/{ino}/xattrs/{}", encode(name)),

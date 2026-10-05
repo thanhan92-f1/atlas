@@ -7,7 +7,9 @@
 
 pub mod cache;
 pub mod client;
+pub mod dirs;
 #[cfg(all(feature = "fuse", target_os = "linux"))]
 pub mod fuse;
+pub mod locks;
 pub mod ops;
 pub mod writeback;

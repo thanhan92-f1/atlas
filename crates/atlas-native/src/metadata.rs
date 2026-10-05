@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 
 use crate::{
     alloc::FreeList,
+    leases::{LeaseOp, Leases},
     membership::Membership,
     namespace::{FsId, FsMeta, FsOp, FsSnapshotMeta},
     tracked::Tracked,
@@ -78,6 +79,9 @@ pub struct Catalog {
     pub filesystems: Tracked<FsId, FsMeta>,
     #[serde(default)]
     pub fs_snapshots: Tracked<SnapshotId, FsSnapshotMeta>,
+    /// Client sessions and the file locks they hold.
+    #[serde(default, skip_serializing_if = "leases_empty")]
+    pub leases: Leases,
     /// Whether the catalog store holds this catalog apart from the changes the maps track.
     /// False for a catalog built any other way (new, from JSON, from a Raft snapshot), which the
     /// next checkpoint writes in full.
@@ -151,8 +155,16 @@ pub enum MetaCommand {
     Fs {
         op: FsOp,
     },
+    /// A client session or file lock change ([`crate::leases`]).
+    Lease {
+        op: LeaseOp,
+    },
     /// Appended by a new Raft leader so entries from earlier terms can be committed.
     Noop,
+}
+
+fn leases_empty(l: &Leases) -> bool {
+    *l == Leases::default()
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -175,6 +187,11 @@ pub enum MetaError {
     TooBig(String),
     #[error("not supported: {0}")]
     Unsupported(String),
+    #[error("locked: {0}")]
+    Locked(String),
+    /// Session ids are never echoed: one lets its holder renew the session or drop its locks.
+    #[error("no such session (expired or closed)")]
+    NoSession,
     /// The catalog store could not be read: not a property of the command.
     #[error("catalog store: {0}")]
     Store(String),
@@ -455,6 +472,20 @@ impl Catalog {
                 self.membership = Some(membership.clone());
             }
             MetaCommand::Fs { op } => self.apply_fs(op, &mut gc_candidates)?,
+            MetaCommand::Lease { op } => {
+                let filesystems = &self.filesystems;
+                self.leases.apply(op, term, |fs, ino| {
+                    let f = filesystems
+                        .get(fs)
+                        .ok_or_else(|| MetaError::NotFound(format!("filesystem {fs}")))?;
+                    match f.inode(ino)?.kind {
+                        crate::namespace::InodeKind::File { .. } => Ok(()),
+                        _ => Err(MetaError::Invalid(format!(
+                            "inode {ino} is not a regular file"
+                        ))),
+                    }
+                })?;
+            }
             MetaCommand::Noop => {}
         }
         self.applied(term, index, gc_candidates)
